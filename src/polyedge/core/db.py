@@ -140,6 +140,18 @@ CREATE TABLE IF NOT EXISTS polyedge.ai_cost_log (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS polyedge.agent_memory (
+    id SERIAL PRIMARY KEY,
+    market_id TEXT DEFAULT '',
+    memory_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}',
+    importance FLOAT DEFAULT 0.5,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    superseded_by INT
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_status ON polyedge.trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_market ON polyedge.trades(market_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON polyedge.orders(status);
@@ -148,6 +160,8 @@ CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_ts ON polyedge.portfolio_snap
 CREATE INDEX IF NOT EXISTS idx_price_history_market ON polyedge.price_history(market_id);
 CREATE INDEX IF NOT EXISTS idx_price_history_ts ON polyedge.price_history(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_ai_cost_log_ts ON polyedge.ai_cost_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_market ON polyedge.agent_memory(market_id);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_type ON polyedge.agent_memory(memory_type);
 """
 
 
@@ -561,4 +575,160 @@ class Database:
             return {
                 "total_cost": float(total),
                 "breakdown": [dict(r) for r in rows],
+            }
+
+    # --- Agent Memory ---
+
+    async def save_memory(self, memory_type: str, content: str, market_id: str = "",
+                           metadata: dict = None, importance: float = 0.5,
+                           expires_at: datetime = None) -> int:
+        """Store an agent memory. Returns the memory ID."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                INSERT INTO polyedge.agent_memory
+                    (market_id, memory_type, content, metadata, importance, expires_at)
+                VALUES ($1,$2,$3,$4,$5,$6)
+                RETURNING id
+                """,
+                market_id,
+                memory_type,
+                content,
+                json.dumps(metadata or {}),
+                importance,
+                expires_at,
+            )
+
+    async def get_memories(self, market_id: str = "", memory_type: str = "",
+                            limit: int = 20) -> list[dict]:
+        """Retrieve active (non-expired, non-superseded) memories."""
+        async with self.pool.acquire() as conn:
+            conditions = ["superseded_by IS NULL", "(expires_at IS NULL OR expires_at > NOW())"]
+            params = []
+            idx = 1
+
+            if market_id:
+                conditions.append(f"market_id = ${idx}")
+                params.append(market_id)
+                idx += 1
+            if memory_type:
+                conditions.append(f"memory_type = ${idx}")
+                params.append(memory_type)
+                idx += 1
+
+            conditions.append(f"${idx}")
+            params.append(limit)
+
+            where = " AND ".join(conditions[:-1])
+            query = f"""
+                SELECT * FROM polyedge.agent_memory
+                WHERE {where}
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ${idx}
+            """
+            rows = await conn.fetch(query, *params)
+            return [dict(r) for r in rows]
+
+    async def get_market_memories(self, market_id: str) -> list[dict]:
+        """Get all active memories for a specific market."""
+        return await self.get_memories(market_id=market_id)
+
+    async def get_global_memories(self, memory_type: str = "", limit: int = 20) -> list[dict]:
+        """Get memories not tied to a specific market (lessons, patterns, etc)."""
+        async with self.pool.acquire() as conn:
+            conditions = [
+                "superseded_by IS NULL",
+                "(expires_at IS NULL OR expires_at > NOW())",
+                "(market_id = '' OR market_id IS NULL)",
+            ]
+            params = []
+            idx = 1
+
+            if memory_type:
+                conditions.append(f"memory_type = ${idx}")
+                params.append(memory_type)
+                idx += 1
+
+            params.append(limit)
+            where = " AND ".join(conditions)
+            query = f"""
+                SELECT * FROM polyedge.agent_memory
+                WHERE {where}
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ${idx}
+            """
+            rows = await conn.fetch(query, *params)
+            return [dict(r) for r in rows]
+
+    async def supersede_memory(self, old_id: int, new_id: int):
+        """Mark a memory as superseded by a newer one."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE polyedge.agent_memory SET superseded_by = $2 WHERE id = $1",
+                old_id, new_id,
+            )
+
+    async def cleanup_expired_memories(self) -> int:
+        """Delete memories that have expired. Returns count deleted."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM polyedge.agent_memory WHERE expires_at IS NOT NULL AND expires_at < NOW()"
+            )
+            # asyncpg returns "DELETE N"
+            return int(result.split()[-1]) if result else 0
+
+    # --- Market Lifecycle ---
+
+    async def deactivate_missing_markets(self, active_condition_ids: list[str]) -> int:
+        """Mark markets as inactive if they weren't in the latest API sync.
+
+        Markets that vanish from the API are resolved/closed/removed.
+        We don't delete them — just mark active=FALSE so they stop appearing in scans.
+        Returns count of markets deactivated.
+        """
+        if not active_condition_ids:
+            return 0
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE polyedge.markets
+                SET active = FALSE, updated_at = NOW()
+                WHERE active = TRUE
+                AND condition_id != ALL($1::text[])
+                """,
+                active_condition_ids,
+            )
+            return int(result.split()[-1]) if result else 0
+
+    async def deactivate_past_end_date(self) -> int:
+        """Mark markets as closed if their end_date has passed."""
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE polyedge.markets
+                SET closed = TRUE, active = FALSE, updated_at = NOW()
+                WHERE active = TRUE AND closed = FALSE
+                AND end_date IS NOT NULL AND end_date < NOW()
+                """
+            )
+            return int(result.split()[-1]) if result else 0
+
+    async def get_market_lifecycle_stats(self) -> dict:
+        """Get counts of markets in various states."""
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM polyedge.markets")
+            active = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.markets WHERE active = TRUE AND closed = FALSE"
+            )
+            closed = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.markets WHERE closed = TRUE"
+            )
+            inactive = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.markets WHERE active = FALSE AND closed = FALSE"
+            )
+            return {
+                "total": total,
+                "active": active,
+                "closed": closed,
+                "inactive": inactive,
             }

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from rich.console import Console
@@ -92,6 +93,10 @@ class TradingAgent:
         5. Only AI-analyze markets that look promising OR moved in price
         """
         console.print("\n[bold cyan]--- Scan Cycle ---")
+
+        # Housekeeping: review resolved positions + clean expired memories
+        await self._review_resolved_positions()
+        await self._cleanup_memory()
 
         # Check risk limits
         if await self._check_circuit_breakers():
@@ -339,6 +344,9 @@ class TradingAgent:
             ai_probability=signal.ai_probability,
         )
 
+        # Record trade in agent memory
+        await self._remember_trade(signal, size_usd)
+
     async def _get_bankroll(self) -> float:
         """Get current bankroll from positions + available balance."""
         # TODO: Query actual USDC balance from wallet
@@ -378,3 +386,134 @@ class TradingAgent:
             return age_minutes < self.settings.agent.scan_interval_minutes * 2
 
         return False
+
+    # --- Agent Memory ---
+
+    async def _remember_trade(self, signal: Signal, size_usd: float):
+        """Record a trade decision in memory so the agent can build context."""
+        content = (
+            f"Traded {signal.side.value} ${size_usd:.2f} on '{signal.market.question[:80]}'. "
+            f"Edge: {signal.edge:.1%}, Confidence: {signal.confidence:.1%}. "
+            f"Strategy: {signal.strategy}. "
+            f"Entry price: {signal.market.yes_price if signal.side == Side.YES else signal.market.no_price:.3f}."
+        )
+        if signal.reasoning:
+            content += f" Reasoning: {signal.reasoning[:200]}"
+
+        await self.db.save_memory(
+            memory_type="trade_decision",
+            content=content,
+            market_id=signal.market.condition_id,
+            metadata={
+                "side": signal.side.value,
+                "size_usd": size_usd,
+                "edge": signal.edge,
+                "strategy": signal.strategy,
+                "entry_price": signal.market.yes_price if signal.side == Side.YES else signal.market.no_price,
+            },
+            importance=0.7,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        )
+
+    async def _remember_skip(self, market: Market, reason: str):
+        """Record why we skipped a market — helps avoid re-analyzing bad candidates."""
+        await self.db.save_memory(
+            memory_type="skip_reason",
+            content=f"Skipped '{market.question[:60]}': {reason}",
+            market_id=market.condition_id,
+            importance=0.3,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=6),
+        )
+
+    async def _remember_lesson(self, content: str, importance: float = 0.8,
+                                 market_id: str = ""):
+        """Record a lesson learned (e.g. from a resolved trade)."""
+        await self.db.save_memory(
+            memory_type="lesson",
+            content=content,
+            market_id=market_id,
+            importance=importance,
+            # Lessons don't expire — they're valuable long-term
+        )
+
+    async def _get_market_context(self, market: Market) -> str:
+        """Build memory context for a market to feed into AI analysis.
+
+        Returns a string summary of what the agent remembers about this market.
+        """
+        memories = await self.db.get_market_memories(market.condition_id)
+        if not memories:
+            return ""
+
+        lines = []
+        for mem in memories[:5]:  # Cap at 5 most important
+            lines.append(f"- [{mem['memory_type']}] {mem['content']}")
+
+        return "Agent memory for this market:\n" + "\n".join(lines)
+
+    async def _get_global_context(self) -> str:
+        """Get global agent lessons to feed into AI analysis."""
+        lessons = await self.db.get_global_memories(memory_type="lesson", limit=5)
+        if not lessons:
+            return ""
+
+        lines = [f"- {m['content']}" for m in lessons]
+        return "Lessons learned from past trades:\n" + "\n".join(lines)
+
+    async def _review_resolved_positions(self):
+        """Check if any positions resolved and record lessons.
+
+        Called at the start of each scan cycle.
+        """
+        try:
+            trades = await self.db.get_open_trades()
+            for trade in trades:
+                market_id = trade.get("market_id", "")
+                # Check if the market is now closed/inactive
+                market_rows = await self.db.get_markets_from_db(active_only=False, limit=1)
+                # Look up this specific market
+                market_row = None
+                async with self.db.pool.acquire() as conn:
+                    market_row = await conn.fetchrow(
+                        "SELECT * FROM polyedge.markets WHERE condition_id = $1",
+                        market_id,
+                    )
+
+                if market_row and (market_row["closed"] or not market_row["active"]):
+                    # Market resolved — calculate outcome
+                    entry = trade.get("entry_price", 0)
+                    side = trade.get("side", "")
+                    ai_prob = trade.get("ai_probability")
+
+                    # Record lesson about calibration
+                    if ai_prob is not None:
+                        final_price = market_row.get("yes_price", 0)
+                        if final_price >= 0.95:
+                            outcome = "YES won"
+                            correct = side == "YES"
+                        elif final_price <= 0.05:
+                            outcome = "NO won"
+                            correct = side == "NO"
+                        else:
+                            continue  # Not clearly resolved yet
+
+                        pnl_sign = "profit" if correct else "loss"
+                        await self._remember_lesson(
+                            f"Market '{trade.get('question', '')[:60]}' resolved: {outcome}. "
+                            f"We bet {side} at {entry:.2f} (AI said {ai_prob:.0%}). "
+                            f"Result: {pnl_sign}. "
+                            f"Category: {market_row.get('category', 'unknown')}.",
+                            importance=0.9,
+                            market_id=market_id,
+                        )
+        except Exception as e:
+            logger.debug(f"Error reviewing resolved positions: {e}")
+
+    async def _cleanup_memory(self):
+        """Periodic memory maintenance."""
+        try:
+            deleted = await self.db.cleanup_expired_memories()
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} expired memories")
+        except Exception:
+            pass

@@ -99,6 +99,17 @@ class MarketIndexer:
         # Bulk insert price history
         await self.db.bulk_record_prices(price_snapshots)
 
+        # Deactivate markets that disappeared from API
+        active_ids = [m.condition_id for m in markets]
+        deactivated = await self.db.deactivate_missing_markets(active_ids)
+        if deactivated:
+            console.print(f"[dim]Deactivated {deactivated} markets no longer in API[/dim]")
+
+        # Also close markets past their end date
+        closed = await self.db.deactivate_past_end_date()
+        if closed:
+            console.print(f"[dim]Closed {closed} markets past end date[/dim]")
+
         self._last_sync = datetime.now(timezone.utc)
         console.print(
             f"[green]Synced {len(markets)} markets to DB "
