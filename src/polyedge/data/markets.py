@@ -52,9 +52,14 @@ async def fetch_active_markets(
 async def fetch_all_markets(
     settings: Settings,
     min_liquidity: float = 0,
-    max_pages: int = 10,
+    max_pages: int = 50,
 ) -> list[Market]:
-    """Fetch all active markets, paginating through results."""
+    """Fetch ALL active markets, paginating with offset until exhausted.
+
+    The Gamma API returns ~100 per page. We keep going until we get a
+    page with fewer results than batch_size (meaning we hit the end).
+    max_pages is a safety cap to prevent infinite loops.
+    """
     all_markets = []
     batch_size = 100
 
@@ -67,7 +72,7 @@ async def fetch_all_markets(
         )
         all_markets.extend(batch)
         if len(batch) < batch_size:
-            break
+            break  # Last page — no more results
 
     return all_markets
 
@@ -99,7 +104,7 @@ async def search_markets(
     limit: int = 20,
 ) -> list[Market]:
     """Search markets by keyword."""
-    all_markets = await fetch_all_markets(settings, max_pages=5)
+    all_markets = await fetch_all_markets(settings)
     query_lower = query.lower()
     return [
         m
