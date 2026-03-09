@@ -16,7 +16,7 @@ from polyedge.core.config import Settings
 from polyedge.core.client import PolyClient
 from polyedge.core.db import Database
 from polyedge.core.models import AgentMode, Market, Signal, Side
-from polyedge.data.markets import fetch_all_markets
+from polyedge.data.indexer import MarketIndexer
 from polyedge.risk.sizing import calculate_position_size
 from polyedge.risk.kelly import fractional_kelly
 from polyedge.strategies.edge_finder import EdgeFinderStrategy
@@ -42,6 +42,9 @@ class TradingAgent:
         self.llm = llm
         self.mode = AgentMode(settings.agent.mode)
         self.running = False
+
+        # Market indexer — reads from DB, syncs periodically
+        self.indexer = MarketIndexer(settings, db)
 
         # Strategies
         self.edge_finder = EdgeFinderStrategy(settings)
@@ -79,7 +82,15 @@ class TradingAgent:
         self.running = False
 
     async def _scan_cycle(self):
-        """One full scan-analyze-trade cycle."""
+        """One full scan-analyze-trade cycle.
+
+        Tiered approach to minimize AI costs:
+        1. Sync markets from API → DB (only if stale)
+        2. Read ALL markets from DB (free, no API call)
+        3. Run cheap_hunter on all markets (zero AI cost)
+        4. Pick top N candidates for AI analysis (expensive)
+        5. Only AI-analyze markets that look promising OR moved in price
+        """
         console.print("\n[bold cyan]--- Scan Cycle ---")
 
         # Check risk limits
@@ -87,61 +98,83 @@ class TradingAgent:
             console.print("[red]Circuit breaker triggered — skipping cycle")
             return
 
-        # 1. Fetch markets
-        console.print("[dim]Fetching markets...[/dim]")
-        markets = await fetch_all_markets(
-            self.settings,
+        # 1. Get markets from DB (auto-syncs if stale)
+        console.print("[dim]Loading markets from DB...[/dim]")
+        markets = await self.indexer.get_markets(
             min_liquidity=self.settings.risk.min_liquidity,
-            max_pages=3,
         )
-        console.print(f"Found {len(markets)} active markets")
+        console.print(f"Found {len(markets)} active markets in DB")
+
+        if not markets:
+            console.print("[yellow]No markets available — forcing sync")
+            await self.indexer.sync(force=True)
+            markets = await self.indexer.get_markets(
+                min_liquidity=self.settings.risk.min_liquidity,
+            )
+            if not markets:
+                console.print("[red]Still no markets after sync")
+                return
 
         # 2. Pre-filter with cheap hunter (no AI cost)
         cheap_signals = self.cheap_hunter.evaluate_batch(markets)
         if cheap_signals:
             console.print(f"[green]Cheap Hunter found {len(cheap_signals)} opportunities")
 
-        # 3. AI analysis on top markets
+        # 3. Tiered AI analysis — only analyze top candidates
         ai_signals = []
         if self.settings.strategies.edge_finder.enabled:
-            top_markets = markets[: self.settings.agent.max_markets_per_scan]
-            console.print(f"[dim]AI analyzing {len(top_markets)} markets...[/dim]")
+            # Check remaining AI budget before spending anything
+            budget_left = await self.llm.get_budget_remaining()
+            if budget_left <= 0:
+                console.print("[yellow]AI budget exhausted for today — skipping AI analysis")
+            else:
+                # Pick candidates smartly: price movers + highest volume
+                candidates = await self._pick_ai_candidates(markets)
+                console.print(
+                    f"[dim]AI analyzing {len(candidates)} candidates "
+                    f"(budget remaining: ${budget_left:.2f})...[/dim]"
+                )
 
-            for market in top_markets:
-                # Check if we already have a recent analysis
-                existing = await self.db.get_latest_analysis(market.condition_id)
-                if existing and self._analysis_still_fresh(existing, market):
-                    continue
+                for market in candidates:
+                    # Check if we already have a recent analysis
+                    existing = await self.db.get_latest_analysis(market.condition_id)
+                    if existing and self._analysis_still_fresh(existing, market):
+                        continue
 
-                try:
-                    # Get news context
-                    news = await get_news_context(
-                        self.llm, market, self.settings.news_api_key
-                    )
+                    # Re-check budget mid-loop
+                    if await self.llm.get_budget_remaining() <= 0.01:
+                        console.print("[yellow]AI budget hit mid-scan — stopping analysis")
+                        break
 
-                    # Analyze
-                    analysis = await analyze_market(self.llm, market, news_context=news)
-                    await self.db.save_analysis(analysis.model_dump())
-
-                    # Check for edge
-                    edge = analysis.probability - market.yes_price
-                    if abs(edge) >= self.settings.risk.min_edge_threshold:
-                        side = Side.YES if edge > 0 else Side.NO
-                        signal = Signal(
-                            market=market,
-                            side=side,
-                            confidence=analysis.confidence,
-                            edge=abs(edge),
-                            ev=abs(edge) * analysis.confidence,
-                            reasoning=analysis.reasoning,
-                            strategy="edge_finder",
-                            ai_probability=analysis.probability,
+                    try:
+                        # Get news context
+                        news = await get_news_context(
+                            self.llm, market, self.settings.news_api_key
                         )
-                        ai_signals.append(signal)
 
-                except Exception as e:
-                    logger.warning(f"Analysis failed for {market.question[:50]}: {e}")
-                    continue
+                        # Analyze with purpose tracking
+                        analysis = await analyze_market(self.llm, market, news_context=news)
+                        await self.db.save_analysis(analysis.model_dump())
+
+                        # Check for edge
+                        edge = analysis.probability - market.yes_price
+                        if abs(edge) >= self.settings.risk.min_edge_threshold:
+                            side = Side.YES if edge > 0 else Side.NO
+                            signal = Signal(
+                                market=market,
+                                side=side,
+                                confidence=analysis.confidence,
+                                edge=abs(edge),
+                                ev=abs(edge) * analysis.confidence,
+                                reasoning=analysis.reasoning,
+                                strategy="edge_finder",
+                                ai_probability=analysis.probability,
+                            )
+                            ai_signals.append(signal)
+
+                    except Exception as e:
+                        logger.warning(f"Analysis failed for {market.question[:50]}: {e}")
+                        continue
 
         # 4. Combine and rank all signals
         all_signals = cheap_signals + ai_signals
@@ -166,6 +199,39 @@ class TradingAgent:
         else:
             # Signals mode — just display, don't trade
             console.print("[dim]Signals mode — displaying only, no trades[/dim]")
+
+    async def _pick_ai_candidates(self, markets: list[Market]) -> list[Market]:
+        """Pick the best candidates for AI analysis.
+
+        Smart selection: price movers first, then highest volume, capped at max_markets_per_scan.
+        This is the key to keeping AI costs low — we don't analyze 500 markets, only ~10-20.
+        """
+        max_candidates = self.settings.agent.max_markets_per_scan
+        candidates = []
+        seen_ids = set()
+
+        # Priority 1: Markets that moved in price (something happened)
+        try:
+            movers = await self.indexer.get_price_movers(
+                hours=1, min_move_pct=0.03, min_liquidity=self.settings.risk.min_liquidity
+            )
+            for mover in movers[:max_candidates // 2]:
+                m = mover["market"]
+                if m.condition_id not in seen_ids:
+                    candidates.append(m)
+                    seen_ids.add(m.condition_id)
+        except Exception:
+            pass
+
+        # Priority 2: Highest volume markets (most liquid = best for trading)
+        for market in markets:
+            if len(candidates) >= max_candidates:
+                break
+            if market.condition_id not in seen_ids:
+                candidates.append(market)
+                seen_ids.add(market.condition_id)
+
+        return candidates
 
     async def _autopilot_execute(self, signals: list[Signal]):
         """Auto-execute top signals within risk limits."""

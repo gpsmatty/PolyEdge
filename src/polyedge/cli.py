@@ -536,6 +536,7 @@ def autopilot(mode):
             settings.ai,
             anthropic_key=settings.anthropic_api_key,
             openai_key=settings.openai_api_key,
+            db=db,
         )
 
         agent = TradingAgent(settings, client, db, llm)
@@ -592,6 +593,147 @@ def initdb():
         await db.close()
 
     run_async(_initdb())
+
+
+# --- Market Indexer ---
+
+
+@cli.command()
+@click.option("--force", "-f", is_flag=True, help="Force sync even if recently synced")
+def sync(force):
+    """Sync all markets from Polymarket API to local database."""
+
+    async def _sync():
+        from polyedge.core.db import Database
+        from polyedge.data.indexer import MarketIndexer
+
+        settings = get_settings()
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        indexer = MarketIndexer(settings, db)
+        count = await indexer.sync(force=True if force else False)
+
+        if count:
+            total = await db.get_market_count()
+            console.print(f"[green]Synced {count} markets. Total active in DB: {total}")
+        else:
+            console.print("[yellow]No markets synced (may be up to date)")
+
+        await db.close()
+
+    run_async(_sync())
+
+
+@cli.command()
+def costs():
+    """Show AI cost breakdown for today."""
+
+    async def _costs():
+        from polyedge.core.db import Database
+
+        settings = get_settings()
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        details = await db.get_ai_cost_today_detailed()
+
+        budget = settings.ai.max_analysis_cost_per_day
+        spent = details["total_cost"]
+        remaining = max(0, budget - spent)
+
+        console.print(f"\n[bold]AI Cost Summary (Today)")
+        console.print(f"  Budget:    ${budget:.2f}")
+        console.print(f"  Spent:     ${spent:.4f}")
+        console.print(f"  Remaining: ${remaining:.4f}")
+
+        if details["breakdown"]:
+            table = Table(title="Breakdown by Model")
+            table.add_column("Provider", width=10)
+            table.add_column("Model", width=30)
+            table.add_column("Calls", justify="right", width=6)
+            table.add_column("Input Tokens", justify="right", width=12)
+            table.add_column("Output Tokens", justify="right", width=12)
+            table.add_column("Cost", justify="right", width=10)
+
+            for row in details["breakdown"]:
+                table.add_row(
+                    row["provider"],
+                    row["model"],
+                    str(row["calls"]),
+                    f"{row['total_input']:,}",
+                    f"{row['total_output']:,}",
+                    f"${row['total_cost']:.4f}",
+                )
+            console.print(table)
+        else:
+            console.print("[dim]  No AI calls logged today[/dim]")
+
+        await db.close()
+
+    run_async(_costs())
+
+
+@cli.command()
+@click.option("--hours", "-h", default=1, help="Hours to look back")
+@click.option("--min-move", default=0.03, help="Minimum price move to show")
+def movers(hours, min_move):
+    """Show markets with significant price movement."""
+
+    async def _movers():
+        from polyedge.core.db import Database
+        from polyedge.data.indexer import MarketIndexer
+
+        settings = get_settings()
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        indexer = MarketIndexer(settings, db)
+
+        # Need at least 2 syncs for price history
+        count = await db.get_market_count()
+        if count == 0:
+            console.print("[yellow]No markets in DB. Run 'polyedge sync' first.")
+            await db.close()
+            return
+
+        price_movers = await indexer.get_price_movers(
+            hours=hours, min_move_pct=min_move,
+            min_liquidity=settings.risk.min_liquidity,
+        )
+
+        if not price_movers:
+            console.print(f"[dim]No markets moved >{min_move*100:.0f}% in the last {hours}h[/dim]")
+            console.print("[dim]Tip: Run 'polyedge sync' periodically to build price history[/dim]")
+            await db.close()
+            return
+
+        table = Table(title=f"Price Movers (last {hours}h, >{min_move*100:.0f}% move)")
+        table.add_column("#", width=3)
+        table.add_column("Market", max_width=50)
+        table.add_column("Dir", width=5)
+        table.add_column("Old", justify="right", width=7)
+        table.add_column("New", justify="right", width=7)
+        table.add_column("Change", justify="right", width=8)
+
+        for i, mover in enumerate(price_movers[:20], 1):
+            direction_style = "green" if mover["direction"] == "up" else "red"
+            table.add_row(
+                str(i),
+                mover["market"].question[:50],
+                f"[{direction_style}]{mover['direction'].upper()}[/{direction_style}]",
+                f"${mover['old_price']:.2f}",
+                f"${mover['new_price']:.2f}",
+                f"{mover['price_change']*100:+.1f}%",
+            )
+
+        console.print(table)
+        await db.close()
+
+    run_async(_movers())
 
 
 if __name__ == "__main__":

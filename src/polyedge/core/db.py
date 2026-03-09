@@ -117,11 +117,37 @@ CREATE TABLE IF NOT EXISTS polyedge.risk_config (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS polyedge.price_history (
+    id SERIAL PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    yes_price FLOAT NOT NULL,
+    no_price FLOAT NOT NULL,
+    volume FLOAT DEFAULT 0,
+    liquidity FLOAT DEFAULT 0,
+    spread FLOAT DEFAULT 0,
+    recorded_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS polyedge.ai_cost_log (
+    id SERIAL PRIMARY KEY,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INT DEFAULT 0,
+    output_tokens INT DEFAULT 0,
+    cost_usd FLOAT DEFAULT 0,
+    purpose TEXT DEFAULT '',
+    market_id TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_status ON polyedge.trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_market ON polyedge.trades(market_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON polyedge.orders(status);
 CREATE INDEX IF NOT EXISTS idx_ai_analyses_market ON polyedge.ai_analyses(market_id);
 CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_ts ON polyedge.portfolio_snapshots(timestamp);
+CREATE INDEX IF NOT EXISTS idx_price_history_market ON polyedge.price_history(market_id);
+CREATE INDEX IF NOT EXISTS idx_price_history_ts ON polyedge.price_history(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_ai_cost_log_ts ON polyedge.ai_cost_log(created_at);
 """
 
 
@@ -421,3 +447,118 @@ class Database:
                 key,
                 json.dumps(value),
             )
+
+    # --- Price History ---
+
+    async def record_price_snapshot(self, market_id: str, yes_price: float, no_price: float,
+                                     volume: float = 0, liquidity: float = 0, spread: float = 0):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO polyedge.price_history
+                    (market_id, yes_price, no_price, volume, liquidity, spread)
+                VALUES ($1,$2,$3,$4,$5,$6)
+                """,
+                market_id, yes_price, no_price, volume, liquidity, spread,
+            )
+
+    async def bulk_record_prices(self, snapshots: list[tuple]):
+        """Batch insert price snapshots. Each tuple: (market_id, yes, no, vol, liq, spread)."""
+        if not snapshots:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO polyedge.price_history
+                    (market_id, yes_price, no_price, volume, liquidity, spread)
+                VALUES ($1,$2,$3,$4,$5,$6)
+                """,
+                snapshots,
+            )
+
+    async def get_price_history(self, market_id: str, hours: int = 24) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM polyedge.price_history
+                WHERE market_id = $1 AND recorded_at >= NOW() - INTERVAL '1 hour' * $2
+                ORDER BY recorded_at
+                """,
+                market_id, hours,
+            )
+            return [dict(r) for r in rows]
+
+    async def get_markets_from_db(self, active_only: bool = True, min_liquidity: float = 0,
+                                   limit: int = 500) -> list[dict]:
+        """Get markets from local DB instead of hitting the API."""
+        async with self.pool.acquire() as conn:
+            if active_only:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM polyedge.markets
+                    WHERE active = TRUE AND closed = FALSE AND liquidity >= $1
+                    ORDER BY volume DESC LIMIT $2
+                    """,
+                    min_liquidity, limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM polyedge.markets ORDER BY volume DESC LIMIT $1", limit,
+                )
+            return [dict(r) for r in rows]
+
+    async def get_market_count(self) -> int:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.markets WHERE active = TRUE AND closed = FALSE"
+            )
+
+    async def get_stale_market_count(self, minutes: int = 30) -> int:
+        """Count markets not updated in the last N minutes."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM polyedge.markets
+                WHERE active = TRUE AND closed = FALSE
+                AND updated_at < NOW() - INTERVAL '1 minute' * $1
+                """,
+                minutes,
+            )
+
+    # --- AI Cost Tracking ---
+
+    async def log_ai_cost(self, provider: str, model: str, input_tokens: int,
+                           output_tokens: int, cost_usd: float, purpose: str = "",
+                           market_id: str = ""):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO polyedge.ai_cost_log
+                    (provider, model, input_tokens, output_tokens, cost_usd, purpose, market_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                """,
+                provider, model, input_tokens, output_tokens, cost_usd, purpose, market_id,
+            )
+
+    async def get_ai_cost_today_detailed(self) -> dict:
+        """Get detailed AI cost breakdown for today."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT provider, model,
+                    COUNT(*) as calls,
+                    SUM(input_tokens) as total_input,
+                    SUM(output_tokens) as total_output,
+                    SUM(cost_usd) as total_cost
+                FROM polyedge.ai_cost_log
+                WHERE created_at >= CURRENT_DATE
+                GROUP BY provider, model
+                """
+            )
+            total = await conn.fetchval(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM polyedge.ai_cost_log WHERE created_at >= CURRENT_DATE"
+            )
+            return {
+                "total_cost": float(total),
+                "breakdown": [dict(r) for r in rows],
+            }

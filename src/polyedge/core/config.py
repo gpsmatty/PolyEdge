@@ -73,7 +73,8 @@ class StrategiesConfig(BaseModel):
 class AgentConfig(BaseModel):
     mode: str = "copilot"
     scan_interval_minutes: int = 5
-    max_markets_per_scan: int = 50
+    sync_interval_minutes: int = 15  # How often to re-fetch markets from API
+    max_markets_per_scan: int = 20  # Max markets to AI-analyze per cycle
     reanalyze_price_change_pct: float = 0.05
 
 

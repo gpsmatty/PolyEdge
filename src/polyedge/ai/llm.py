@@ -37,10 +37,12 @@ def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
 class LLMClient:
     """Unified LLM client for Claude and OpenAI."""
 
-    def __init__(self, config: AIConfig, anthropic_key: str = "", openai_key: str = ""):
+    def __init__(self, config: AIConfig, anthropic_key: str = "", openai_key: str = "",
+                 db=None):
         self.config = config
         self._anthropic_client = None
         self._openai_client = None
+        self._db = db  # Optional Database for persistent cost logging
         self._total_cost_today = 0.0
 
         if anthropic_key:
@@ -60,6 +62,33 @@ class LLMClient:
     def reset_daily_cost(self):
         self._total_cost_today = 0.0
 
+    async def _log_cost(self, response: LLMResponse, purpose: str = "", market_id: str = ""):
+        """Log cost to DB if database is available."""
+        if self._db and response.cost_usd > 0:
+            try:
+                await self._db.log_ai_cost(
+                    provider=response.provider,
+                    model=response.model,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    cost_usd=response.cost_usd,
+                    purpose=purpose,
+                    market_id=market_id,
+                )
+            except Exception:
+                pass  # Don't fail analysis because of logging
+
+    async def get_budget_remaining(self) -> float:
+        """Get remaining AI budget for today."""
+        if self._db:
+            try:
+                details = await self._db.get_ai_cost_today_detailed()
+                spent = details["total_cost"]
+                return max(0, self.config.max_analysis_cost_per_day - spent)
+            except Exception:
+                pass
+        return max(0, self.config.max_analysis_cost_per_day - self._total_cost_today)
+
     async def analyze(
         self,
         prompt: str,
@@ -67,13 +96,16 @@ class LLMClient:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        purpose: str = "",
+        market_id: str = "",
     ) -> LLMResponse:
         """Send a prompt to the configured LLM and return the response."""
         provider = provider or self.config.provider
         temp = temperature if temperature is not None else self.config.temperature
 
-        # Check budget
-        if self._total_cost_today >= self.config.max_analysis_cost_per_day:
+        # Check budget (prefer DB-backed cost if available)
+        remaining = await self.get_budget_remaining()
+        if remaining <= 0:
             return LLMResponse(
                 text="[BUDGET EXCEEDED] Daily AI analysis budget reached.",
                 model="none",
@@ -81,21 +113,24 @@ class LLMClient:
             )
 
         if self.config.ensemble and provider == "ensemble":
-            return await self._ensemble_analyze(prompt, system, temp)
-
-        if provider == "claude":
-            return await self._claude_analyze(
+            response = await self._ensemble_analyze(prompt, system, temp)
+        elif provider == "claude":
+            response = await self._claude_analyze(
                 prompt, system, model or self.config.claude_model, temp
             )
         elif provider == "openai":
-            return await self._openai_analyze(
+            response = await self._openai_analyze(
                 prompt, system, model or self.config.openai_model, temp
             )
         else:
             # Default to claude
-            return await self._claude_analyze(
+            response = await self._claude_analyze(
                 prompt, system, model or self.config.claude_model, temp
             )
+
+        # Log cost to DB
+        await self._log_cost(response, purpose=purpose, market_id=market_id)
+        return response
 
     async def _claude_analyze(
         self, prompt: str, system: str, model: str, temperature: float
