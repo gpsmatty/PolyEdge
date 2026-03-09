@@ -1,0 +1,51 @@
+polymarket:
+  clob_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  chain_id: 137  # Polygon mainnet
+
+ai:
+  provider: "claude"  # "claude" | "openai" | "ensemble"
+  claude_model: "claude-sonnet-4-6"
+  openai_model: "gpt-4o"
+  ensemble: false
+  temperature: 0.2
+  max_analysis_cost_per_day: 5.00
+
+risk:
+  max_position_pct: 0.10
+  max_exposure_pct: 0.50
+  max_positions: 10
+  drawdown_circuit_breaker: 0.25
+  kelly_fraction: 0.25
+  min_edge_threshold: 0.05
+  min_confidence: 0.60
+  max_trades_per_day: 20
+  daily_loss_limit_pct: 0.15
+  confirm_trades: true
+  categories_blacklist: []
+  min_liquidity: 1000
+  min_time_to_resolution_hours: 24
+
+strategies:
+  cheap_hunter:
+    enabled: true
+    max_price: 0.15
+    min_volume: 500
+    min_ev: 0.02
+  edge_finder:
+    enabled: true
+    min_edge: 0.05
+    use_ai: true
+    use_news: true
+  market_maker:
+    enabled: false
+    min_spread: 0.05
+    max_inventory_pct: 0.20
+    requote_threshold: 0.02
+
+agent:
+  mode: "copilot"  # "autopilot" | "copilot" | "signals"
+  scan_interval_minutes: 5
+  max_markets_per_scan: 50
+  reanalyze_price_change_pct: 0.05
