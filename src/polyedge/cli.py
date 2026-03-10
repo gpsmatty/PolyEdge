@@ -45,8 +45,10 @@ def setup():
 
     settings = get_settings()
 
+    from polyedge.core.config import _set_in_keychain
+
     if settings.poly_private_key:
-        console.print("[yellow]Wallet already configured in .env")
+        console.print("[yellow]Wallet already configured")
         if not click.confirm("Generate a NEW wallet?", default=False):
             # Just derive API keys
             console.print("\nDeriving API credentials...")
@@ -57,10 +59,17 @@ def setup():
                 console.print(f"  API Key: {creds['api_key'][:20]}...")
                 console.print(f"  Secret: {creds['api_secret'][:20]}...")
                 console.print(f"  Passphrase: {creds['api_passphrase'][:20]}...")
-                console.print("\n[yellow]Add these to your .env file:")
-                console.print(f"  POLY_API_KEY={creds['api_key']}")
-                console.print(f"  POLY_API_SECRET={creds['api_secret']}")
-                console.print(f"  POLY_API_PASSPHRASE={creds['api_passphrase']}")
+
+                if click.confirm("\nStore these in macOS Keychain?", default=True):
+                    _set_in_keychain("poly_api_key", creds['api_key'])
+                    _set_in_keychain("poly_api_secret", creds['api_secret'])
+                    _set_in_keychain("poly_api_passphrase", creds['api_passphrase'])
+                    console.print("[green]Stored in Keychain!")
+                else:
+                    console.print("\n[yellow]Add these to your .env file:")
+                    console.print(f"  POLY_API_KEY={creds['api_key']}")
+                    console.print(f"  POLY_API_SECRET={creds['api_secret']}")
+                    console.print(f"  POLY_API_PASSPHRASE={creds['api_passphrase']}")
             except Exception as e:
                 console.print(f"[red]Failed to derive credentials: {e}")
             return
@@ -73,17 +82,236 @@ def setup():
     console.print(f"  Address: {wallet['address']}")
     console.print(f"  Private Key: {wallet['private_key'][:20]}...")
 
-    console.print("\n[bold yellow]IMPORTANT: Add to your .env file:")
-    console.print(f"  POLY_PRIVATE_KEY={wallet['private_key']}")
-    console.print(f"  POLY_WALLET_ADDRESS={wallet['address']}")
+    if click.confirm("\nStore wallet keys in macOS Keychain?", default=True):
+        _set_in_keychain("poly_private_key", wallet['private_key'])
+        _set_in_keychain("poly_wallet_address", wallet['address'])
+        console.print("[green]Stored in Keychain!")
+    else:
+        console.print("\n[yellow]Add to your .env file:")
+        console.print(f"  POLY_PRIVATE_KEY={wallet['private_key']}")
+        console.print(f"  POLY_WALLET_ADDRESS={wallet['address']}")
 
     console.print(
         "\n[bold]Next steps:"
-        "\n  1. Add the private key and address to your .env file"
-        "\n  2. Send $200 USDC to the address on Polygon"
-        "\n  3. Send ~$0.50 of MATIC/POL for gas"
-        "\n  4. Run 'polyedge setup' again to derive API credentials"
+        "\n  1. Send $200 USDC to the address on Polygon"
+        "\n  2. Send ~$0.50 of MATIC/POL for gas"
+        "\n  3. Run 'polyedge setup' again to derive API credentials"
     )
+
+
+@cli.command()
+def init():
+    """First-run wizard — configure secrets, database, and trading params."""
+    from polyedge.core.config import (
+        KEYCHAIN_KEYS, _get_from_keychain, _set_in_keychain, load_keychain_secrets,
+        save_config_to_db,
+    )
+
+    console.print("[bold cyan]PolyEdge First-Run Setup[/bold cyan]")
+    console.print("[dim]This wizard walks you through everything needed to start trading.\n")
+
+    # --- Step 1: Secrets ---
+    console.print("[bold]Step 1: Secrets (macOS Keychain)[/bold]")
+    console.print("[dim]All secrets are stored encrypted in your Mac's Keychain.\n")
+
+    existing = load_keychain_secrets()
+
+    secret_prompts = {
+        "database_url": ("PostgreSQL connection string", "postgresql://user:pass@host:5432/polyedge"),
+        "anthropic_api_key": ("Anthropic API key (for Claude)", "sk-ant-..."),
+        "openai_api_key": ("OpenAI API key (optional, for ensemble mode)", "sk-..."),
+        "news_api_key": ("News API key (optional, for news context)", ""),
+    }
+
+    for key, (label, hint) in secret_prompts.items():
+        if key in existing:
+            masked = existing[key][:4] + "..." + existing[key][-4:] if len(existing[key]) > 12 else "***"
+            console.print(f"  [green]{label}[/green]: already set ({masked})")
+            if not click.confirm(f"  Update {key}?", default=False):
+                continue
+
+        if hint:
+            console.print(f"  [dim]Format: {hint}[/dim]")
+
+        if "optional" in label.lower():
+            if not click.confirm(f"  Set up {label}?", default=False):
+                continue
+
+        value = click.prompt(f"  {label}", hide_input=True)
+        if value.strip():
+            _set_in_keychain(key, value.strip())
+            console.print(f"  [green]Stored![/green]")
+        else:
+            console.print(f"  [dim]Skipped[/dim]")
+
+    # --- Step 2: Database ---
+    console.print(f"\n[bold]Step 2: Database[/bold]")
+    db_ready = False
+    if _get_from_keychain("database_url"):
+        if click.confirm("  Initialize database schema now?", default=True):
+            async def _init_db():
+                from polyedge.core.db import Database
+                settings = get_settings()
+                db = Database(settings.database_url)
+                await db.connect()
+                await db.init_schema()
+                await db.close()
+                console.print("  [green]Database schema created (10 tables)![/green]")
+            try:
+                run_async(_init_db())
+                db_ready = True
+            except Exception as e:
+                console.print(f"  [red]Database error: {e}[/red]")
+                console.print("  [dim]Check your database_url and try again later with 'polyedge initdb'[/dim]")
+    else:
+        console.print("  [yellow]No database_url set — skipping. Run 'polyedge vault store database_url' first.[/yellow]")
+
+    # --- Step 3: Wallet ---
+    console.print(f"\n[bold]Step 3: Wallet[/bold]")
+    if _get_from_keychain("poly_private_key"):
+        masked = _get_from_keychain("poly_private_key")
+        masked = masked[:6] + "..." + masked[-4:]
+        console.print(f"  [green]Wallet already configured[/green] ({masked})")
+    else:
+        if click.confirm("  Generate a new trading wallet?", default=True):
+            from polyedge.core.client import PolyClient
+            wallet = PolyClient.generate_wallet()
+            _set_in_keychain("poly_private_key", wallet['private_key'])
+            _set_in_keychain("poly_wallet_address", wallet['address'])
+            console.print(f"  [green]Wallet generated and stored in Keychain![/green]")
+            console.print(f"  Address: {wallet['address']}")
+            console.print(f"\n  [bold yellow]Fund this address with USDC on Polygon + tiny MATIC for gas[/bold yellow]")
+        else:
+            console.print("  [dim]Import existing wallet with 'polyedge vault store poly_private_key'[/dim]")
+
+    # --- Step 4: Trading Configuration ---
+    console.print(f"\n[bold]Step 4: Trading Configuration[/bold]")
+    console.print("[dim]All config is stored in the database — portable across environments.\n")
+
+    settings = get_settings()
+    risk = settings.risk
+    agent = settings.agent
+    ai = settings.ai
+
+    # Bankroll-based risk
+    bankroll = click.prompt(
+        "  Starting bankroll (USD)",
+        type=float, default=200.0,
+    )
+
+    # Risk appetite
+    console.print("\n  [bold]Risk profile:[/bold]")
+    console.print("    1. Conservative — Quarter Kelly, 5% min edge, 10% max position")
+    console.print("    2. Moderate     — Half Kelly, 4% min edge, 15% max position")
+    console.print("    3. Aggressive   — Full Kelly, 3% min edge, 25% max position")
+    console.print("    4. Custom       — Set everything manually")
+
+    profile = click.prompt("  Choose profile", type=int, default=1)
+
+    if profile == 1:
+        risk.kelly_fraction = 0.25
+        risk.min_edge_threshold = 0.05
+        risk.min_confidence = 0.60
+        risk.max_position_pct = 0.10
+        risk.max_exposure_pct = 0.50
+        risk.max_positions = 10
+        risk.daily_loss_limit_pct = 0.15
+        risk.drawdown_circuit_breaker = 0.25
+    elif profile == 2:
+        risk.kelly_fraction = 0.50
+        risk.min_edge_threshold = 0.04
+        risk.min_confidence = 0.55
+        risk.max_position_pct = 0.15
+        risk.max_exposure_pct = 0.60
+        risk.max_positions = 15
+        risk.daily_loss_limit_pct = 0.20
+        risk.drawdown_circuit_breaker = 0.30
+    elif profile == 3:
+        risk.kelly_fraction = 1.0
+        risk.min_edge_threshold = 0.03
+        risk.min_confidence = 0.50
+        risk.max_position_pct = 0.25
+        risk.max_exposure_pct = 0.75
+        risk.max_positions = 20
+        risk.daily_loss_limit_pct = 0.25
+        risk.drawdown_circuit_breaker = 0.40
+    elif profile == 4:
+        risk.kelly_fraction = click.prompt("  Kelly fraction (0.25 = quarter)", type=float, default=risk.kelly_fraction)
+        risk.min_edge_threshold = click.prompt("  Min edge to trade (0.05 = 5%)", type=float, default=risk.min_edge_threshold)
+        risk.min_confidence = click.prompt("  Min AI confidence (0.60 = 60%)", type=float, default=risk.min_confidence)
+        risk.max_position_pct = click.prompt("  Max single position (% of bankroll)", type=float, default=risk.max_position_pct)
+        risk.max_exposure_pct = click.prompt("  Max total exposure (% of bankroll)", type=float, default=risk.max_exposure_pct)
+        risk.max_positions = click.prompt("  Max concurrent positions", type=int, default=risk.max_positions)
+        risk.daily_loss_limit_pct = click.prompt("  Daily loss limit (%)", type=float, default=risk.daily_loss_limit_pct)
+        risk.drawdown_circuit_breaker = click.prompt("  Drawdown circuit breaker (%)", type=float, default=risk.drawdown_circuit_breaker)
+
+    risk.max_trades_per_day = click.prompt("\n  Max trades per day", type=int, default=risk.max_trades_per_day)
+
+    # AI budget
+    ai.max_analysis_cost_per_day = click.prompt(
+        "  AI budget per day (USD)",
+        type=float, default=ai.max_analysis_cost_per_day,
+    )
+
+    # Agent mode
+    console.print("\n  [bold]Starting mode:[/bold]")
+    console.print("    signals  — AI finds edges, shows you, doesn't trade")
+    console.print("    copilot  — AI recommends, you approve each trade")
+    console.print("    autopilot — fully autonomous trading")
+    agent.mode = click.prompt(
+        "  Mode", type=click.Choice(["signals", "copilot", "autopilot"]),
+        default=agent.mode,
+    )
+
+    # Scan frequency
+    agent.scan_interval_minutes = click.prompt(
+        "  Scan interval (minutes)",
+        type=int, default=agent.scan_interval_minutes,
+    )
+
+    # Save config to database
+    if db_ready:
+        async def _save_config():
+            from polyedge.core.db import Database
+            db = Database(settings.database_url)
+            await db.connect()
+            await save_config_to_db(settings, db)
+            await db.close()
+
+        try:
+            run_async(_save_config())
+            console.print(f"\n  [green]Config saved to database (portable across environments)[/green]")
+        except Exception as e:
+            console.print(f"\n  [red]Failed to save config to DB: {e}[/red]")
+            console.print(f"  [dim]You can save later with 'polyedge config save'[/dim]")
+    else:
+        console.print(f"\n  [yellow]Database not available — config not saved.[/yellow]")
+        console.print(f"  [dim]Run 'polyedge init' again after setting up the database.[/dim]")
+
+    # --- Summary ---
+    console.print(f"\n[bold cyan]Setup Complete![/bold cyan]\n")
+
+    loss_limit = bankroll * risk.daily_loss_limit_pct
+    breaker = bankroll * (1 - risk.drawdown_circuit_breaker)
+    max_pos = bankroll * risk.max_position_pct
+
+    console.print(f"  Bankroll:           ${bankroll:,.0f}")
+    console.print(f"  Risk profile:       {'Conservative' if profile == 1 else 'Moderate' if profile == 2 else 'Aggressive' if profile == 3 else 'Custom'}")
+    console.print(f"  Kelly fraction:     {risk.kelly_fraction:.0%}")
+    console.print(f"  Max position:       ${max_pos:,.0f} ({risk.max_position_pct:.0%} of bankroll)")
+    console.print(f"  Daily loss limit:   ${loss_limit:,.0f}")
+    console.print(f"  Circuit breaker:    pauses at ${breaker:,.0f}")
+    console.print(f"  AI budget:          ${ai.max_analysis_cost_per_day:.2f}/day")
+    console.print(f"  Mode:               {agent.mode}")
+    console.print(f"  Scan every:         {agent.scan_interval_minutes} min")
+
+    console.print(f"\n[bold]Next steps:")
+    if not _get_from_keychain("poly_private_key"):
+        console.print("  1. Generate wallet:  polyedge setup")
+        console.print("  2. Fund wallet with USDC on Polygon")
+    console.print(f"  {'3' if not _get_from_keychain('poly_private_key') else '1'}. Start trading:    polyedge autopilot")
+    console.print(f"  [dim]View config:      polyedge config show[/dim]")
+    console.print(f"  [dim]Change a value:   polyedge config set risk.kelly_fraction 0.5[/dim]")
 
 
 # --- Market Data ---
@@ -400,6 +628,7 @@ def trade(market_query, side, amount, price, yolo):
         from polyedge.data.markets import search_markets
         from polyedge.core.client import PolyClient
         from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config
         from polyedge.execution.engine import ExecutionEngine
 
         settings = get_settings()
@@ -430,6 +659,8 @@ def trade(market_query, side, amount, price, yolo):
         db = Database(settings.database_url)
         await db.connect()
         await db.init_schema()
+
+        settings = await apply_db_config(settings, db)
 
         client = PolyClient(settings)
         engine = ExecutionEngine(client, db, settings)
@@ -511,13 +742,11 @@ def autopilot(mode):
     async def _autopilot():
         from polyedge.core.client import PolyClient
         from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config
         from polyedge.ai.llm import LLMClient
         from polyedge.ai.agent import TradingAgent
 
         settings = get_settings()
-
-        if mode:
-            settings.agent.mode = mode
 
         if not settings.poly_private_key:
             console.print("[red]Wallet not configured. Run 'polyedge setup' first.")
@@ -530,6 +759,12 @@ def autopilot(mode):
         db = Database(settings.database_url)
         await db.connect()
         await db.init_schema()
+
+        # Load config from DB (overrides YAML defaults)
+        settings = await apply_db_config(settings, db)
+
+        if mode:
+            settings.agent.mode = mode
 
         client = PolyClient(settings)
         llm = LLMClient(
@@ -558,6 +793,7 @@ def dashboard():
 
     async def _dashboard():
         from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config
         from polyedge.dashboard.live import Dashboard
 
         settings = get_settings()
@@ -565,6 +801,8 @@ def dashboard():
         db = Database(settings.database_url)
         await db.connect()
         await db.init_schema()
+
+        settings = await apply_db_config(settings, db)
 
         dash = Dashboard(db, settings)
         try:
@@ -849,6 +1087,150 @@ def movers(hours, min_move):
         await db.close()
 
     run_async(_movers())
+
+
+# --- Config Management ---
+
+
+@cli.command("config")
+@click.argument("action", type=click.Choice(["show", "set", "save"], case_sensitive=False))
+@click.argument("key", required=False)
+@click.argument("value", required=False)
+def config_cmd(action, key, value):
+    """View or change trading config stored in the database.
+
+    \b
+    Usage:
+      polyedge config show                          # show all config from DB
+      polyedge config set risk.kelly_fraction 0.5   # change a value
+      polyedge config save                          # push current settings to DB
+    """
+
+    async def _config():
+        from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config, save_config_to_db, settings_to_db_dict
+
+        settings = get_settings()
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        if action == "show":
+            db_config = await db.get_all_config()
+            if not db_config:
+                console.print("[yellow]No config in database yet. Run 'polyedge init' or 'polyedge config save'.")
+                await db.close()
+                return
+
+            # Group by section
+            sections: dict[str, list] = {}
+            for k in sorted(db_config.keys()):
+                section = k.split(".")[0]
+                sections.setdefault(section, []).append(k)
+
+            for section, keys in sections.items():
+                console.print(f"\n[bold cyan]{section}[/bold cyan]")
+                for k in keys:
+                    v = db_config[k]
+                    console.print(f"  {k} = [green]{v}[/green]")
+
+            console.print(f"\n[dim]{len(db_config)} config values in database[/dim]")
+
+        elif action == "set":
+            if not key or value is None:
+                console.print("[red]Usage: polyedge config set <key> <value>")
+                console.print("[dim]Example: polyedge config set risk.kelly_fraction 0.5")
+                await db.close()
+                return
+
+            # Auto-convert value types
+            parsed_value: any = value
+            if value.lower() in ("true", "false"):
+                parsed_value = value.lower() == "true"
+            elif value.replace(".", "", 1).replace("-", "", 1).isdigit():
+                parsed_value = float(value) if "." in value else int(value)
+
+            await db.set_risk_override(key, parsed_value)
+            console.print(f"[green]Set {key} = {parsed_value}[/green]")
+
+        elif action == "save":
+            # Load current settings (YAML + env), then push all to DB
+            settings = await apply_db_config(settings, db)
+            await save_config_to_db(settings, db)
+            config = settings_to_db_dict(settings)
+            console.print(f"[green]Saved {len(config)} config values to database[/green]")
+
+        await db.close()
+
+    run_async(_config())
+
+
+# --- Keychain Vault ---
+
+
+@cli.command()
+@click.argument("action", type=click.Choice(["store", "list", "remove"], case_sensitive=False))
+@click.argument("key", required=False)
+@click.argument("value", required=False)
+def vault(action, key, value):
+    """Manage secrets in macOS Keychain.
+
+    \b
+    Usage:
+      polyedge vault store poly_private_key       # prompts for value
+      polyedge vault store anthropic_api_key sk-ant-...
+      polyedge vault list                          # show stored keys
+      polyedge vault remove poly_private_key       # delete a key
+    """
+    from polyedge.core.config import KEYCHAIN_KEYS, _get_from_keychain, _set_in_keychain, KEYCHAIN_SERVICE
+
+    if action == "list":
+        console.print("[bold]Keychain secrets (polyedge):\n")
+        found = 0
+        for k in KEYCHAIN_KEYS:
+            val = _get_from_keychain(k)
+            if val:
+                # Show just first/last few chars
+                if len(val) > 12:
+                    masked = val[:4] + "..." + val[-4:]
+                else:
+                    masked = "***"
+                console.print(f"  [green]{k}[/green] = {masked}")
+                found += 1
+            else:
+                console.print(f"  [dim]{k}[/dim] = (not set)")
+        console.print(f"\n[dim]{found}/{len(KEYCHAIN_KEYS)} keys stored[/dim]")
+        return
+
+    if not key:
+        console.print("[red]Key name required. Valid keys:")
+        for k in KEYCHAIN_KEYS:
+            console.print(f"  {k}")
+        return
+
+    key = key.lower()
+    if key not in KEYCHAIN_KEYS:
+        console.print(f"[yellow]Warning: '{key}' is not a recognized key. Storing anyway.")
+
+    if action == "store":
+        if not value:
+            value = click.prompt(f"Enter value for {key}", hide_input=True)
+        if _set_in_keychain(key, value):
+            console.print(f"[green]Stored '{key}' in Keychain")
+        else:
+            console.print(f"[red]Failed to store '{key}' in Keychain")
+
+    elif action == "remove":
+        import subprocess
+        result = subprocess.run(
+            ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", key],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            console.print(f"[green]Removed '{key}' from Keychain")
+        else:
+            console.print(f"[yellow]'{key}' not found in Keychain")
 
 
 if __name__ == "__main__":
