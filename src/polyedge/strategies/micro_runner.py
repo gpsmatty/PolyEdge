@@ -162,10 +162,19 @@ class MicroRunner:
             f"[dim]Feed: Binance aggTrade (~10-50 tps) + Polymarket WS{filter_str}[/dim]"
         )
 
-        # Initial market load — skip API sync if we have a --market filter
-        # (no point syncing 5000 markets when you just want one BTC window)
+        # Initial market load — try DB first when --market filter is set,
+        # only hit the API if DB comes back empty (stale data / first run)
         if self.market_filter:
-            console.print("[dim]Loading markets from DB (skipping API sync — filter active)...[/dim]")
+            console.print("[dim]Loading markets from DB...[/dim]")
+            await self._refresh_markets()
+            if self._total_markets == 0:
+                console.print("[yellow]No matching markets in DB — syncing from API...[/yellow]")
+                try:
+                    synced = await self.indexer.sync(force=True)
+                    console.print(f"[green]Synced {synced} markets[/green]")
+                    await self._refresh_markets()
+                except Exception as e:
+                    console.print(f"[yellow]Sync failed ({e})[/yellow]")
         else:
             console.print("[dim]Syncing markets from API...[/dim]")
             try:
@@ -318,15 +327,14 @@ class MicroRunner:
     async def _market_refresh_loop(self):
         """Periodically refresh active up/down markets.
 
-        When a --market filter is set, skip the API sync entirely and just
-        read from DB.  The regular `polyedge sync` or autopilot keeps the DB
-        fresh enough — no need to hit the Gamma API every 2 minutes when
-        you're targeting a single known window.
+        When --market filter is set: skip API sync as long as we have
+        matching markets.  If markets drop to 0 (window expired), do a
+        sync to pick up the next window.
         """
         while self.running:
             try:
-                # Sync from API only when running unfiltered
-                if not self.market_filter:
+                need_sync = not self.market_filter or self._total_markets == 0
+                if need_sync:
                     try:
                         await self.indexer.sync()
                     except Exception as e:
