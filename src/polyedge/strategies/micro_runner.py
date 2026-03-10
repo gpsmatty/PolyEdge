@@ -115,6 +115,9 @@ class MicroRunner:
         # Config
         self.config = settings.strategies.micro_sniper
 
+        # Lock to prevent concurrent _quick_sync calls (refresh loop + hop can race)
+        self._sync_lock = asyncio.Lock()
+
         # Strategy
         self.strategy = MicroSniperStrategy(settings)
 
@@ -324,8 +327,11 @@ class MicroRunner:
         if self.market_filter:
             console.print("[dim]Loading markets from DB...[/dim]")
             await self._refresh_markets()
-            if self._total_markets == 0:
-                console.print("[yellow]No matching markets in DB — fetching from API...[/yellow]")
+            if self._total_markets <= 3:
+                if self._total_markets == 0:
+                    console.print("[yellow]No matching markets in DB — fetching from API...[/yellow]")
+                else:
+                    console.print(f"[yellow]Only {self._total_markets} window(s) from DB — fetching more from API...[/yellow]")
                 try:
                     fetched = await self._quick_sync()
                     if fetched:
@@ -509,9 +515,10 @@ class MicroRunner:
 
                     # If we're running low on windows, fetch more from API
                     # Trigger early (≤3) so we refetch BEFORE running out
-                    if self._total_markets <= 3:
+                    if self._total_markets <= 3 and not self._sync_lock.locked():
                         try:
-                            fetched = await self._quick_sync()
+                            async with self._sync_lock:
+                                fetched = await self._quick_sync()
                             if fetched:
                                 await self._refresh_markets(prefetched=fetched)
                         except Exception as e:
@@ -707,11 +714,12 @@ class MicroRunner:
             # Quick DB read first
             await self._refresh_markets()
 
-            if self._total_markets == 0:
+            if self._total_markets == 0 and not self._sync_lock.locked():
                 # DB doesn't have next window yet — quick fetch from API
                 console.print("[yellow]Fetching next window from API...[/yellow]")
                 try:
-                    fetched = await self._quick_sync()
+                    async with self._sync_lock:
+                        fetched = await self._quick_sync()
                     if fetched:
                         await self._refresh_markets(prefetched=fetched)
                 except Exception as e:

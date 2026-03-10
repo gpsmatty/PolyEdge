@@ -196,6 +196,7 @@ class MicroStructure:
     window_start_time: float = 0.0
     current_price: float = 0.0
     tick_count: int = 0
+    last_update_time: float = 0.0  # monotonic time of last aggTrade
 
     def __post_init__(self):
         if self.flow_5s is None:
@@ -206,12 +207,31 @@ class MicroStructure:
             self.flow_30s = TradeFlowWindow(symbol=self.symbol, window_seconds=30.0)
 
     def add_trade(self, trade: AggTrade):
-        """Add a trade to all windows."""
+        """Add a trade to all windows.
+
+        Detects gaps (>5s since last trade) which indicate a WebSocket
+        disconnect/reconnect. After a gap, reset all windows to avoid
+        stale momentum signals from pre-disconnect data.
+        """
+        now = time.monotonic()
+        if self.last_update_time > 0 and (now - self.last_update_time) > 5.0:
+            # Gap detected — WS was likely disconnected. Reset windows
+            # so we don't trade on stale momentum from before the gap.
+            logger.info(
+                f"{self.symbol}: {now - self.last_update_time:.1f}s gap detected, "
+                f"resetting flow windows"
+            )
+            self.flow_5s.reset()
+            self.flow_15s.reset()
+            self.flow_30s.reset()
+            self.tick_count = 0
+
         self.flow_5s.add(trade)
         self.flow_15s.add(trade)
         self.flow_30s.add(trade)
         self.current_price = trade.price
         self.tick_count += 1
+        self.last_update_time = now
 
     def start_window(self, price: float):
         """Reset tracking for a new prediction market window."""
