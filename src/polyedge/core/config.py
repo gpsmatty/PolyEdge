@@ -156,6 +156,24 @@ class WeatherSniperConfig(BaseModel):
     )
 
 
+class MicroSniperConfig(BaseModel):
+    enabled: bool = True
+    symbols: list[str] = Field(default_factory=lambda: ["btcusdt"])
+    entry_threshold: float = 0.25          # Momentum signal threshold to enter
+    exit_threshold: float = 0.10           # Reverse momentum threshold to exit
+    hold_threshold: float = 0.05           # Below this (aligned), exit for weak signal
+    flip_threshold: float = 0.35           # Reverse momentum threshold to flip
+    flip_min_confidence: float = 0.40      # Min confidence to flip
+    min_confidence: float = 0.30           # Min confidence to enter
+    min_trades_in_window: int = 10         # Min trades in 15s window to consider
+    min_seconds_remaining: float = 15.0    # Don't enter with less than this left
+    force_exit_seconds: float = 8.0        # Force exit with this many seconds left
+    max_entry_price: float = 0.80          # Don't buy a side priced above this
+    max_position_per_trade: float = 0.03   # 3% of bankroll per micro trade
+    max_trades_per_window: int = 50        # Max trades in a single 5-min window
+    min_liquidity: float = 500             # Min market liquidity to trade
+
+
 class MarketMakerConfig(BaseModel):
     enabled: bool = False
     min_spread: float = 0.05
@@ -168,6 +186,7 @@ class StrategiesConfig(BaseModel):
     edge_finder: EdgeFinderConfig = EdgeFinderConfig()
     crypto_sniper: CryptoSniperConfig = CryptoSniperConfig()
     weather_sniper: WeatherSniperConfig = WeatherSniperConfig()
+    micro_sniper: MicroSniperConfig = MicroSniperConfig()
     market_maker: MarketMakerConfig = MarketMakerConfig()
 
 
@@ -270,6 +289,7 @@ _CONFIG_SECTIONS = {
     "strategies.edge_finder": EdgeFinderConfig,
     "strategies.crypto_sniper": CryptoSniperConfig,
     "strategies.weather_sniper": WeatherSniperConfig,
+    "strategies.micro_sniper": MicroSniperConfig,
     "strategies.market_maker": MarketMakerConfig,
 }
 
@@ -295,6 +315,8 @@ def settings_to_db_dict(settings: Settings) -> dict[str, any]:
         config[f"strategies.crypto_sniper.{field}"] = value
     for field, value in settings.strategies.weather_sniper.model_dump().items():
         config[f"strategies.weather_sniper.{field}"] = value
+    for field, value in settings.strategies.micro_sniper.model_dump().items():
+        config[f"strategies.micro_sniper.{field}"] = value
     for field, value in settings.strategies.market_maker.model_dump().items():
         config[f"strategies.market_maker.{field}"] = value
 
