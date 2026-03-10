@@ -837,6 +837,61 @@ def sniper(auto, dry):
     run_async(_sniper())
 
 
+# --- Weather Sniper ---
+
+
+@cli.command()
+@click.option("--auto", is_flag=True, help="Auto-execute trades (no confirmation)")
+@click.option("--dry", is_flag=True, help="Dry run — show opportunities but don't trade")
+def weather(auto, dry):
+    """Start the weather sniper — trade weather markets using forecast data.
+
+    Connects to Open-Meteo for ensemble forecasts, watches Polymarket's
+    temperature and precipitation markets, and trades when professional
+    forecasts disagree with market prices.
+
+    Also detects neg-risk arbitrage on multi-bucket events.
+
+    No AI needed — pure data comparison.
+    """
+
+    async def _weather():
+        from polyedge.core.client import PolyClient
+        from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config
+        from polyedge.strategies.weather_runner import WeatherRunner
+
+        settings = get_settings()
+
+        if not settings.poly_private_key:
+            console.print("[red]Wallet not configured. Run 'polyedge setup' first.")
+            return
+
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        # Load config from DB (overrides YAML defaults)
+        settings = await apply_db_config(settings, db)
+
+        client = PolyClient(settings)
+
+        runner = WeatherRunner(
+            settings=settings,
+            client=client,
+            db=db,
+            auto_execute=auto,
+            dry_run=dry,
+        )
+
+        try:
+            await runner.run()
+        finally:
+            await db.close()
+
+    run_async(_weather())
+
+
 # --- Dashboard ---
 
 

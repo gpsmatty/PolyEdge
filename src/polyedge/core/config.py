@@ -143,6 +143,19 @@ class CryptoSniperConfig(BaseModel):
     min_liquidity: float = 500           # Min market liquidity to trade
 
 
+class WeatherSniperConfig(BaseModel):
+    enabled: bool = True
+    min_edge: float = 0.10               # 10% minimum edge to trade
+    min_confidence: float = 0.60         # Minimum confidence from ensemble
+    min_neg_risk_edge: float = 0.03      # 3% for neg-risk arbitrage
+    max_position_per_trade: float = 0.08  # 8% of bankroll per weather trade
+    min_liquidity: float = 200           # Min market liquidity
+    forecast_interval_minutes: int = 30  # How often to refresh forecasts
+    locations: list[str] = Field(
+        default_factory=lambda: ["nyc", "london", "seoul", "chicago", "miami"]
+    )
+
+
 class MarketMakerConfig(BaseModel):
     enabled: bool = False
     min_spread: float = 0.05
@@ -154,6 +167,7 @@ class StrategiesConfig(BaseModel):
     cheap_hunter: CheapHunterConfig = CheapHunterConfig()
     edge_finder: EdgeFinderConfig = EdgeFinderConfig()
     crypto_sniper: CryptoSniperConfig = CryptoSniperConfig()
+    weather_sniper: WeatherSniperConfig = WeatherSniperConfig()
     market_maker: MarketMakerConfig = MarketMakerConfig()
 
 
@@ -255,6 +269,7 @@ _CONFIG_SECTIONS = {
     "strategies.cheap_hunter": CheapHunterConfig,
     "strategies.edge_finder": EdgeFinderConfig,
     "strategies.crypto_sniper": CryptoSniperConfig,
+    "strategies.weather_sniper": WeatherSniperConfig,
     "strategies.market_maker": MarketMakerConfig,
 }
 
@@ -278,6 +293,8 @@ def settings_to_db_dict(settings: Settings) -> dict[str, any]:
         config[f"strategies.edge_finder.{field}"] = value
     for field, value in settings.strategies.crypto_sniper.model_dump().items():
         config[f"strategies.crypto_sniper.{field}"] = value
+    for field, value in settings.strategies.weather_sniper.model_dump().items():
+        config[f"strategies.weather_sniper.{field}"] = value
     for field, value in settings.strategies.market_maker.model_dump().items():
         config[f"strategies.market_maker.{field}"] = value
 
