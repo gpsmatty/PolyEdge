@@ -29,6 +29,7 @@ KEYCHAIN_SERVICE = "polyedge"
 KEYCHAIN_KEYS = [
     "poly_private_key",
     "poly_wallet_address",
+    "poly_proxy_address",
     "poly_api_key",
     "poly_api_secret",
     "poly_api_passphrase",
@@ -208,6 +209,7 @@ class Settings(BaseSettings):
     # Wallet
     poly_private_key: str = ""
     poly_wallet_address: str = ""
+    poly_proxy_address: str = ""  # Polymarket proxy wallet (funder) — needed if using web UI wallet
 
     # API credentials
     poly_api_key: str = ""

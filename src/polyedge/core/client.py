@@ -42,11 +42,23 @@ class PolyClient:
         chain_id = self.settings.polymarket.chain_id
         key = self.settings.poly_private_key
 
-        self.client = ClobClient(
-            host,
-            key=key,
-            chain_id=chain_id,
-        )
+        # If proxy address is set, use signature_type=1 (poly proxy)
+        # This is required when using a wallet imported via Polymarket's web UI
+        funder = self.settings.poly_proxy_address or None
+        if funder:
+            self.client = ClobClient(
+                host,
+                key=key,
+                chain_id=chain_id,
+                signature_type=1,
+                funder=funder,
+            )
+        else:
+            self.client = ClobClient(
+                host,
+                key=key,
+                chain_id=chain_id,
+            )
 
         # If we have API creds, set them
         if self.settings.poly_api_key:
