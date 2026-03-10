@@ -749,34 +749,36 @@ class MicroRunner:
             if not markets:
                 return
 
-        for market, parsed in markets:
-            if not market.end_date:
-                continue
+        # Only evaluate the CURRENT (first) window — the rest are pre-loaded
+        # for seamless hopping, NOT for simultaneous trading.
+        market, parsed = markets[0]
+        if not market.end_date:
+            return
 
-            remaining = (market.end_date - now).total_seconds()
-            if remaining <= 0:
-                continue
+        remaining = (market.end_date - now).total_seconds()
+        if remaining <= 0:
+            return
 
-            # Check trade cooldown for this market
-            last_trade_time = self._last_trade_log.get(market.condition_id, 0)
-            if time.time() - last_trade_time < self._trade_cooldown:
-                continue
+        # Check trade cooldown for this market
+        last_trade_time = self._last_trade_log.get(market.condition_id, 0)
+        if time.time() - last_trade_time < self._trade_cooldown:
+            return
 
-            # Check max trades per window
-            if self._trades_this_window >= self.config.max_trades_per_window:
-                continue
+        # Check max trades per window
+        if self._trades_this_window >= self.config.max_trades_per_window:
+            return
 
-            current_pos = self._positions.get(market.condition_id)
+        current_pos = self._positions.get(market.condition_id)
 
-            opp = self.strategy.evaluate(
-                market=market,
-                micro=micro,
-                seconds_remaining=remaining,
-                current_position=current_pos,
-            )
+        opp = self.strategy.evaluate(
+            market=market,
+            micro=micro,
+            seconds_remaining=remaining,
+            current_position=current_pos,
+        )
 
-            if opp:
-                await self._handle_opportunity(opp)
+        if opp:
+            await self._handle_opportunity(opp)
 
     # ------------------------------------------------------------------
     # Opportunity handling
