@@ -100,7 +100,17 @@ class MicroRunner:
         self.running = False
         self.market_filter = market_filter.lower() if market_filter else None
         # Split filter into words so "btc 5m" matches slug "btc-updown-5m-..."
+        # but NOT "btc-updown-15m-..." (5m != 15m)
         self._filter_words = self.market_filter.split() if self.market_filter else []
+
+        # Pre-compile regex patterns for each filter word — match as whole
+        # segments in slug (split by -) or whole words in question text.
+        # This prevents "5m" from matching inside "15m".
+        import re
+        self._filter_patterns = [
+            re.compile(r'(?:^|[\s\-–,])' + re.escape(w) + r'(?:[\s\-–,]|$)', re.IGNORECASE)
+            for w in self._filter_words
+        ]
 
         # Config
         self.config = settings.strategies.micro_sniper
@@ -267,12 +277,21 @@ class MicroRunner:
                 continue
             if not UP_DOWN_PATTERN.search(m.question):
                 continue
-            if self._filter_words:
-                haystack = f"{m.question.lower()} {(m.slug or '').lower()}"
-                if not all(w in haystack for w in self._filter_words):
-                    continue
+            if not self._matches_filter(m):
+                continue
             count += 1
         return count
+
+    def _matches_filter(self, market: Market) -> bool:
+        """Check if a market matches the --market filter words.
+
+        Uses word-boundary matching so "5m" matches "btc-updown-5m-123"
+        but NOT "btc-updown-15m-123".
+        """
+        if not self._filter_patterns:
+            return True
+        haystack = f"{market.question} {market.slug or ''}"
+        return all(p.search(haystack) for p in self._filter_patterns)
 
     async def run(self):
         """Main micro sniper loop."""
@@ -514,13 +533,10 @@ class MicroRunner:
             if not market.end_date or market.end_date <= now:
                 continue
 
-            # Apply user's --market filter — every word must appear somewhere
-            # in question or slug.  e.g. "btc 5m" matches slug "btc-updown-5m-..."
-            # and "bitcoin" matches question "Bitcoin Up or Down ..."
-            if self._filter_words:
-                haystack = f"{q.lower()} {(market.slug or '').lower()}"
-                if not all(w in haystack for w in self._filter_words):
-                    continue
+            # Apply user's --market filter with word-boundary matching
+            # "btc 5m" matches "btc-updown-5m-..." but NOT "btc-updown-15m-..."
+            if not self._matches_filter(market):
+                continue
 
             # Extract symbol
             symbol = None
