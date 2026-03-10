@@ -64,10 +64,11 @@ class MarketIndexer:
             console.print("[yellow]No markets returned from API")
             return 0
 
-        # Upsert each market + record price snapshot
+        # Bulk upsert all markets + record price snapshots in two batch operations
+        market_dicts = []
         price_snapshots = []
         for market in markets:
-            market_dict = {
+            market_dicts.append({
                 "condition_id": market.condition_id,
                 "question": market.question,
                 "slug": market.slug,
@@ -83,10 +84,7 @@ class MarketIndexer:
                 "liquidity": market.liquidity,
                 "spread": market.spread,
                 "raw": market.raw or {},
-            }
-            await self.db.upsert_market(market_dict)
-
-            # Collect price snapshots for bulk insert
+            })
             price_snapshots.append((
                 market.condition_id,
                 market.yes_price,
@@ -96,7 +94,7 @@ class MarketIndexer:
                 market.spread,
             ))
 
-        # Bulk insert price history
+        await self.db.bulk_upsert_markets(market_dicts)
         await self.db.bulk_record_prices(price_snapshots)
 
         # Deactivate markets that disappeared from API
