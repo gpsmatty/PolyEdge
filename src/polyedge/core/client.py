@@ -279,6 +279,18 @@ class PolyClient:
         )
         return self.client.get_balance_allowance(params)
 
+    def update_token_allowance(self, token_id: str) -> dict:
+        """Update allowance for a conditional token so it can be sold.
+
+        Must be called before selling tokens that were received via FOK buy.
+        """
+        self.ensure_ready()
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        )
+        return self.client.update_balance_allowance(params)
+
     # --- Wallet ---
 
     @staticmethod

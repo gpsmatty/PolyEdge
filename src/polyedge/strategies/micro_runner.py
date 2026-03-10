@@ -1017,6 +1017,13 @@ class MicroRunner:
 
             poly_order_id = result.get("orderID", result.get("id", ""))
             if poly_order_id:
+                # Update allowance so we can SELL these tokens later.
+                # Without this, the exchange contract can't move our conditional tokens.
+                try:
+                    self.client.update_token_allowance(token_id)
+                except Exception as e:
+                    logger.warning(f"Token allowance update failed (non-fatal): {e}")
+
                 # Record in DB
                 try:
                     order_id = await self.db.insert_order({
@@ -1125,17 +1132,39 @@ class MicroRunner:
         size = 0
         try:
             bal = self.client.get_token_balance(token_id)
-            raw_bal = int(bal.get("balance", 0))
-            # Conditional token balance is in 6-decimal wei (like USDC)
-            size = round(raw_bal / 1e6, 2)
+            logger.info(f"Token balance response for {token_id}: {bal}")
+            # Balance may be a raw string number or dict with 'balance' key
+            if isinstance(bal, dict):
+                raw_bal = bal.get("balance", 0)
+            else:
+                raw_bal = bal
+            # Convert from 6-decimal USDC-style wei to human-readable
+            raw_int = int(float(str(raw_bal)))
+            if raw_int > 1_000_000:
+                # Looks like wei (e.g. 15600000 = 15.6 shares)
+                size = round(raw_int / 1e6, 2)
+            else:
+                # Already in human-readable units
+                size = round(float(str(raw_bal)), 2)
         except Exception as e:
             logger.warning(f"Token balance lookup failed, falling back to DB: {e}")
             size = round(db_size, 2)
+
+        if not self.quiet:
+            console.print(f"  [dim]Token balance: {size} shares (DB: {db_size})[/dim]")
 
         if size <= 0:
             # No tokens to sell — just clear our tracking
             logger.info(f"No token balance for {token_id}, clearing tracking")
             return True
+
+        # Ensure exchange has allowance to move our conditional tokens.
+        # This is required before any SELL — the exchange contract needs
+        # approval to transfer tokens from our wallet.
+        try:
+            self.client.update_token_allowance(token_id)
+        except Exception as e:
+            logger.warning(f"Token allowance update before sell failed: {e}")
 
         try:
             # For SELL FOK, amount = shares to sell (not USD)
