@@ -1143,17 +1143,20 @@ class MicroRunner:
                 raw_bal = bal.get("balance", 0)
             else:
                 raw_bal = bal
-            # Convert from 6-decimal USDC-style wei to human-readable
+            # Convert from 6-decimal USDC-style wei to human-readable.
+            # CRITICAL: Always truncate DOWN, never round().  round() can
+            # round UP (e.g. 5.926176 → 5.93) making us try to sell more
+            # tokens than we actually own → "not enough balance" error.
             raw_int = int(float(str(raw_bal)))
             if raw_int > 1_000_000:
                 # Looks like wei (e.g. 15600000 = 15.6 shares)
-                size = round(raw_int / 1e6, 2)
+                size = int(raw_int / 1e6 * 100) / 100  # truncate to 2 dp
             else:
                 # Already in human-readable units
-                size = round(float(str(raw_bal)), 2)
+                size = int(float(str(raw_bal)) * 100) / 100
         except Exception as e:
             logger.warning(f"Token balance lookup failed, falling back to DB: {e}")
-            size = round(db_size, 2)
+            size = int(float(db_size) * 100) / 100
 
         if not self.quiet:
             console.print(f"  [dim]Token balance: {size} shares (DB: {db_size})[/dim]")
