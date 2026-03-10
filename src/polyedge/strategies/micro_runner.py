@@ -422,8 +422,8 @@ class MicroRunner:
             # Sort by end_date ascending — first entry is the current live window
             market_list.sort(key=lambda mp: mp[0].end_date)
 
-            # Take the nearest window (current) + next one (so we can transition)
-            selected = market_list[:2]
+            # Take the nearest window (current) + next few for seamless hopping
+            selected = market_list[:3]
 
             self.updown_markets[symbol] = selected
 
@@ -466,6 +466,80 @@ class MicroRunner:
             )
 
     # ------------------------------------------------------------------
+    # Window hopping — seamless transition between 5-min windows
+    # ------------------------------------------------------------------
+
+    async def _hop_window(self, symbol: str, now: datetime):
+        """Current window expired — immediately hop to the next one.
+
+        If we pre-loaded the next window (selected[:2] in refresh), promote it.
+        If no next window is available, trigger a fast refresh from DB/API to
+        pick up newly created windows.
+        """
+        markets = self.updown_markets.get(symbol, [])
+        expired = markets[0][0] if markets else None
+
+        # Close any position on the expired market
+        if expired:
+            cid = expired.condition_id
+            pos = self._positions.pop(cid, None)
+            if pos and not self.quiet:
+                console.print(
+                    f"[yellow]Window expired — auto-closed {pos.upper()} position on "
+                    f"{expired.question}[/yellow]"
+                )
+
+        # Remove expired window, promote next
+        live = [(m, p) for m, p in markets if m.end_date and m.end_date > now]
+
+        if live:
+            # We have the next window pre-loaded — instant hop
+            self.updown_markets[symbol] = live
+            next_mkt = live[0][0]
+            remaining = (next_mkt.end_date - now).total_seconds()
+            self._trades_this_window = 0
+
+            # Re-subscribe Polymarket WS to new token IDs
+            new_tokens: list[str] = []
+            self._token_to_market.clear()
+            for sym, mlist in self.updown_markets.items():
+                for m, _ in mlist:
+                    if len(m.clob_token_ids) >= 2:
+                        self._token_to_market[m.clob_token_ids[0]] = (m, "yes")
+                        self._token_to_market[m.clob_token_ids[1]] = (m, "no")
+                        new_tokens.extend(m.clob_token_ids[:2])
+
+            new_set = set(new_tokens)
+            if new_set != self._subscribed_tokens and new_tokens:
+                await self._start_poly_feed(new_tokens)
+
+            console.print(
+                f"\n[bold green]{'='*60}[/bold green]"
+                f"\n[bold green]WINDOW HOP → {next_mkt.question}[/bold green]"
+                f"\n[bold green]{remaining:.0f}s remaining | "
+                f"YES={next_mkt.yes_price:.2f} NO={next_mkt.no_price:.2f}[/bold green]"
+                f"\n[bold green]{'='*60}[/bold green]\n"
+            )
+        else:
+            # No next window pre-loaded — need to refresh from DB/API
+            console.print("[yellow]Window expired, no next window cached — refreshing...[/yellow]")
+            self._trades_this_window = 0
+
+            # Quick DB read first
+            await self._refresh_markets()
+
+            if self._total_markets == 0:
+                # DB doesn't have next window yet — sync from API
+                console.print("[yellow]Syncing from API for next window...[/yellow]")
+                try:
+                    await self.indexer.sync(force=True)
+                    await self._refresh_markets()
+                except Exception as e:
+                    logger.warning(f"Hop sync failed: {e}")
+
+        self._total_markets = sum(len(v) for v in self.updown_markets.values())
+
+    # ------------------------------------------------------------------
     # Core eval loop — called on every aggTrade tick
     # ------------------------------------------------------------------
 
@@ -484,11 +558,21 @@ class MicroRunner:
         if self._eval_count % 5 != 0:
             return
 
+        now = datetime.now(timezone.utc)
+
+        # Check if the current (first) window has expired — if so, hop to next
+        current_market = markets[0][0]
+        if current_market.end_date and current_market.end_date <= now:
+            await self._hop_window(symbol, now)
+            # Re-fetch after hop
+            markets = self.updown_markets.get(symbol, [])
+            if not markets:
+                return
+
         for market, parsed in markets:
             if not market.end_date:
                 continue
 
-            now = datetime.now(timezone.utc)
             remaining = (market.end_date - now).total_seconds()
             if remaining <= 0:
                 continue
