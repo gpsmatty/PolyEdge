@@ -133,6 +133,16 @@ class EdgeFinderConfig(BaseModel):
     use_news: bool = True
 
 
+class CryptoSniperConfig(BaseModel):
+    enabled: bool = True
+    min_edge: float = 0.08              # 8% minimum edge to trade
+    min_price_move_pct: float = 0.002   # 0.2% minimum price move to consider
+    max_seconds_before_entry: float = 90  # Only enter with <90s remaining
+    symbols: list[str] = Field(default_factory=lambda: ["btcusdt", "ethusdt", "solusdt"])
+    max_position_per_trade: float = 0.05  # 5% of bankroll per snipe
+    min_liquidity: float = 500           # Min market liquidity to trade
+
+
 class MarketMakerConfig(BaseModel):
     enabled: bool = False
     min_spread: float = 0.05
@@ -143,6 +153,7 @@ class MarketMakerConfig(BaseModel):
 class StrategiesConfig(BaseModel):
     cheap_hunter: CheapHunterConfig = CheapHunterConfig()
     edge_finder: EdgeFinderConfig = EdgeFinderConfig()
+    crypto_sniper: CryptoSniperConfig = CryptoSniperConfig()
     market_maker: MarketMakerConfig = MarketMakerConfig()
 
 
@@ -243,6 +254,7 @@ _CONFIG_SECTIONS = {
     "agent": AgentConfig,
     "strategies.cheap_hunter": CheapHunterConfig,
     "strategies.edge_finder": EdgeFinderConfig,
+    "strategies.crypto_sniper": CryptoSniperConfig,
     "strategies.market_maker": MarketMakerConfig,
 }
 
@@ -264,6 +276,8 @@ def settings_to_db_dict(settings: Settings) -> dict[str, any]:
         config[f"strategies.cheap_hunter.{field}"] = value
     for field, value in settings.strategies.edge_finder.model_dump().items():
         config[f"strategies.edge_finder.{field}"] = value
+    for field, value in settings.strategies.crypto_sniper.model_dump().items():
+        config[f"strategies.crypto_sniper.{field}"] = value
     for field, value in settings.strategies.market_maker.model_dump().items():
         config[f"strategies.market_maker.{field}"] = value
 

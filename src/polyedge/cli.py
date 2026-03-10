@@ -784,6 +784,59 @@ def autopilot(mode):
     run_async(_autopilot())
 
 
+# --- Crypto Sniper ---
+
+
+@cli.command()
+@click.option("--auto", is_flag=True, help="Auto-execute trades (no confirmation)")
+@click.option("--dry", is_flag=True, help="Dry run — show opportunities but don't trade")
+def sniper(auto, dry):
+    """Start the crypto sniper — real-time trading on short-duration crypto markets.
+
+    Connects to Binance for live prices, watches Polymarket's 5-minute and
+    15-minute crypto "Up or Down" markets, and trades when the price feed
+    shows near-certain outcomes before Polymarket adjusts.
+
+    No AI needed — pure math and speed.
+    """
+
+    async def _sniper():
+        from polyedge.core.client import PolyClient
+        from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config
+        from polyedge.strategies.sniper_runner import SniperRunner
+
+        settings = get_settings()
+
+        if not settings.poly_private_key:
+            console.print("[red]Wallet not configured. Run 'polyedge setup' first.")
+            return
+
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        # Load config from DB (overrides YAML defaults)
+        settings = await apply_db_config(settings, db)
+
+        client = PolyClient(settings)
+
+        runner = SniperRunner(
+            settings=settings,
+            client=client,
+            db=db,
+            auto_execute=auto,
+            dry_run=dry,
+        )
+
+        try:
+            await runner.run()
+        finally:
+            await db.close()
+
+    run_async(_sniper())
+
+
 # --- Dashboard ---
 
 
