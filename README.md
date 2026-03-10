@@ -11,15 +11,13 @@ Scans thousands of markets, estimates true probabilities with LLMs, detects misp
 cd PolyEdge
 pip install -e ".[dev]"
 
-# Configure
-cp .env.example .env
-# Edit .env with your keys:
-#   POLY_PRIVATE_KEY, ANTHROPIC_API_KEY, DATABASE_URL
+# First-run wizard (secrets, database, wallet, risk profile — all in one)
+polyedge init
 
-# Initialize database
+# Or set up manually:
+polyedge vault store database_url
+polyedge vault store anthropic_api_key
 polyedge initdb
-
-# Generate wallet (first time only)
 polyedge setup
 
 # Scan markets
@@ -151,19 +149,52 @@ Each cycle (every 5 minutes):
 
 44 tests covering models, Kelly criterion, position sizing, portfolio risk, order book analysis, and strategy logic.
 
+## Secrets Management (macOS Keychain)
+
+All secrets are stored in macOS Keychain — encrypted at rest, unlocked when you log in. No `.env` file with plaintext keys needed.
+
+```bash
+# Store secrets (prompts for hidden input)
+polyedge vault store poly_private_key
+polyedge vault store poly_wallet_address 0x...
+polyedge vault store database_url
+polyedge vault store anthropic_api_key
+polyedge vault store openai_api_key
+polyedge vault store poly_api_key
+polyedge vault store poly_api_secret
+polyedge vault store poly_api_passphrase
+polyedge vault store news_api_key
+
+# Verify what's stored
+polyedge vault list
+
+# Remove a key
+polyedge vault remove openai_api_key
+```
+
+Priority order: Keychain > environment variables > `.env` file > defaults.
+
 ## Configuration
 
-Environment variables (`.env`):
-```
-POLY_PRIVATE_KEY=0x...
-POLY_WALLET_ADDRESS=0x...
-POLY_API_KEY=...
-POLY_API_SECRET=...
-POLY_API_PASSPHRASE=...
-DATABASE_URL=postgresql://...
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-NEWS_API_KEY=...
+All trading config lives in the **database** — portable across environments (Mac, VPS, App Platform, etc.).
+
+```bash
+# View all config
+polyedge config show
+
+# Change a value (takes effect on next scan cycle)
+polyedge config set risk.kelly_fraction 0.5
+polyedge config set agent.mode autopilot
+polyedge config set ai.max_analysis_cost_per_day 10.0
+
+# Push current settings to DB
+polyedge config save
 ```
 
-Strategy and risk params: `config/default.yaml`
+**Secrets**: macOS Keychain via `polyedge vault` (see above). Falls back to environment variables or `.env` file.
+
+**Trading config**: Database (`risk_config` table). Set via `polyedge init` wizard or `polyedge config set`.
+
+**Fallback defaults**: `config/default.yaml` — used when DB has no value for a key.
+
+Priority: Database > Keychain (secrets) > env vars > `.env` > YAML > Pydantic defaults.

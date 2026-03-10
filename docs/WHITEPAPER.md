@@ -95,7 +95,15 @@ With a $200 starting bankroll, capital preservation is existential. One bad day 
 - 25% drawdown circuit breaker (if bankroll drops to $150, pause everything)
 - Manual override via Ctrl+C in any mode
 
-Every parameter is configurable in YAML and overridable via database at runtime.
+Every parameter lives in the database — portable across any environment. Change anything at runtime with `polyedge config set`, no restart needed.
+
+## Security: Secrets in the Vault
+
+Trading bots handle sensitive credentials — wallet private keys, API keys, database URLs. PolyEdge stores all secrets in macOS Keychain rather than plaintext `.env` files.
+
+The Keychain is encrypted at rest by macOS and unlocks when you log into your Mac. No Touch ID prompts during normal operation — the bot reads secrets silently as long as you're logged in. Lock your Mac and the secrets are locked too.
+
+A built-in `polyedge vault` CLI manages the Keychain entries. The config loader checks Keychain first, then falls back to environment variables and `.env` files, so you can migrate gradually or use different approaches per environment.
 
 ## Agent Memory
 
@@ -134,6 +142,8 @@ Start in signals mode, graduate to copilot once you trust the signals, then auto
 **Cost-conscious AI.** Every LLM call is budget-tracked, two-tier models keep costs under $1/hour, and the system degrades gracefully when budget runs out (cheap hunter still works, AI just pauses).
 
 **Persistent learning.** Agent memory means the system gets better over time without manual intervention. Calibration tracking shows whether the AI is actually good at probability estimation, not just confident.
+
+**Portable config.** All trading config lives in PostgreSQL, not local files. Move from Mac to VPS to App Platform — your risk limits, AI settings, and strategy config follow the database.
 
 ## The Bet
 

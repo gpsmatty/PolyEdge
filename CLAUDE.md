@@ -31,7 +31,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 
 | File | Purpose | Key exports |
 |------|---------|-------------|
-| `config.py` | All configuration. Loads from `.env` + `config/default.yaml`. | `Settings`, `load_config()`, `AIConfig`, `RiskConfig`, `AgentConfig` |
+| `config.py` | All configuration. Loads from Keychain + `.env` + `config/default.yaml`. | `Settings`, `load_config()`, `AIConfig`, `RiskConfig`, `AgentConfig`, `_get_from_keychain()`, `_set_in_keychain()`, `load_keychain_secrets()`, `KEYCHAIN_KEYS` |
 | `models.py` | Every data model (Pydantic). | `Market`, `OrderBook`, `OrderBookLevel`, `Signal`, `Order`, `Position`, `Trade`, `AIAnalysis`, `PortfolioSnapshot`, `Side`, `AgentMode` |
 | `client.py` | Wrapper around `py-clob-client`. Handles auth, order placement, market data. | `PolyClient` |
 | `db.py` | PostgreSQL storage. All tables defined in `SCHEMA_SQL` string at top of file. | `Database` (async, uses connection pool) |
@@ -83,7 +83,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 
 ### CLI (`src/polyedge/cli.py`)
 
-Click-based CLI. Commands: `setup`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `autopilot`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`.
+Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `autopilot`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
 
 ## Database Schema
 
@@ -97,7 +97,7 @@ All tables in the `polyedge` schema (PostgreSQL). Defined in `core/db.py` as the
 | `positions` | Open positions. Unique on `(market_id, token_id, side)`. |
 | `ai_analyses` | Every AI analysis result with probability, confidence, reasoning, cost. |
 | `portfolio_snapshots` | Point-in-time portfolio state. |
-| `risk_config` | Runtime risk parameter overrides (key-value JSONB). |
+| `risk_config` | All trading config (risk, AI, agent, strategies). Key-value JSONB. Portable across environments. |
 | `price_history` | Price snapshots per market per sync. Used for price mover detection. |
 | `ai_cost_log` | Every AI API call with tokens, cost, purpose. Used for budget tracking. |
 | `agent_memory` | Persistent agent memory: trade decisions, skip reasons, lessons. |
@@ -163,11 +163,37 @@ The AI sees a ~100 token text summary via `format_book_for_ai()`, not the raw or
 
 ## Configuration
 
-**Environment variables** (`.env`): Secrets — wallet key, API keys, database URL.
+**Priority order** (highest wins):
+1. **Database** (`risk_config` table) — All trading config. Portable across environments (Mac, VPS, App Platform). Managed via `polyedge config` CLI or `polyedge init` wizard.
+2. **macOS Keychain** — Secrets only (wallet key, API keys, DB URL). Managed via `polyedge vault` CLI.
+3. **Environment variables** — Explicit `export` in shell overrides Keychain.
+4. **`.env` file** — Legacy fallback. Not needed if using Keychain.
+5. **YAML** (`config/default.yaml`) — Defaults/fallback when DB has no value.
+6. **Pydantic defaults** — Hardcoded fallbacks in `config.py`.
 
-**YAML** (`config/default.yaml`): All strategy params, risk limits, AI model selection, agent behavior. Loaded by `load_config()` which overlays YAML onto env-based defaults.
+**DB config keys** use dot notation: `risk.kelly_fraction`, `ai.max_analysis_cost_per_day`, `agent.mode`, `strategies.cheap_hunter.enabled`, etc. All non-secret config lives in the `risk_config` table as JSONB key-value pairs.
 
-**Database overrides** (`risk_config` table): Runtime changes to risk params without restart. Checked via `db.get_risk_override(key)`.
+**Config CLI:**
+- `polyedge config show` — display all config from DB
+- `polyedge config set <key> <value>` — change a single value
+- `polyedge config save` — push current in-memory settings to DB
+
+## Secrets / Keychain Integration
+
+Secrets are stored in macOS Keychain under the service name `polyedge`. The `config.py` module handles this:
+
+- `KEYCHAIN_KEYS` — List of all secret field names: `poly_private_key`, `poly_wallet_address`, `poly_api_key`, `poly_api_secret`, `poly_api_passphrase`, `database_url`, `anthropic_api_key`, `openai_api_key`, `news_api_key`.
+- `_get_from_keychain(account)` — Reads a secret via `security find-generic-password`.
+- `_set_in_keychain(account, value)` — Writes a secret via `security add-generic-password`.
+- `load_keychain_secrets()` — Loads all known secrets from Keychain into a dict.
+- `load_config()` — Injects Keychain secrets into `os.environ` before `Settings()` reads them.
+- `apply_db_config(settings, db)` — Async. Overlays DB config values onto a `Settings` object. DB wins over YAML.
+- `save_config_to_db(settings, db)` — Async. Writes all non-secret settings to DB for portability.
+- `settings_to_db_dict(settings)` — Flattens `Settings` into namespaced key-value pairs (`risk.kelly_fraction`, etc).
+
+CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entries. `store` without a value prompts with hidden input.
+
+**Important:** Never log, print, or expose secret values. The `vault list` command masks values (shows first/last 4 chars only).
 
 ## Key Design Decisions
 
@@ -177,6 +203,8 @@ The AI sees a ~100 token text summary via `format_book_for_ai()`, not the raw or
 - **Two-tier AI** — Cheap model filters before expensive model analyzes. Keeps costs under $1/hour.
 - **Agent memory** — Persistent across sessions. Lessons never expire. Trade decisions expire after 30 days. Skip reasons expire after 6 hours.
 - **Market indexer** — Don't hit the Gamma API every scan cycle. Sync to DB periodically, read from DB always.
+- **Keychain over .env** — Secrets encrypted at rest by macOS. No plaintext keys in the repo directory.
+- **Config in DB** — Trading config stored in PostgreSQL, not local YAML files. Portable across Mac, VPS, App Platform, etc.
 
 ## Testing
 
@@ -215,8 +243,13 @@ The AI sees a ~100 token text summary via `format_book_for_ai()`, not the raw or
 4. Run `polyedge initdb` to apply
 
 **Changing AI models:**
-- Config: `config/default.yaml` under `ai.research_model` and `ai.compute_model`
+- DB: `polyedge config set ai.research_model claude-sonnet-4-6`
+- Or YAML fallback: `config/default.yaml` under `ai.research_model` and `ai.compute_model`
 - Cost table: `COST_TABLE` dict in `llm.py`
+
+**Changing risk params at runtime:**
+- `polyedge config set risk.kelly_fraction 0.5`
+- Takes effect on next scan cycle (no restart needed)
 
 **Adding a new data source to AI analysis:**
 1. Build the data fetcher in `data/`
