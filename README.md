@@ -2,7 +2,7 @@
 
 AI-powered trading bot for [Polymarket](https://polymarket.com) prediction markets.
 
-Scans thousands of markets, estimates true probabilities with LLMs, detects mispricings, sizes positions with Kelly criterion, and executes trades on the CLOB — all from a single Python process. Includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets.
+Scans thousands of markets, estimates true probabilities with LLMs, detects mispricings, sizes positions with Kelly criterion, and executes trades on the CLOB — all from a single Python process. Includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, and a high-frequency micro sniper that reads Binance aggTrade order flow to momentum-trade 5-minute crypto windows.
 
 ## Quick Start
 
@@ -36,6 +36,11 @@ polyedge weather --dry   # Watch mode
 polyedge weather         # Copilot
 polyedge weather --auto  # Autopilot
 
+# Micro sniper — high-frequency momentum trading on 5-min crypto markets
+polyedge micro --dry --market "btc 5m"   # Watch BTC 5-min only
+polyedge micro --market "btc 5m"         # Copilot — confirm each trade
+polyedge micro --auto --market "btc 5m"  # Autopilot — auto-execute
+
 # Start the general agent
 polyedge autopilot --mode signals    # Display-only mode
 polyedge autopilot --mode copilot    # Recommends, you approve
@@ -68,6 +73,7 @@ polyedge/
 │   ├── db.py           # PostgreSQL (asyncpg)
 │   └── models.py       # All data models
 ├── data/
+│   ├── binance_aggtrade.py # Binance aggTrade feed (tick-level order flow)
 │   ├── binance_feed.py   # Binance WebSocket price feed (BTC/ETH/SOL)
 │   ├── book_analyzer.py  # Order book microstructure analysis
 │   ├── indexer.py        # Market sync (API → DB)
@@ -87,6 +93,8 @@ polyedge/
 │   ├── crypto_sniper.py   # Real-time crypto price feed arbitrage
 │   ├── edge_finder.py     # AI-detected mispricings
 │   ├── market_maker.py    # Spread capture (WIP)
+│   ├── micro_sniper.py    # HF momentum strategy (aggTrade order flow)
+│   ├── micro_runner.py    # Persistent loop for micro sniper
 │   ├── sniper_runner.py   # Persistent async loop for crypto sniper
 │   ├── weather_sniper.py  # Weather forecast vs market price arbitrage
 │   └── weather_runner.py  # Persistent loop for weather sniper
