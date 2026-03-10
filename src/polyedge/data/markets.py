@@ -18,8 +18,13 @@ async def fetch_active_markets(
     category: Optional[str] = None,
     min_liquidity: float = 0,
     active: bool = True,
-) -> list[Market]:
-    """Fetch active markets from the Gamma API."""
+) -> tuple[list[Market], int]:
+    """Fetch active markets from the Gamma API.
+
+    Returns (filtered_markets, raw_count) where raw_count is the number
+    of items the API actually returned (before filtering). This is needed
+    for pagination — we stop when raw_count < limit.
+    """
     url = f"{settings.polymarket.gamma_url}/markets"
     params = {
         "limit": limit,
@@ -36,6 +41,7 @@ async def fetch_active_markets(
                 raise RuntimeError(f"Gamma API error: {resp.status}")
             data = await resp.json()
 
+    raw_count = len(data)
     markets = []
     for item in data:
         try:
@@ -46,7 +52,7 @@ async def fetch_active_markets(
         except (KeyError, ValueError):
             continue
 
-    return markets
+    return markets, raw_count
 
 
 async def fetch_all_markets(
@@ -56,22 +62,25 @@ async def fetch_all_markets(
 ) -> list[Market]:
     """Fetch ALL active markets, paginating with offset until exhausted.
 
-    The Gamma API returns ~100 per page. We keep going until we get a
-    page with fewer results than batch_size (meaning we hit the end).
+    The Gamma API returns up to 100 per page. We keep going until the API
+    returns fewer than batch_size raw items (meaning we hit the end).
+    Pagination is based on raw API count, NOT filtered count — otherwise
+    a page with many low-liquidity markets would falsely terminate early.
+
     max_pages is a safety cap to prevent infinite loops.
     """
     all_markets = []
     batch_size = 100
 
     for page in range(max_pages):
-        batch = await fetch_active_markets(
+        batch, raw_count = await fetch_active_markets(
             settings,
             limit=batch_size,
             offset=page * batch_size,
             min_liquidity=min_liquidity,
         )
         all_markets.extend(batch)
-        if len(batch) < batch_size:
+        if raw_count < batch_size:
             break  # Last page — no more results
 
     return all_markets

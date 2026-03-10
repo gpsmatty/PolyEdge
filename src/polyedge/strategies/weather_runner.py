@@ -170,7 +170,7 @@ class WeatherRunner:
     async def _refresh_markets(self):
         """Fetch and filter for active weather markets."""
         try:
-            all_markets = await fetch_active_markets(
+            all_markets, _ = await fetch_active_markets(
                 self.settings,
                 limit=100,
                 min_liquidity=self.weather_config.min_liquidity,

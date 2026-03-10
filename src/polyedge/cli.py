@@ -330,7 +330,7 @@ def scan(limit, min_liquidity, category):
         settings = get_settings()
         console.print("[dim]Fetching markets...[/dim]")
 
-        markets = await fetch_active_markets(
+        markets, _ = await fetch_active_markets(
             settings,
             limit=limit,
             min_liquidity=min_liquidity,
@@ -1083,7 +1083,7 @@ def feed(market_query, duration):
                 return
             markets = markets[:1]
         else:
-            markets = await fetch_active_markets(settings, limit=5)
+            markets, _ = await fetch_active_markets(settings, limit=5)
 
         asset_ids = []
         for m in markets:

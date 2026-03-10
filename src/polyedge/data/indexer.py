@@ -53,11 +53,11 @@ class MarketIndexer:
 
         console.print("[dim]Syncing markets from Polymarket API...[/dim]")
 
-        # Fetch all markets from Gamma API
+        # Fetch all markets from Gamma API — paginate through everything
         markets = await fetch_all_markets(
             self.settings,
             min_liquidity=0,  # Get everything, filter later
-            max_pages=10,
+            max_pages=50,     # Up to 5000 markets
         )
 
         if not markets:

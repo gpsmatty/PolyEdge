@@ -34,7 +34,7 @@ from polyedge.core.client import PolyClient
 from polyedge.core.db import Database
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_feed import BinanceFeed, PriceSnapshot, PriceWindow
-from polyedge.data.markets import fetch_all_markets
+from polyedge.data.indexer import MarketIndexer
 from polyedge.data.ws_feed import MarketFeed, EVENT_BEST_BID_ASK, EVENT_LAST_TRADE
 from polyedge.risk.sizing import calculate_position_size
 from polyedge.strategies.crypto_sniper import (
@@ -48,8 +48,9 @@ from polyedge.strategies.crypto_sniper import (
 logger = logging.getLogger("polyedge.sniper_runner")
 console = Console()
 
-# How often to refresh the crypto market list from Polymarket
-MARKET_REFRESH_INTERVAL = 60  # seconds
+# How often to re-read crypto markets from the DB.
+# The MarketIndexer handles API sync separately (default every 15 min).
+MARKET_REFRESH_INTERVAL = 120  # seconds
 
 # How often to evaluate threshold/bucket markets
 SLOW_EVAL_INTERVAL = 30  # seconds
@@ -88,6 +89,9 @@ class SniperRunner:
         self.strategy = CryptoSniperStrategy(settings)
         self.config = settings.strategies.crypto_sniper
         sniper_config = self.config
+
+        # Market indexer — reads from DB, syncs from API periodically
+        self.indexer = MarketIndexer(settings, db)
 
         # Binance price feed (crypto spot prices — required)
         self.binance = BinanceFeed(symbols=sniper_config.symbols)
@@ -137,6 +141,14 @@ class SniperRunner:
             f"[dim]Market types: Up/Down + Threshold + Bucket | "
             f"Dual WebSocket: Binance + Polymarket[/dim]"
         )
+
+        # Initial market sync — ensure DB has fresh data before we start
+        console.print("[dim]Syncing all markets from Polymarket API...[/dim]")
+        try:
+            synced = await self.indexer.sync(force=True)
+            console.print(f"[green]Synced {synced} markets to DB[/green]")
+        except Exception as e:
+            console.print(f"[yellow]Initial sync failed ({e}) — using existing DB data[/yellow]")
 
         # Register Binance price callback for up/down opportunity detection
         self.binance.on_any_price(self._on_price_update)
@@ -308,28 +320,35 @@ class SniperRunner:
             await asyncio.sleep(MARKET_REFRESH_INTERVAL)
 
     async def _refresh_crypto_markets(self):
-        """Fetch and classify all active crypto markets.
+        """Load crypto markets from the DB (synced by MarketIndexer).
+
+        The indexer handles full API pagination (100/page until exhausted),
+        upserts to Postgres, and deactivates stale/closed markets. We just
+        read from the DB — fast, complete, no API rate limit worries.
 
         Also manages Polymarket WebSocket subscriptions — restarts the
         WS connection when the token ID set changes significantly.
         """
         try:
-            all_markets = await fetch_all_markets(
-                self.settings,
+            # Indexer auto-syncs from API if data is stale (default: every 15 min)
+            all_markets = await self.indexer.get_markets(
                 min_liquidity=self.settings.strategies.crypto_sniper.min_liquidity,
-                max_pages=10,
+                limit=5000,
             )
         except Exception as e:
-            logger.warning(f"Failed to fetch markets: {e}")
+            logger.warning(f"Failed to load markets from DB: {e}")
             return
 
         crypto = find_crypto_markets(all_markets)
 
         if self.verbose:
+            sync_ago = self.indexer.minutes_since_sync
+            sync_str = f"{sync_ago:.0f}m ago" if sync_ago else "just now"
             console.print(
                 f"\n[bold cyan]── Market Refresh ──[/bold cyan] "
-                f"API returned {len(all_markets)} total, "
-                f"{len(crypto)} crypto matches"
+                f"{len(all_markets)} markets in DB (liq ≥ ${self.config.min_liquidity:,.0f}), "
+                f"{len(crypto)} are crypto "
+                f"(last sync: {sync_str})"
             )
 
         # Classify and group
