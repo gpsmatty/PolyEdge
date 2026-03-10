@@ -1166,9 +1166,12 @@ class MicroRunner:
         # The actual on-chain approval is done once at startup via
         # ensure_exchange_approved(). This just syncs the cache.
         try:
-            self.client.update_token_allowance(token_id)
+            refresh = self.client.update_token_allowance(token_id)
+            if not self.quiet:
+                console.print(f"  [dim]Allowance refresh: {refresh}[/dim]")
         except Exception as e:
-            logger.debug(f"Token allowance cache refresh failed (non-fatal): {e}")
+            if not self.quiet:
+                console.print(f"  [dim]Allowance refresh failed: {e}[/dim]")
 
         # Check order book bid depth from WebSocket to see what's available.
         # Bids = people willing to buy our tokens. Walk the book to find
