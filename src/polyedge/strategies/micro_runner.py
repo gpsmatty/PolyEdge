@@ -245,6 +245,15 @@ class MicroRunner:
 
             found.extend(page_markets)
 
+            # DEBUG: Show first few questions + slugs on page 0 so we can see
+            # what the API actually returns and why the filter might not match.
+            if page == 0 and page_markets:
+                console.print(f"[dim]  DEBUG: {len(page_markets)} markets on page 1. First 5:[/dim]")
+                for dm in page_markets[:5]:
+                    console.print(f"[dim]    Q: {dm.question[:80]}[/dim]")
+                    console.print(f"[dim]    Slug: {dm.slug[:60]}  End: {dm.end_date}[/dim]")
+                    console.print(f"[dim]    Filter match: {self._matches_filter(dm)}  UP_DOWN: {bool(UP_DOWN_PATTERN.search(dm.question))}[/dim]")
+
             # Check if we have any matching crypto markets yet
             matches = self._count_filter_matches(page_markets)
             if matches > 0:
