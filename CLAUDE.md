@@ -193,7 +193,7 @@ Defined in `weather_runner.py` `WeatherRunner.run()`. Runs as a persistent async
 
 Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async process, separate from the agent, crypto sniper, and weather sniper. Reads tick-level Binance aggTrade data to momentum-trade Polymarket's 5-minute crypto up/down markets.
 
-1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket.
+1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket. Skips the first partial window to warm up microstructure data — waits for the next fresh window before trading.
 2. **aggTrade callback** (every 5th trade tick, ~2-10 evals/sec) — On each Binance aggTrade, updates `MicroStructure` rolling flow windows (5s/15s/30s OFI, VWAP drift, trade intensity). Evaluates only the current (first) window — rest are pre-loaded for seamless hopping.
 3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 40% OFI_5s + 30% OFI_15s + 20% VWAP drift + 10% intensity surge.
 4. **Entry** — When `|momentum| > 0.40` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.20-0.70, enter a position (BUY YES if bullish, BUY NO if bearish). **30s trend filter**: if entry direction disagrees with the 30-second OFI trend, requires higher threshold of 0.55 (counter_trend_threshold) instead of 0.40. This kills counter-trend entries that are the #1 source of losses.
