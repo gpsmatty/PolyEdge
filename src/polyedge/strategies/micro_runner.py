@@ -508,25 +508,25 @@ class MicroRunner:
         """
         now = datetime.now(timezone.utc)
 
+        # Load ALL markets from DB with no liquidity filter — 5-min crypto
+        # markets can have low reported liquidity despite massive activity.
+        # Skip find_crypto_markets() which has extra filters from the regular
+        # sniper that don't apply here.
         try:
             all_markets = await self.indexer.get_markets(
-                min_liquidity=self.config.min_liquidity,
+                min_liquidity=0,
                 limit=5000,
             )
         except Exception as e:
             logger.warning(f"Failed to load markets: {e}")
             return
 
-        crypto = find_crypto_markets(all_markets)
-
-        # Collect all matching markets per symbol, then pick the nearest live one
+        # Simple filter: UP_DOWN_PATTERN + user filter + live (not expired)
         candidates: dict[str, list[tuple[Market, ParsedCryptoMarket]]] = {}
 
-        for market in crypto:
+        for market in all_markets:
             q = market.question
             if not UP_DOWN_PATTERN.search(q):
-                continue
-            if EXCLUDED_PATTERNS.search(q):
                 continue
 
             # Skip markets that have already ended
@@ -534,7 +534,6 @@ class MicroRunner:
                 continue
 
             # Apply user's --market filter with word-boundary matching
-            # "btc 5m" matches "btc-updown-5m-..." but NOT "btc-updown-15m-..."
             if not self._matches_filter(market):
                 continue
 
