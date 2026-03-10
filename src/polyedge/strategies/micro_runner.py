@@ -161,6 +161,11 @@ class MicroRunner:
         # Rate limiting: don't trade the same market more than once per N seconds
         self._trade_cooldown: float = 10.0  # seconds between trades on same market
 
+        # On startup, wait for the next fresh window instead of jumping into
+        # a partially-elapsed one with stale microstructure data.
+        self._waiting_for_fresh_window: bool = True
+        self._startup_window_id: str | None = None  # condition_id of the window we're skipping
+
     async def _quick_sync(self):
         """Targeted API fetch for crypto 5-min markets.
 
@@ -359,6 +364,18 @@ class MicroRunner:
             )
             self.agg_feed = BinanceAggTradeFeed(symbols=active_symbols)
             self.ticker_feed = BinanceFeed(symbols=active_symbols)
+
+        # Log that we're waiting for a fresh window on startup
+        if self._waiting_for_fresh_window and self._total_markets > 0:
+            for sym, mlist in self.updown_markets.items():
+                current = mlist[0][0]
+                remaining = (current.end_date - datetime.now(timezone.utc)).total_seconds()
+                self._startup_window_id = current.condition_id
+                console.print(
+                    f"[yellow]Waiting for fresh window — skipping "
+                    f"{current.question} ({remaining:.0f}s left). "
+                    f"Warming up microstructure data...[/yellow]"
+                )
 
         # Register aggTrade callback — this is the main eval loop
         self.agg_feed.on_any_trade(self._on_agg_trade)
@@ -713,6 +730,14 @@ class MicroRunner:
             if new_set != self._subscribed_tokens and new_tokens:
                 await self._start_poly_feed(new_tokens)
 
+            # Clear startup wait flag — this is a fresh window, start trading
+            if self._waiting_for_fresh_window:
+                self._waiting_for_fresh_window = False
+                console.print(
+                    "[bold green]Fresh window ready — microstructure warmed up, "
+                    "starting to trade![/bold green]"
+                )
+
             console.print(
                 f"\n[bold green]{'='*60}[/bold green]"
                 f"\n[bold green]WINDOW HOP → {next_mkt.question}[/bold green]"
@@ -738,6 +763,14 @@ class MicroRunner:
                         await self._refresh_markets(prefetched=fetched)
                 except Exception as e:
                     logger.warning(f"Hop sync failed: {e}")
+
+            # Clear startup wait flag after refresh too
+            if self._waiting_for_fresh_window and self._total_markets > 0:
+                self._waiting_for_fresh_window = False
+                console.print(
+                    "[bold green]Fresh window ready — microstructure warmed up, "
+                    "starting to trade![/bold green]"
+                )
 
         self._total_markets = sum(len(v) for v in self.updown_markets.values())
 
@@ -769,6 +802,32 @@ class MicroRunner:
             # Re-fetch after hop
             markets = self.updown_markets.get(symbol, [])
             if not markets:
+                return
+
+        # On startup, skip trading until the first fresh window starts.
+        # The aggTrade callback still fires (warming up microstructure).
+        # We detect the new window by checking if markets[0] is different
+        # from the window we started on (refresh loop prunes expired ones).
+        if self._waiting_for_fresh_window:
+            current_cid = markets[0][0].condition_id if markets else None
+            if current_cid and current_cid != self._startup_window_id:
+                # The startup window expired and was pruned — we're on a fresh one
+                self._waiting_for_fresh_window = False
+                self._trades_this_window = 0
+                next_mkt = markets[0][0]
+                remaining = (next_mkt.end_date - now).total_seconds()
+                console.print(
+                    "[bold green]Fresh window ready — microstructure warmed up, "
+                    "starting to trade![/bold green]"
+                )
+                console.print(
+                    f"\n[bold green]{'='*60}[/bold green]"
+                    f"\n[bold green]WINDOW HOP → {next_mkt.question}[/bold green]"
+                    f"\n[bold green]{remaining:.0f}s remaining | "
+                    f"YES={next_mkt.yes_price:.2f} NO={next_mkt.no_price:.2f}[/bold green]"
+                    f"\n[bold green]{'='*60}[/bold green]\n"
+                )
+            else:
                 return
 
         # Only evaluate the CURRENT (first) window — the rest are pre-loaded
@@ -1080,6 +1139,7 @@ class MicroRunner:
             n_pos = len(self._positions)
             pos_str = f"Pos: {n_pos}" if n_pos > 0 else "Flat"
             poly_str = f"live/{self._ws_price_updates}" if self._poly_connected else "api"
+            warmup_str = " | [yellow]WARMING UP — waiting for fresh window[/yellow]" if self._waiting_for_fresh_window else ""
 
             console.print(
                 f"\n[bold dim]── Micro Status ── "
@@ -1089,6 +1149,7 @@ class MicroRunner:
                 f"Trades: {self._total_trades} (flips: {self._total_flips}) | "
                 f"Evals: {self._eval_count} | "
                 f"Prices: {poly_str}[/bold dim]"
+                f"{warmup_str}"
             )
 
     async def _get_bankroll(self) -> float:
