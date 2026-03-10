@@ -1011,7 +1011,7 @@ class MicroRunner:
         # place_fok_order takes USD amount directly — SDK handles rounding to avoid
         # the "invalid amounts" error where maker_amount has >2 decimal places.
         price = opp.market_price
-        entry_price = min(round(price + 0.03, 2), 0.99)  # Pay up to 3c more for instant fill
+        entry_price = min(round(price + 0.05, 2), 0.99)  # Pay up to 5c more for instant fill
         size = round(size_usd / entry_price, 2) if entry_price > 0 else 0
 
         signal = self.strategy.opportunity_to_signal(opp)
@@ -1083,7 +1083,7 @@ class MicroRunner:
             if "fully filled" in err_msg or "FOK" in err_msg:
                 # FOK rejected — not enough liquidity at our price. Normal, just skip.
                 if not self.quiet:
-                    console.print("[dim]  FOK rejected — no liquidity, skipping[/dim]")
+                    console.print(f"[dim]  FOK rejected @ ${entry_price:.2f} (mkt ${price:.2f}) — no liquidity[/dim]")
             else:
                 console.print(f"[red]  Execution error: {e}[/red]")
                 logger.error(f"Micro execution failed: {e}", exc_info=True)
