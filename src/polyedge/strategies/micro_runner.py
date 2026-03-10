@@ -148,6 +148,49 @@ class MicroRunner:
         # Rate limiting: don't trade the same market more than once per N seconds
         self._trade_cooldown: float = 3.0  # seconds between trades on same market
 
+    async def _quick_sync(self):
+        """Fast targeted API fetch — only grabs 5 pages (500 markets) instead of
+        the full 10,000. BTC/ETH/SOL 5-min markets have massive volume so they
+        appear in the first few pages when sorted by volume. Takes ~2-3 seconds
+        instead of 30-60 seconds for a full sync.
+        """
+        from polyedge.data.markets import fetch_all_markets
+
+        console.print("[dim]Quick fetch (500 markets)...[/dim]")
+        markets = await fetch_all_markets(
+            self.settings,
+            min_liquidity=0,
+            max_pages=5,  # 500 markets max — enough for current crypto windows
+        )
+
+        if not markets:
+            console.print("[yellow]Quick fetch returned 0 markets[/yellow]")
+            return
+
+        # Upsert just these markets to DB
+        market_dicts = []
+        for m in markets:
+            market_dicts.append({
+                "condition_id": m.condition_id,
+                "question": m.question,
+                "slug": m.slug,
+                "description": m.description,
+                "category": m.category,
+                "end_date": m.end_date,
+                "active": m.active,
+                "closed": m.closed,
+                "clob_token_ids": m.clob_token_ids,
+                "yes_price": m.yes_price,
+                "no_price": m.no_price,
+                "volume": m.volume,
+                "liquidity": m.liquidity,
+                "spread": m.spread,
+                "raw": m.raw or {},
+            })
+
+        await self.db.bulk_upsert_markets(market_dicts)
+        console.print(f"[green]Quick synced {len(markets)} markets[/green]")
+
     async def run(self):
         """Main micro sniper loop."""
         self.running = True
@@ -171,13 +214,12 @@ class MicroRunner:
             console.print("[dim]Loading markets from DB...[/dim]")
             await self._refresh_markets()
             if self._total_markets == 0:
-                console.print("[yellow]No matching markets in DB — syncing from API...[/yellow]")
+                console.print("[yellow]No matching markets in DB — quick API fetch...[/yellow]")
                 try:
-                    synced = await self.indexer.sync(force=True)
-                    console.print(f"[green]Synced {synced} markets[/green]")
+                    await self._quick_sync()
                     await self._refresh_markets()
                 except Exception as e:
-                    console.print(f"[yellow]Sync failed ({e})[/yellow]")
+                    console.print(f"[yellow]Quick fetch failed ({e})[/yellow]")
         else:
             console.print("[dim]Syncing markets from API...[/dim]")
             try:
@@ -336,12 +378,18 @@ class MicroRunner:
         """
         while self.running:
             try:
-                need_sync = not self.market_filter or self._total_markets == 0
-                if need_sync:
+                if not self.market_filter:
+                    # Full sync for unfiltered mode
                     try:
                         await self.indexer.sync()
                     except Exception as e:
                         logger.warning(f"Background sync failed: {e}")
+                elif self._total_markets == 0:
+                    # Quick targeted fetch when filtered and out of windows
+                    try:
+                        await self._quick_sync()
+                    except Exception as e:
+                        logger.warning(f"Quick sync failed: {e}")
 
                 await self._refresh_markets()
             except Exception as e:
@@ -529,10 +577,10 @@ class MicroRunner:
             await self._refresh_markets()
 
             if self._total_markets == 0:
-                # DB doesn't have next window yet — sync from API
-                console.print("[yellow]Syncing from API for next window...[/yellow]")
+                # DB doesn't have next window yet — quick fetch from API
+                console.print("[yellow]Fetching next window from API...[/yellow]")
                 try:
-                    await self.indexer.sync(force=True)
+                    await self._quick_sync()
                     await self._refresh_markets()
                 except Exception as e:
                     logger.warning(f"Hop sync failed: {e}")
