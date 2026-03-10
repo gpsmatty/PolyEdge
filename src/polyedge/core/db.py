@@ -162,6 +162,39 @@ CREATE INDEX IF NOT EXISTS idx_price_history_ts ON polyedge.price_history(record
 CREATE INDEX IF NOT EXISTS idx_ai_cost_log_ts ON polyedge.ai_cost_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_memory_market ON polyedge.agent_memory(market_id);
 CREATE INDEX IF NOT EXISTS idx_agent_memory_type ON polyedge.agent_memory(memory_type);
+
+CREATE TABLE IF NOT EXISTS polyedge.pnl_ledger (
+    id SERIAL PRIMARY KEY,
+    market_id TEXT NOT NULL,
+    question TEXT DEFAULT '',
+    strategy TEXT DEFAULT '',
+    side TEXT NOT NULL,
+    size FLOAT NOT NULL,
+    entry_fill_price FLOAT NOT NULL,
+    exit_fill_price FLOAT,
+    gross_pnl FLOAT DEFAULT 0,
+    fees_paid FLOAT DEFAULT 0,
+    net_pnl FLOAT DEFAULT 0,
+    gas_estimate FLOAT DEFAULT 0,
+    pnl_type TEXT DEFAULT 'trade',
+    clob_buy_order_id TEXT DEFAULT '',
+    clob_sell_order_id TEXT DEFAULT '',
+    entry_time TIMESTAMPTZ,
+    exit_time TIMESTAMPTZ,
+    reconciled_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS polyedge.reconcile_state (
+    id SERIAL PRIMARY KEY,
+    last_cursor TEXT DEFAULT 'MA==',
+    last_fill_timestamp BIGINT DEFAULT 0,
+    total_fills_processed INT DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_pnl_ledger_market ON polyedge.pnl_ledger(market_id);
+CREATE INDEX IF NOT EXISTS idx_pnl_ledger_strategy ON polyedge.pnl_ledger(strategy);
+CREATE INDEX IF NOT EXISTS idx_pnl_ledger_time ON polyedge.pnl_ledger(entry_time);
 """
 
 
@@ -352,6 +385,26 @@ class Database:
                 exit_price,
                 pnl,
                 status,
+            )
+
+    async def close_trade_by_market(
+        self, market_id: str, exit_price: float, pnl: float
+    ):
+        """Close the most recent open trade for a market by condition_id."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE polyedge.trades
+                SET exit_price=$2, pnl=$3, status='CLOSED', closed_at=NOW()
+                WHERE trade_id = (
+                    SELECT trade_id FROM polyedge.trades
+                    WHERE market_id=$1 AND status='OPEN'
+                    ORDER BY opened_at DESC LIMIT 1
+                )
+                """,
+                market_id,
+                exit_price,
+                pnl,
             )
 
     async def get_open_trades(self) -> list[dict]:
@@ -797,3 +850,128 @@ class Database:
                 "closed": closed,
                 "inactive": inactive,
             }
+
+    # --- P&L Ledger ---
+
+    async def insert_pnl_entry(self, entry: dict):
+        """Insert a reconciled P&L ledger entry."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO polyedge.pnl_ledger
+                    (market_id, question, strategy, side, size,
+                     entry_fill_price, exit_fill_price, gross_pnl,
+                     fees_paid, net_pnl, gas_estimate, pnl_type,
+                     clob_buy_order_id, clob_sell_order_id,
+                     entry_time, exit_time)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                """,
+                entry["market_id"],
+                entry.get("question", ""),
+                entry.get("strategy", ""),
+                entry["side"],
+                entry["size"],
+                entry["entry_fill_price"],
+                entry.get("exit_fill_price"),
+                entry.get("gross_pnl", 0),
+                entry.get("fees_paid", 0),
+                entry.get("net_pnl", 0),
+                entry.get("gas_estimate", 0),
+                entry.get("pnl_type", "trade"),
+                entry.get("clob_buy_order_id", ""),
+                entry.get("clob_sell_order_id", ""),
+                entry.get("entry_time"),
+                entry.get("exit_time"),
+            )
+
+    async def get_pnl_ledger(
+        self,
+        strategy: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Get reconciled P&L entries."""
+        async with self.pool.acquire() as conn:
+            if strategy:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM polyedge.pnl_ledger
+                    WHERE strategy = $1
+                    ORDER BY entry_time DESC LIMIT $2
+                    """,
+                    strategy,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM polyedge.pnl_ledger
+                    ORDER BY entry_time DESC LIMIT $1
+                    """,
+                    limit,
+                )
+            return [dict(r) for r in rows]
+
+    async def get_pnl_summary(self, strategy: str | None = None) -> dict:
+        """Get aggregate P&L summary from the ledger."""
+        async with self.pool.acquire() as conn:
+            where = "WHERE strategy = $1" if strategy else ""
+            params = [strategy] if strategy else []
+
+            row = await conn.fetchrow(
+                f"""
+                SELECT
+                    COUNT(*) as total_trades,
+                    COALESCE(SUM(gross_pnl), 0) as total_gross_pnl,
+                    COALESCE(SUM(fees_paid), 0) as total_fees,
+                    COALESCE(SUM(net_pnl), 0) as total_net_pnl,
+                    COALESCE(SUM(gas_estimate), 0) as total_gas,
+                    COUNT(*) FILTER (WHERE net_pnl > 0) as wins,
+                    COUNT(*) FILTER (WHERE net_pnl < 0) as losses,
+                    COUNT(*) FILTER (WHERE net_pnl = 0) as breakeven,
+                    COALESCE(AVG(net_pnl) FILTER (WHERE net_pnl > 0), 0) as avg_win,
+                    COALESCE(AVG(net_pnl) FILTER (WHERE net_pnl < 0), 0) as avg_loss,
+                    COALESCE(SUM(size * entry_fill_price), 0) as total_volume
+                FROM polyedge.pnl_ledger
+                {where}
+                """,
+                *params,
+            )
+            return dict(row) if row else {}
+
+    # --- Reconcile State ---
+
+    async def get_reconcile_state(self) -> dict:
+        """Get the last reconciliation cursor."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM polyedge.reconcile_state ORDER BY id DESC LIMIT 1"
+            )
+            if row:
+                return dict(row)
+            return {
+                "last_cursor": "MA==",
+                "last_fill_timestamp": 0,
+                "total_fills_processed": 0,
+            }
+
+    async def update_reconcile_state(
+        self, last_cursor: str, last_fill_timestamp: int, total_fills: int
+    ):
+        """Update or insert reconciliation state."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO polyedge.reconcile_state
+                    (id, last_cursor, last_fill_timestamp,
+                     total_fills_processed, updated_at)
+                VALUES (1, $1, $2, $3, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    last_cursor = EXCLUDED.last_cursor,
+                    last_fill_timestamp = EXCLUDED.last_fill_timestamp,
+                    total_fills_processed = EXCLUDED.total_fills_processed,
+                    updated_at = NOW()
+                """,
+                last_cursor,
+                last_fill_timestamp,
+                total_fills,
+            )
