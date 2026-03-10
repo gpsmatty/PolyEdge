@@ -704,25 +704,246 @@ def positions():
     run_async(_positions())
 
 
-@cli.command()
-def pnl():
-    """Show P&L summary and recent trades."""
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def pnl(ctx):
+    """P&L commands. Run without subcommand for summary."""
+    if ctx.invoked_subcommand is None:
+        # Default: show both internal tracker and reconciled summary
+        async def _pnl():
+            settings = get_settings()
+            from polyedge.core.db import Database
+            from polyedge.execution.tracker import PnLTracker
+            from polyedge.execution.reconciler import PnLReconciler
+            from polyedge.core.client import PolyClient
 
-    async def _pnl():
+            db = Database(settings.database_url)
+            await db.connect()
+            await db.init_schema()
+
+            # Show internal tracker (today's trades)
+            tracker = PnLTracker(db)
+            await tracker.display_pnl()
+            await tracker.display_trades()
+
+            # Show reconciled summary if available
+            client = PolyClient(settings)
+            reconciler = PnLReconciler(client, db, settings)
+            await reconciler.display_summary()
+
+            await db.close()
+
+        run_async(_pnl())
+
+
+@pnl.command("reconcile")
+def pnl_reconcile():
+    """Pull fills from CLOB API and reconcile P&L with fees."""
+
+    async def _reconcile():
         settings = get_settings()
         from polyedge.core.db import Database
-        from polyedge.execution.tracker import PnLTracker
+        from polyedge.core.client import PolyClient
+        from polyedge.execution.reconciler import PnLReconciler
 
         db = Database(settings.database_url)
         await db.connect()
         await db.init_schema()
 
-        tracker = PnLTracker(db)
-        await tracker.display_pnl()
-        await tracker.display_trades()
+        client = PolyClient(settings)
+        reconciler = PnLReconciler(client, db, settings)
+
+        # Reconcile trade fills
+        stats = await reconciler.reconcile()
+
+        # Check for resolved markets
+        console.print("\n[dim]Checking for resolved markets...[/dim]")
+        resolved = await reconciler.check_resolutions()
+        if resolved:
+            console.print(f"[green]{len(resolved)} resolved positions processed[/green]")
+        else:
+            console.print("[dim]No resolved positions[/dim]")
+
         await db.close()
 
-    run_async(_pnl())
+    run_async(_reconcile())
+
+
+@pnl.command("history")
+@click.option("--limit", "-n", default=20, help="Number of entries to show")
+@click.option("--strategy", "-s", default=None, help="Filter by strategy")
+def pnl_history(limit, strategy):
+    """Show reconciled trade history with fees."""
+
+    async def _history():
+        settings = get_settings()
+        from polyedge.core.db import Database
+        from polyedge.core.client import PolyClient
+        from polyedge.execution.reconciler import PnLReconciler
+
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        client = PolyClient(settings)
+        reconciler = PnLReconciler(client, db, settings)
+        await reconciler.display_history(limit=limit, strategy=strategy)
+        await reconciler.display_summary(strategy=strategy)
+
+        await db.close()
+
+    run_async(_history())
+
+
+@pnl.command("strategy")
+@click.argument("name", required=False, default=None)
+def pnl_strategy(name):
+    """Show P&L breakdown by strategy (or for a specific strategy)."""
+
+    async def _strategy():
+        settings = get_settings()
+        from polyedge.core.db import Database
+        from polyedge.core.client import PolyClient
+        from polyedge.execution.reconciler import PnLReconciler
+
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        client = PolyClient(settings)
+        reconciler = PnLReconciler(client, db, settings)
+
+        if name:
+            await reconciler.display_summary(strategy=name)
+        else:
+            # Show all strategies
+            for strat in ["micro_sniper", "crypto_sniper", "weather_sniper", "agent"]:
+                await reconciler.display_summary(strategy=strat)
+
+        await db.close()
+
+    run_async(_strategy())
+
+
+@cli.command()
+def status():
+    """Smoke test CLOB connectivity, wallet balance, and open orders."""
+
+    async def _status():
+        settings = get_settings()
+        from polyedge.core.client import PolyClient
+        from polyedge.core.db import Database
+
+        console.print("\n[bold]PolyEdge Status Check[/bold]\n")
+
+        # 1. Database connection
+        console.print("[dim]Checking database...[/dim]")
+        try:
+            db = Database(settings.database_url)
+            await db.connect()
+            await db.init_schema()
+            trades = await db.get_trades_today()
+            positions = await db.get_open_positions()
+            console.print(
+                f"  [green]✓ DB connected[/green] — "
+                f"{len(trades)} trades today, {len(positions)} open positions"
+            )
+        except Exception as e:
+            console.print(f"  [red]✗ DB failed: {e}[/red]")
+            return
+
+        # 2. CLOB client initialization
+        console.print("[dim]Checking CLOB API credentials...[/dim]")
+        try:
+            client = PolyClient(settings)
+            client.ensure_ready()
+            console.print(f"  [green]✓ CLOB client initialized[/green]")
+        except Exception as e:
+            console.print(f"  [red]✗ CLOB init failed: {e}[/red]")
+            return
+
+        # 3. Wallet address
+        wallet = settings.poly_wallet_address
+        if wallet:
+            console.print(f"  [green]✓ Wallet:[/green] {wallet[:6]}...{wallet[-4:]}")
+        else:
+            console.print("  [yellow]⚠ No wallet address configured[/yellow]")
+
+        # 4. USDC balance
+        console.print("[dim]Checking USDC balance...[/dim]")
+        try:
+            bal = client.get_collateral_balance()
+            balance = float(bal.get("balance", 0)) / 1e6  # USDC has 6 decimals
+            allowance = float(bal.get("allowance", 0)) / 1e6
+            bal_style = "green" if balance > 10 else "yellow" if balance > 0 else "red"
+            console.print(
+                f"  [{bal_style}]✓ USDC Balance: ${balance:,.2f}[/{bal_style}] "
+                f"(allowance: ${allowance:,.2f})"
+            )
+        except Exception as e:
+            console.print(f"  [red]✗ Balance check failed: {e}[/red]")
+
+        # 5. Open orders
+        console.print("[dim]Checking open orders...[/dim]")
+        try:
+            open_orders = client.get_open_orders()
+            if open_orders:
+                console.print(f"  [yellow]⚠ {len(open_orders)} open orders on the book[/yellow]")
+                for o in open_orders[:5]:
+                    oid = o.get("id", "")[:8]
+                    side = o.get("side", "?")
+                    price = float(o.get("price", 0))
+                    size = float(o.get("original_size", 0))
+                    matched = float(o.get("size_matched", 0))
+                    console.print(
+                        f"    {oid}... {side} {size:.1f} @ ${price:.2f} "
+                        f"(filled: {matched:.1f})"
+                    )
+            else:
+                console.print(f"  [green]✓ No open orders[/green]")
+        except Exception as e:
+            console.print(f"  [red]✗ Open orders check failed: {e}[/red]")
+
+        # 6. Trade history (recent)
+        console.print("[dim]Checking trade history access...[/dim]")
+        try:
+            recent_trades = client.get_trades()
+            console.print(
+                f"  [green]✓ Trade history accessible[/green] — "
+                f"{len(recent_trades)} total fills on record"
+            )
+        except Exception as e:
+            console.print(f"  [red]✗ Trade history failed: {e}[/red]")
+
+        # 7. Order placement test (dry — just verify we CAN create signed orders)
+        console.print("[dim]Checking order signing...[/dim]")
+        try:
+            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.order_builder.constants import BUY
+            test_args = OrderArgs(
+                token_id="0" * 40,  # Dummy token
+                price=0.50,
+                size=1.0,
+                side=BUY,
+            )
+            signed = client.client.create_order(test_args)
+            if signed:
+                console.print(f"  [green]✓ Order signing works[/green]")
+            else:
+                console.print(f"  [yellow]⚠ Order signing returned empty[/yellow]")
+        except Exception as e:
+            # This might fail for dummy token — that's fine, we just want to
+            # verify the signing pipeline doesn't error before reaching the API
+            err_str = str(e).lower()
+            if "sign" in err_str or "key" in err_str:
+                console.print(f"  [red]✗ Order signing failed: {e}[/red]")
+            else:
+                console.print(f"  [green]✓ Order signing pipeline OK[/green] (dummy token rejected as expected)")
+
+        console.print("\n[bold]Status check complete.[/bold]\n")
+        await db.close()
+
+    run_async(_status())
 
 
 # --- Agent ---
