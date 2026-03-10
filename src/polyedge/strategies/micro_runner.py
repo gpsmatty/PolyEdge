@@ -1166,29 +1166,85 @@ class MicroRunner:
         except Exception as e:
             logger.warning(f"Token allowance update before sell failed: {e}")
 
-        try:
-            # For SELL FOK, amount = shares to sell (not USD)
-            result = self.client.place_fok_order(
-                token_id=token_id,
-                side="SELL",
-                amount=size,
-                price=sell_price,
-            )
-
-            order_id = result.get("orderID", result.get("id", ""))
-
-            # FOK fills instantly or cancels — no need to poll.
-            # Trust the API response: if post_order didn't throw, assume filled.
-            fill_price = sell_price
-
+        # Check order book bid depth from WebSocket to see what's available.
+        # Bids = people willing to buy our tokens. Walk the book to find
+        # how much we can sell and at what weighted-average price.
+        book = self.poly_feed.books.get(token_id)
+        available_at_floor = 0.0
+        if book and book.bids:
+            for bid in book.bids:
+                if bid.price >= sell_price:
+                    available_at_floor += bid.size
             if not self.quiet:
-                console.print(
-                    f"[yellow]  SOLD {current_pos.upper()} {size:.1f} @ ${sell_price:.2f} "
-                    f"— Order: {order_id}[/yellow]"
+                top_bids = book.bids[:3]
+                bid_str = " | ".join(f"${b.price:.2f}×{b.size:.0f}" for b in top_bids)
+                console.print(f"  [dim]Book bids: {bid_str} — {available_at_floor:.0f} shares above ${sell_price:.2f}[/dim]")
+
+        # Sell in chunks if needed. FOK requires the full amount to fill,
+        # so if our position > book depth, split into what's available.
+        remaining = size
+        total_sold = 0.0
+        total_proceeds = 0.0
+        sell_attempts = 0
+        max_attempts = 3  # Don't spam the API
+
+        while remaining > 0.5 and sell_attempts < max_attempts:
+            sell_attempts += 1
+            # Sell the smaller of: what we have left, or what the book shows.
+            # If we can't see the book, just try the full amount.
+            chunk = remaining
+            if available_at_floor > 0 and available_at_floor < remaining:
+                chunk = round(min(available_at_floor, remaining), 2)
+                if chunk < 0.5:
+                    break  # Not enough liquidity, stop trying
+
+            chunk = round(chunk, 2)
+
+            try:
+                result = self.client.place_fok_order(
+                    token_id=token_id,
+                    side="SELL",
+                    amount=chunk,
+                    price=sell_price,
                 )
+                order_id = result.get("orderID", result.get("id", ""))
+                total_sold += chunk
+                total_proceeds += chunk * sell_price
+                remaining = round(remaining - chunk, 2)
+
+                if not self.quiet:
+                    console.print(
+                        f"[yellow]  SOLD {current_pos.upper()} {chunk:.1f} @ ${sell_price:.2f} "
+                        f"— Order: {order_id}[/yellow]"
+                    )
+
+            except Exception as e:
+                err_msg = str(e)
+                if "fully filled" in err_msg or "FOK" in err_msg:
+                    # FOK rejected — try a smaller chunk or lower price
+                    if chunk > 2.0:
+                        # Try half the chunk
+                        available_at_floor = chunk / 2
+                        if not self.quiet:
+                            console.print(f"[yellow]  FOK rejected at {chunk:.1f} — retrying smaller[/yellow]")
+                        continue
+                    else:
+                        if not self.quiet:
+                            console.print(f"[yellow]  FOK sell rejected — no liquidity at ${sell_price:.2f}[/yellow]")
+                        break
+                elif "not enough balance" in err_msg:
+                    console.print(f"[red]  Sell failed: not enough balance/allowance[/red]")
+                    break
+                else:
+                    console.print(f"[red]  Sell failed: {e}[/red]")
+                    logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
+                    break
+
+        if total_sold > 0:
+            fill_price = total_proceeds / total_sold if total_sold > 0 else sell_price
 
             # Record exit price + P&L in trades table
-            gross_pnl = (fill_price - entry_price) * size if entry_price > 0 else 0
+            gross_pnl = (fill_price - entry_price) * total_sold if entry_price > 0 else 0
             try:
                 await self.db.close_trade_by_market(
                     market_id=cid,
@@ -1198,29 +1254,32 @@ class MicroRunner:
             except Exception as e:
                 logger.warning(f"Trade close recording failed (non-fatal): {e}")
 
-            # Remove DB position
-            try:
-                await self.db.remove_position(cid, token_id, current_pos)
-            except Exception as e:
-                logger.warning(f"DB position update failed (non-fatal): {e}")
+            # Remove DB position (or update size if partial fill)
+            if remaining <= 0.5:
+                try:
+                    await self.db.remove_position(cid, token_id, current_pos)
+                except Exception as e:
+                    logger.warning(f"DB position update failed (non-fatal): {e}")
+            else:
+                # Partial fill — update remaining size in DB
+                logger.warning(f"Partial sell: {total_sold:.1f}/{size:.1f} filled, {remaining:.1f} remaining")
 
             if not self.quiet and entry_price > 0:
                 pnl_style = "green" if gross_pnl >= 0 else "red"
+                sold_label = f"{total_sold:.1f}/{size:.1f}" if remaining > 0.5 else f"{total_sold:.1f}"
                 console.print(
                     f"  [{pnl_style}]P&L: ${gross_pnl:+.2f} "
-                    f"(entry ${entry_price:.2f} → exit ${fill_price:.2f})"
+                    f"(entry ${entry_price:.2f} → exit ${fill_price:.2f}, {sold_label} shares)"
                     f"  ✓ filled[/{pnl_style}]"
                 )
 
-            return True
-
-        except Exception as e:
-            err_msg = str(e)
-            if "fully filled" in err_msg or "FOK" in err_msg:
-                console.print(f"[yellow]  FOK sell rejected — no liquidity at ${sell_price:.2f}[/yellow]")
+            # If fully sold, clear position tracking
+            if remaining <= 0.5:
+                return True
             else:
-                console.print(f"[red]  Sell failed: {e}[/red]")
-                logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
+                # Partial — will retry on next eval tick
+                return False
+        else:
             return False
 
     # ------------------------------------------------------------------
