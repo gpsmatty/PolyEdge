@@ -841,6 +841,76 @@ def sniper(auto, dry, verbose, quiet):
     run_async(_sniper())
 
 
+# --- Micro Sniper ---
+
+
+@cli.command()
+@click.option("--auto", is_flag=True, help="Auto-execute trades (no confirmation)")
+@click.option("--dry", is_flag=True, help="Dry run — show momentum signals but don't trade")
+@click.option("--verbose", "-v", is_flag=True, help="Show detailed evaluations")
+@click.option("--quiet", "-q", is_flag=True, help="Suppress eval output, show only trades + status")
+@click.option("--market", "-m", default=None, help="Filter to specific market (e.g. 'btc', '5 minute', 'bitcoin 5')")
+def micro(auto, dry, verbose, quiet, market):
+    """Start the micro sniper — high-frequency momentum trading on 5-min crypto markets.
+
+    \b
+    Connects to Binance aggTrade for tick-level order flow, reads momentum
+    from buy/sell imbalance, VWAP drift, and trade intensity, then trades
+    Polymarket's 5-minute up/down crypto markets.
+
+    Can make up to 50 trades per 5-minute window. Small position sizes
+    (1-3% of bankroll) with high frequency.
+
+    \b
+    Examples:
+      polyedge micro --dry --market "btc"           # Watch BTC 5-min only
+      polyedge micro --dry --market "5 minute"       # All 5-minute windows
+      polyedge micro --auto --market "bitcoin 5"     # Auto-trade BTC 5-min
+      polyedge micro --dry                           # All up/down markets
+
+    No AI needed — pure microstructure analysis and speed.
+    """
+
+    async def _micro():
+        from polyedge.core.client import PolyClient
+        from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config
+        from polyedge.strategies.micro_runner import MicroRunner
+
+        settings = get_settings()
+
+        if not settings.poly_private_key:
+            console.print("[red]Wallet not configured. Run 'polyedge setup' first.")
+            return
+
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        # Load config from DB (overrides YAML defaults)
+        settings = await apply_db_config(settings, db)
+
+        client = PolyClient(settings)
+
+        runner = MicroRunner(
+            settings=settings,
+            client=client,
+            db=db,
+            auto_execute=auto,
+            dry_run=dry,
+            verbose=verbose,
+            quiet=quiet,
+            market_filter=market,
+        )
+
+        try:
+            await runner.run()
+        finally:
+            await db.close()
+
+    run_async(_micro())
+
+
 # --- Weather Sniper ---
 
 
