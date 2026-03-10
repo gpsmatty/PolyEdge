@@ -205,6 +205,12 @@ class MicroSniperStrategy:
         if market_price > self.config.max_entry_price:
             return None
 
+        # Don't buy a side the market has nearly killed — if YES is at 4¢,
+        # the market says 96% chance of NO. A 5-second OFI blip doesn't
+        # override the entire window's price action.
+        if market_price < self.config.min_entry_price:
+            return None
+
         return MicroOpportunity(
             market=market,
             symbol=micro.symbol,
@@ -261,8 +267,10 @@ class MicroSniperStrategy:
                     side = Side.NO
                     market_price = market.no_price
 
-                # Don't flip into a heavily priced side
-                if market_price <= self.config.max_entry_price:
+                # Don't flip into a nearly-dead or heavily priced side
+                if market_price < self.config.min_entry_price:
+                    pass  # Fall through to exit check instead
+                elif market_price <= self.config.max_entry_price:
                     return MicroOpportunity(
                         market=market,
                         symbol=micro.symbol,

@@ -484,16 +484,17 @@ class TestMicroStructure:
 # Strategy config defaults for testing
 class FakeConfig:
     enabled: bool = True
-    entry_threshold: float = 0.25
-    exit_threshold: float = 0.10
-    hold_threshold: float = 0.05
-    flip_threshold: float = 0.35
-    flip_min_confidence: float = 0.40
-    min_confidence: float = 0.30
+    entry_threshold: float = 0.40
+    exit_threshold: float = 0.15
+    hold_threshold: float = 0.08
+    flip_threshold: float = 0.50
+    flip_min_confidence: float = 0.50
+    min_confidence: float = 0.40
     min_trades_in_window: int = 10
-    min_trades_for_flip: int = 10
+    min_trades_for_flip: int = 25
     min_seconds_remaining: float = 15.0
     force_exit_seconds: float = 8.0
+    min_entry_price: float = 0.15
     max_entry_price: float = 0.80
     max_position_per_trade: float = 0.03
     max_trades_per_window: int = 50
@@ -536,7 +537,7 @@ def evaluate_micro(market, micro, seconds_remaining, current_position=None, conf
             if confidence >= config.flip_min_confidence and has_enough_for_flip:
                 new_side = "yes" if is_bullish else "no"
                 price = market.yes_price if is_bullish else market.no_price
-                if price <= config.max_entry_price:
+                if price >= config.min_entry_price and price <= config.max_entry_price:
                     return {"action": f"flip_{new_side}", "side": new_side, "is_flip": True}
 
         # Exit on reversal
@@ -561,6 +562,8 @@ def evaluate_micro(market, micro, seconds_remaining, current_position=None, conf
     side = "yes" if is_bullish else "no"
     price = market.yes_price if is_bullish else market.no_price
     if price > config.max_entry_price:
+        return None
+    if price < config.min_entry_price:
         return None
 
     return {"action": f"buy_{side}", "side": side}
@@ -654,6 +657,20 @@ class TestMicroSniperEntry:
         # YES is 0.85 > 0.80 max, so should not enter YES
         if result is not None:
             assert result["side"] != "yes" or market.yes_price <= 0.80
+
+    def test_no_entry_price_too_low(self):
+        """Should not buy a nearly-dead side (market says <15% chance)."""
+        micro = MicroStructure(symbol="btcusdt")
+        trades = make_trades("btcusdt", 30, buy_fraction=0.9)
+        for t in trades:
+            micro.add_trade(t)
+
+        # YES at 4¢ — market says 96% chance of DOWN. Don't fight it.
+        market = FakeMarket(yes_price=0.04, no_price=0.96)
+        result = evaluate_micro(market, micro, 120.0)
+        # Should not buy YES at 4¢ (below 15¢ min_entry_price)
+        if result is not None:
+            assert result["side"] != "yes", "Should not buy YES at 4¢"
 
     def test_no_entry_too_few_trades(self):
         """Should not enter with insufficient trade count."""
@@ -855,7 +872,7 @@ class TestConfigDefaults:
         """Default should track BTC only for micro sniper."""
         config = FakeConfig()
         # Real config defaults to ["btcusdt"]
-        assert config.entry_threshold == 0.25
+        assert config.entry_threshold == 0.40
 
     def test_entry_threshold_range(self):
         """Entry threshold should be between 0 and 1."""
