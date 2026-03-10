@@ -177,6 +177,7 @@ class MicroSniperConfig(BaseModel):
     fixed_position_usd: float = 10.0       # Fixed $ per trade — simpler than Kelly for micro. 0 = use Kelly sizing
     max_trades_per_window: int = 50        # Max trades in a single 5-min window
     min_liquidity: float = 500             # Min market liquidity to trade
+    dead_market_band: float = 0.02         # Skip entry when YES is within this band of 0.50 (market not reacting)
 
 
 class MarketMakerConfig(BaseModel):

@@ -502,6 +502,7 @@ class FakeConfig:
     fixed_position_usd: float = 10.0
     max_trades_per_window: int = 50
     min_liquidity: float = 500
+    dead_market_band: float = 0.02
 
 
 # Simplified strategy logic for testing (mirrors the real one)
@@ -574,6 +575,10 @@ def evaluate_micro(market, micro, seconds_remaining, current_position=None, conf
     if price > config.max_entry_price:
         return None
     if price < config.min_entry_price:
+        return None
+
+    # Dead market filter — skip when YES stuck near 0.50
+    if abs(market.yes_price - 0.50) < config.dead_market_band:
         return None
 
     return {"action": f"buy_{side}", "side": side}
@@ -681,6 +686,29 @@ class TestMicroSniperEntry:
         # Should not buy YES at 15¢ (below 20¢ min_entry_price)
         if result is not None:
             assert result["side"] != "yes", "Should not buy YES at 15¢"
+
+    def test_no_entry_dead_market(self):
+        """Should not enter when market is stuck near 0.50 (dead market)."""
+        micro = MicroStructure(symbol="btcusdt")
+        trades = make_trades("btcusdt", 30, buy_fraction=0.9)
+        for t in trades:
+            micro.add_trade(t)
+
+        # YES at 0.51 — within the 0.02 dead market band around 0.50
+        market = FakeMarket(yes_price=0.51, no_price=0.49)
+        result = evaluate_micro(market, micro, 120.0)
+        assert result is None, "Should not enter when market is dead (YES=0.51)"
+
+        # YES at 0.49 — also within the band
+        market = FakeMarket(yes_price=0.49, no_price=0.51)
+        result = evaluate_micro(market, micro, 120.0)
+        assert result is None, "Should not enter when market is dead (YES=0.49)"
+
+        # YES at 0.53 — outside the band, should be allowed
+        market = FakeMarket(yes_price=0.53, no_price=0.47)
+        result = evaluate_micro(market, micro, 120.0)
+        # This should produce a signal (momentum is bullish from 90% buy trades)
+        assert result is not None, "Should enter when market is outside dead band (YES=0.53)"
 
     def test_no_entry_too_few_trades(self):
         """Should not enter with insufficient trade count."""

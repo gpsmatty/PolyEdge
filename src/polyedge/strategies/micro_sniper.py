@@ -224,6 +224,14 @@ class MicroSniperStrategy:
         if market_price < self.config.min_entry_price:
             return None
 
+        # Dead market filter — if YES is stuck near 0.50, the market isn't
+        # reacting to price moves. Our momentum signals are real but the
+        # market doesn't care. Every trade is just paying spread for nothing.
+        yes_price = market.yes_price
+        band = self.config.dead_market_band
+        if abs(yes_price - 0.50) < band:
+            return None
+
         return MicroOpportunity(
             market=market,
             symbol=micro.symbol,
