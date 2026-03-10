@@ -98,6 +98,8 @@ class MicroRunner:
         self.quiet = quiet
         self.running = False
         self.market_filter = market_filter.lower() if market_filter else None
+        # Split filter into words so "btc 5m" matches slug "btc-updown-5m-..."
+        self._filter_words = self.market_filter.split() if self.market_filter else []
 
         # Config
         self.config = settings.strategies.micro_sniper
@@ -369,12 +371,12 @@ class MicroRunner:
             if EXCLUDED_PATTERNS.search(q):
                 continue
 
-            # Apply user's --market filter (substring match on question/slug)
-            if self.market_filter:
-                q_lower = q.lower()
-                slug_lower = (market.slug or "").lower()
-                if (self.market_filter not in q_lower
-                        and self.market_filter not in slug_lower):
+            # Apply user's --market filter — every word must appear somewhere
+            # in question or slug.  e.g. "btc 5m" matches slug "btc-updown-5m-..."
+            # and "bitcoin" matches question "Bitcoin Up or Down ..."
+            if self._filter_words:
+                haystack = f"{q.lower()} {(market.slug or '').lower()}"
+                if not all(w in haystack for w in self._filter_words):
                     continue
 
             # Extract symbol
