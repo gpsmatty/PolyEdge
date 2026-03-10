@@ -485,8 +485,10 @@ class TestMicroStructure:
 class FakeConfig:
     enabled: bool = True
     entry_threshold: float = 0.40
+    counter_trend_threshold: float = 0.55
     exit_threshold: float = 0.15
     hold_threshold: float = 0.08
+    enable_flips: bool = False
     flip_threshold: float = 0.50
     flip_min_confidence: float = 0.50
     min_confidence: float = 0.40
@@ -494,9 +496,10 @@ class FakeConfig:
     min_trades_for_flip: int = 25
     min_seconds_remaining: float = 15.0
     force_exit_seconds: float = 8.0
-    min_entry_price: float = 0.15
-    max_entry_price: float = 0.80
+    min_entry_price: float = 0.20
+    max_entry_price: float = 0.70
     max_position_per_trade: float = 0.03
+    fixed_position_usd: float = 10.0
     max_trades_per_window: int = 50
     min_liquidity: float = 500
 
@@ -532,13 +535,15 @@ def evaluate_micro(market, micro, seconds_remaining, current_position=None, conf
             return None
 
         # Flip (requires higher trade count — flips are costly)
-        has_enough_for_flip = micro.flow_15s.total_count >= config.min_trades_for_flip
-        if not aligned and abs_momentum >= config.flip_threshold:
-            if confidence >= config.flip_min_confidence and has_enough_for_flip:
-                new_side = "yes" if is_bullish else "no"
-                price = market.yes_price if is_bullish else market.no_price
-                if price >= config.min_entry_price and price <= config.max_entry_price:
-                    return {"action": f"flip_{new_side}", "side": new_side, "is_flip": True}
+        # Only if enable_flips is True
+        if config.enable_flips:
+            has_enough_for_flip = micro.flow_15s.total_count >= config.min_trades_for_flip
+            if not aligned and abs_momentum >= config.flip_threshold:
+                if confidence >= config.flip_min_confidence and has_enough_for_flip:
+                    new_side = "yes" if is_bullish else "no"
+                    price = market.yes_price if is_bullish else market.no_price
+                    if price >= config.min_entry_price and price <= config.max_entry_price:
+                        return {"action": f"flip_{new_side}", "side": new_side, "is_flip": True}
 
         # Exit on reversal
         if not aligned and abs_momentum >= config.exit_threshold:
@@ -552,7 +557,12 @@ def evaluate_micro(market, micro, seconds_remaining, current_position=None, conf
         return None
 
     # No position — check entry
-    if abs_momentum < config.entry_threshold:
+    # 30s trend filter — counter-trend entries need higher threshold
+    trend_ofi = micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0
+    is_counter_trend = (is_bullish and trend_ofi < -0.05) or (not is_bullish and trend_ofi > 0.05)
+    effective_threshold = config.counter_trend_threshold if is_counter_trend else config.entry_threshold
+
+    if abs_momentum < effective_threshold:
         return None
     if confidence < config.min_confidence:
         return None
@@ -646,31 +656,31 @@ class TestMicroSniperEntry:
         assert result is None
 
     def test_no_entry_price_too_high(self):
-        """Should not buy a side priced above max_entry_price."""
+        """Should not buy a side priced above max_entry_price (0.70)."""
         micro = MicroStructure(symbol="btcusdt")
         trades = make_trades("btcusdt", 30, buy_fraction=0.9)
         for t in trades:
             micro.add_trade(t)
 
-        market = FakeMarket(yes_price=0.85, no_price=0.15)
+        market = FakeMarket(yes_price=0.75, no_price=0.25)
         result = evaluate_micro(market, micro, 120.0)
-        # YES is 0.85 > 0.80 max, so should not enter YES
+        # YES is 0.75 > 0.70 max, so should not enter YES
         if result is not None:
-            assert result["side"] != "yes" or market.yes_price <= 0.80
+            assert result["side"] != "yes" or market.yes_price <= 0.70
 
     def test_no_entry_price_too_low(self):
-        """Should not buy a nearly-dead side (market says <15% chance)."""
+        """Should not buy a nearly-dead side (market says <20% chance)."""
         micro = MicroStructure(symbol="btcusdt")
         trades = make_trades("btcusdt", 30, buy_fraction=0.9)
         for t in trades:
             micro.add_trade(t)
 
-        # YES at 4¢ — market says 96% chance of DOWN. Don't fight it.
-        market = FakeMarket(yes_price=0.04, no_price=0.96)
+        # YES at 15¢ — below the 20¢ min_entry_price. Don't fight it.
+        market = FakeMarket(yes_price=0.15, no_price=0.85)
         result = evaluate_micro(market, micro, 120.0)
-        # Should not buy YES at 4¢ (below 15¢ min_entry_price)
+        # Should not buy YES at 15¢ (below 20¢ min_entry_price)
         if result is not None:
-            assert result["side"] != "yes", "Should not buy YES at 4¢"
+            assert result["side"] != "yes", "Should not buy YES at 15¢"
 
     def test_no_entry_too_few_trades(self):
         """Should not enter with insufficient trade count."""
@@ -729,8 +739,26 @@ class TestMicroSniperExit:
 
 
 class TestMicroSniperFlip:
-    def test_flip_on_strong_reversal(self):
-        """Should flip position when strong reversal with high confidence."""
+    def test_no_flip_when_disabled(self):
+        """Should NOT flip when enable_flips=False (default) — strong reversals just EXIT."""
+        config = FakeConfig()
+        config.enable_flips = False  # Default
+        micro = MicroStructure(symbol="btcusdt")
+        trades = make_trades("btcusdt", 50, buy_fraction=0.05, base_price=70000,
+                             time_spacing=0.3)
+        for t in trades:
+            micro.add_trade(t)
+
+        market = FakeMarket(yes_price=0.40, no_price=0.60)
+        result = evaluate_micro(market, micro, 120.0, current_position="yes", config=config)
+        # Should exit, NOT flip
+        if result is not None:
+            assert "flip" not in result["action"], "Flips should be disabled by default"
+
+    def test_flip_on_strong_reversal_when_enabled(self):
+        """Should flip position when enable_flips=True and strong reversal with high confidence."""
+        config = FakeConfig()
+        config.enable_flips = True
         micro = MicroStructure(symbol="btcusdt")
         # Very strong sell pressure while holding YES
         trades = make_trades("btcusdt", 50, buy_fraction=0.05, base_price=70000,
@@ -742,7 +770,7 @@ class TestMicroSniperFlip:
         momentum = micro.momentum_signal
         confidence = micro.confidence
 
-        result = evaluate_micro(market, micro, 120.0, current_position="yes")
+        result = evaluate_micro(market, micro, 120.0, current_position="yes", config=config)
         # If momentum is strong enough and confidence is high, should flip
         if result is not None and abs(momentum) >= 0.35 and confidence >= 0.40:
             assert "flip" in result["action"]
@@ -751,6 +779,7 @@ class TestMicroSniperFlip:
     def test_no_flip_with_weak_confidence(self):
         """Should not flip if confidence is too low — use moderate signal."""
         config = FakeConfig()
+        config.enable_flips = True  # Enable flips for this test
         config.flip_min_confidence = 0.95  # Nearly impossible bar
         config.flip_threshold = 0.20      # Low flip threshold so we'd flip if confidence allowed
         micro = MicroStructure(symbol="btcusdt")
@@ -806,6 +835,7 @@ class TestMicroSniperSparseDataGuard:
     def test_no_flip_below_min_trades_for_flip(self):
         """Should not flip even with enough trades for exit but not for flip."""
         config = FakeConfig()
+        config.enable_flips = True
         config.min_trades_in_window = 5
         config.min_trades_for_flip = 20
         config.flip_threshold = 0.20
@@ -825,6 +855,7 @@ class TestMicroSniperSparseDataGuard:
     def test_flip_with_sufficient_trades(self):
         """Should flip when trade count meets the higher flip threshold."""
         config = FakeConfig()
+        config.enable_flips = True
         config.min_trades_in_window = 5
         config.min_trades_for_flip = 10
         config.flip_threshold = 0.20
@@ -878,6 +909,16 @@ class TestConfigDefaults:
         """Entry threshold should be between 0 and 1."""
         config = FakeConfig()
         assert 0 < config.entry_threshold < 1
+
+    def test_counter_trend_threshold_higher_than_entry(self):
+        """Counter-trend threshold should be higher than entry threshold."""
+        config = FakeConfig()
+        assert config.counter_trend_threshold > config.entry_threshold
+
+    def test_flips_disabled_by_default(self):
+        """Flips should be disabled by default."""
+        config = FakeConfig()
+        assert config.enable_flips is False
 
     def test_flip_threshold_higher_than_entry(self):
         """Flip threshold should be higher than entry threshold."""
@@ -949,3 +990,64 @@ class TestEdgeCases:
             for t in trades:
                 w.add(t)
             assert -1.0 <= w.ofi <= 1.0, f"OFI out of range for buy_fraction={frac}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Counter-trend filter
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestCounterTrendFilter:
+    def test_counter_trend_needs_higher_threshold(self):
+        """Entry against 30s trend should require counter_trend_threshold (0.55)."""
+        config = FakeConfig()
+        config.entry_threshold = 0.40
+        config.counter_trend_threshold = 0.55
+
+        micro = MicroStructure(symbol="btcusdt")
+        # Build a 30s bearish trend (lots of sells)
+        old_trades = make_trades("btcusdt", 40, buy_fraction=0.1, base_price=70000,
+                                 time_spacing=0.5, time_start=time.time() - 25)
+        for t in old_trades:
+            micro.add_trade(t)
+
+        # Now add recent buy pressure (but moderate — 0.45 momentum)
+        recent_trades = make_trades("btcusdt", 15, buy_fraction=0.85, base_price=70000,
+                                    time_spacing=0.1, time_start=time.time() - 1.5)
+        for t in recent_trades:
+            micro.add_trade(t)
+
+        # 30s OFI should be negative (bearish trend)
+        assert micro.flow_30s.ofi < 0, "30s trend should be bearish"
+
+        market = FakeMarket(yes_price=0.50, no_price=0.50)
+        momentum = micro.momentum_signal
+
+        result = evaluate_micro(market, micro, 120.0, config=config)
+        # If momentum is between 0.40 and 0.55, counter-trend filter should block it
+        if momentum > 0 and 0.40 <= abs(momentum) < 0.55:
+            assert result is None, "Counter-trend entry should be blocked below 0.55"
+
+    def test_with_trend_uses_normal_threshold(self):
+        """Entry with the 30s trend should use normal entry_threshold (0.40)."""
+        config = FakeConfig()
+        config.entry_threshold = 0.40
+        config.counter_trend_threshold = 0.55
+
+        micro = MicroStructure(symbol="btcusdt")
+        # Build a 30s bullish trend
+        trades = make_trades("btcusdt", 50, buy_fraction=0.85, base_price=70000,
+                             time_spacing=0.5, time_start=time.time() - 25)
+        for t in trades:
+            micro.add_trade(t)
+
+        # 30s OFI should be positive (bullish)
+        assert micro.flow_30s.ofi > 0, "30s trend should be bullish"
+
+        market = FakeMarket(yes_price=0.50, no_price=0.50)
+        momentum = micro.momentum_signal
+
+        # If momentum is above 0.40 (with-trend), should enter
+        if abs(momentum) >= 0.40:
+            result = evaluate_micro(market, micro, 120.0, config=config)
+            if result is not None:
+                assert result["side"] == "yes", "Should buy YES in bullish with-trend"
