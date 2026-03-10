@@ -60,7 +60,8 @@ logger = logging.getLogger("polyedge.micro_runner")
 console = Console()
 
 # How often to refresh market list from DB
-MARKET_REFRESH_INTERVAL = 120  # seconds
+MARKET_REFRESH_INTERVAL = 120  # seconds (unfiltered)
+MARKET_REFRESH_INTERVAL_FILTERED = 30  # seconds (with --market filter, need fast window transitions)
 
 # How often to print status
 STATUS_INTERVAL = 15  # seconds (shorter than regular sniper — more active)
@@ -345,10 +346,18 @@ class MicroRunner:
                 await self._refresh_markets()
             except Exception as e:
                 logger.error(f"Market refresh failed: {e}")
-            await asyncio.sleep(MARKET_REFRESH_INTERVAL)
+            interval = MARKET_REFRESH_INTERVAL_FILTERED if self.market_filter else MARKET_REFRESH_INTERVAL
+            await asyncio.sleep(interval)
 
     async def _refresh_markets(self):
-        """Load up/down crypto markets from DB."""
+        """Load up/down crypto markets from DB.
+
+        Only keeps markets that are currently live — end_date in the future.
+        For each symbol, picks the NEAREST expiring window (the one that's
+        active right now) so we're always on the current 5-min window.
+        """
+        now = datetime.now(timezone.utc)
+
         try:
             all_markets = await self.indexer.get_markets(
                 min_liquidity=self.config.min_liquidity,
@@ -360,15 +369,18 @@ class MicroRunner:
 
         crypto = find_crypto_markets(all_markets)
 
-        self.updown_markets.clear()
-        self._token_to_market.clear()
-        new_token_ids: list[str] = []
+        # Collect all matching markets per symbol, then pick the nearest live one
+        candidates: dict[str, list[tuple[Market, ParsedCryptoMarket]]] = {}
 
         for market in crypto:
             q = market.question
             if not UP_DOWN_PATTERN.search(q):
                 continue
             if EXCLUDED_PATTERNS.search(q):
+                continue
+
+            # Skip markets that have already ended
+            if not market.end_date or market.end_date <= now:
                 continue
 
             # Apply user's --market filter — every word must appear somewhere
@@ -396,15 +408,41 @@ class MicroRunner:
                 symbol=symbol,
             )
 
-            if symbol not in self.updown_markets:
-                self.updown_markets[symbol] = []
-            self.updown_markets[symbol].append((market, parsed))
+            if symbol not in candidates:
+                candidates[symbol] = []
+            candidates[symbol].append((market, parsed))
 
-            # Register token IDs for WS
-            if len(market.clob_token_ids) >= 2:
-                self._token_to_market[market.clob_token_ids[0]] = (market, "yes")
-                self._token_to_market[market.clob_token_ids[1]] = (market, "no")
-                new_token_ids.extend(market.clob_token_ids[:2])
+        # For each symbol, sort by end_date and pick the nearest window(s)
+        # (the one expiring soonest is the currently active window)
+        self.updown_markets.clear()
+        self._token_to_market.clear()
+        new_token_ids: list[str] = []
+
+        for symbol, market_list in candidates.items():
+            # Sort by end_date ascending — first entry is the current live window
+            market_list.sort(key=lambda mp: mp[0].end_date)
+
+            # Take the nearest window (current) + next one (so we can transition)
+            selected = market_list[:2]
+
+            self.updown_markets[symbol] = selected
+
+            for market, parsed in selected:
+                if len(market.clob_token_ids) >= 2:
+                    self._token_to_market[market.clob_token_ids[0]] = (market, "yes")
+                    self._token_to_market[market.clob_token_ids[1]] = (market, "no")
+                    new_token_ids.extend(market.clob_token_ids[:2])
+
+            # Log which window we're on
+            current = selected[0][0]
+            remaining = (current.end_date - now).total_seconds()
+            if not self.quiet:
+                console.print(
+                    f"[cyan]{symbol.replace('usdt','').upper()}: "
+                    f"[bold]{current.question}[/bold] "
+                    f"({remaining:.0f}s left, "
+                    f"YES={current.yes_price:.2f} NO={current.no_price:.2f})[/cyan]"
+                )
 
         self._total_markets = sum(len(v) for v in self.updown_markets.values())
 
