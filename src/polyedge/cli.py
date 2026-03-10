@@ -677,6 +677,121 @@ def costs():
 
 
 @cli.command()
+@click.argument("market_query")
+def book(market_query):
+    """Show order book intelligence for a market (imbalance, depth, whales)."""
+
+    async def _book():
+        from polyedge.data.markets import search_markets
+        from polyedge.core.client import PolyClient
+        from polyedge.data.book_analyzer import get_full_book_intelligence
+
+        settings = get_settings()
+
+        if not settings.poly_private_key:
+            console.print("[red]Wallet not configured. Run 'polyedge setup' first.")
+            return
+
+        markets = await search_markets(settings, market_query)
+        if not markets:
+            console.print("[yellow]No matching markets found")
+            return
+
+        market = markets[0]
+        console.print(f"\n[bold]{market.question}")
+        console.print(f"  YES: ${market.yes_price:.3f} | NO: ${market.no_price:.3f}\n")
+
+        client = PolyClient(settings)
+        intel = get_full_book_intelligence(client, market)
+
+        for side, book_intel in intel.items():
+            console.print(f"[bold cyan]--- {side} Order Book ---")
+            console.print(book_intel.summary())
+            console.print()
+
+        if not intel:
+            console.print("[yellow]No order book data available (no token IDs)")
+
+    run_async(_book())
+
+
+@cli.command()
+@click.option("--market-query", "-m", default=None, help="Subscribe to a specific market")
+@click.option("--duration", "-d", default=60, help="How many seconds to listen")
+def feed(market_query, duration):
+    """Stream real-time WebSocket market data."""
+
+    async def _feed():
+        from polyedge.data.markets import search_markets, fetch_active_markets
+        from polyedge.data.ws_feed import MarketFeed
+
+        settings = get_settings()
+
+        # Get token IDs to subscribe to
+        if market_query:
+            markets = await search_markets(settings, market_query)
+            if not markets:
+                console.print("[yellow]No matching markets found")
+                return
+            markets = markets[:1]
+        else:
+            markets = await fetch_active_markets(settings, limit=5)
+
+        asset_ids = []
+        for m in markets:
+            if m.yes_token_id:
+                asset_ids.append(m.yes_token_id)
+            if m.no_token_id:
+                asset_ids.append(m.no_token_id)
+
+        if not asset_ids:
+            console.print("[red]No token IDs available for subscription")
+            return
+
+        console.print(f"[dim]Subscribing to {len(asset_ids)} tokens from {len(markets)} markets...[/dim]")
+
+        ws_feed = MarketFeed(settings)
+
+        # Register event handlers
+        async def on_trade(event):
+            price = event.get("price", "?")
+            side = event.get("side", "?")
+            size = event.get("size", "?")
+            console.print(f"  [green]TRADE[/green] {side} {size} @ ${price}")
+
+        async def on_bid_ask(event):
+            bid = event.get("best_bid", "?")
+            ask = event.get("best_ask", "?")
+            spread = event.get("spread", "?")
+            console.print(f"  [cyan]BBA[/cyan] bid=${bid} ask=${ask} spread={spread}")
+
+        async def on_book(event):
+            bids = len(event.get("bids", []))
+            asks = len(event.get("asks", []))
+            console.print(f"  [blue]BOOK[/blue] {bids} bids, {asks} asks")
+
+        ws_feed.on("last_trade_price", on_trade)
+        ws_feed.on("best_bid_ask", on_bid_ask)
+        ws_feed.on("book", on_book)
+
+        console.print(f"[bold]Streaming for {duration}s (Ctrl+C to stop)...\n")
+
+        # Run with timeout
+        feed_task = asyncio.create_task(ws_feed.start(asset_ids))
+        try:
+            await asyncio.wait_for(asyncio.shield(feed_task), timeout=duration)
+        except asyncio.TimeoutError:
+            pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            await ws_feed.stop()
+            console.print("\n[dim]Feed stopped[/dim]")
+
+    run_async(_feed())
+
+
+@cli.command()
 @click.option("--hours", "-h", default=1, help="Hours to look back")
 @click.option("--min-move", default=0.03, help="Minimum price move to show")
 def movers(hours, min_move):

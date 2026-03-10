@@ -26,6 +26,11 @@ class AIConfig(BaseModel):
     temperature: float = 0.2
     max_analysis_cost_per_day: float = 5.00
 
+    # Tiered models — research brain (expensive, deep analysis + web search)
+    # vs compute brain (cheap/fast for number crunching)
+    research_model: str = "claude-sonnet-4-6"  # Deep research, web search, outside info
+    compute_model: str = "claude-haiku-4-5-20251001"  # Fast + cheap for EV calcs, scoring
+
 
 class RiskConfig(BaseModel):
     max_position_pct: float = 0.10

@@ -33,6 +33,8 @@ def _build_analysis_prompt(
     market: Market,
     news_context: str = "",
     additional_context: str = "",
+    book_context: str = "",
+    memory_context: str = "",
 ) -> str:
     parts = [
         f"## Market Question\n{market.question}",
@@ -52,8 +54,14 @@ def _build_analysis_prompt(
     if market.volume:
         parts.append(f"\n## Market Stats\nVolume: ${market.volume:,.0f} | Liquidity: ${market.liquidity:,.0f}")
 
+    if book_context:
+        parts.append(f"\n{book_context}")
+
     if news_context:
         parts.append(f"\n## Recent News\n{news_context}")
+
+    if memory_context:
+        parts.append(f"\n## Agent Memory\n{memory_context}")
 
     if additional_context:
         parts.append(f"\n## Additional Context\n{additional_context}")
@@ -62,6 +70,7 @@ def _build_analysis_prompt(
         "\n## Your Task\n"
         "Estimate the TRUE probability that this market resolves YES. "
         "Consider the resolution criteria carefully. "
+        "Factor in order book microstructure if provided (imbalance, whale activity, walls). "
         "Output your analysis as JSON matching the required format."
     )
 
@@ -121,15 +130,23 @@ async def analyze_market(
     market: Market,
     news_context: str = "",
     additional_context: str = "",
+    book_context: str = "",
+    memory_context: str = "",
     provider: Optional[str] = None,
 ) -> AIAnalysis:
-    """Use AI to analyze a market and estimate the true probability."""
-    prompt = _build_analysis_prompt(market, news_context, additional_context)
+    """Use AI to analyze a market and estimate the true probability.
 
-    response = await llm.analyze(
+    Uses the research model by default for deep analysis.
+    """
+    prompt = _build_analysis_prompt(
+        market, news_context, additional_context, book_context, memory_context
+    )
+
+    response = await llm.research(
         prompt=prompt,
         system=SYSTEM_PROMPT,
-        provider=provider,
+        purpose="market_analysis",
+        market_id=market.condition_id,
     )
 
     analysis = _parse_analysis_response(
@@ -141,6 +158,47 @@ async def analyze_market(
     )
     analysis.news_context = news_context
     return analysis
+
+
+async def quick_score_market(
+    llm: LLMClient,
+    market: Market,
+    book_context: str = "",
+) -> dict:
+    """Quick and cheap market scoring using the compute model.
+
+    Returns a dict with score (0-100) and brief reasoning.
+    Used to pre-filter markets before expensive deep analysis.
+    """
+    prompt = (
+        f"Score this prediction market opportunity 0-100 based on trading potential.\n\n"
+        f"Question: {market.question}\n"
+        f"YES price: ${market.yes_price:.2f} | NO price: ${market.no_price:.2f}\n"
+        f"Volume: ${market.volume:,.0f} | Liquidity: ${market.liquidity:,.0f}\n"
+    )
+
+    if market.end_date and market.hours_to_resolution:
+        prompt += f"Time to resolution: {market.hours_to_resolution:.0f} hours\n"
+
+    if book_context:
+        prompt += f"\n{book_context}\n"
+
+    prompt += (
+        "\nOutput ONLY JSON: {\"score\": <0-100>, \"reason\": \"<one sentence>\"}\n"
+        "High scores = clear mispricing or strong signal. Low scores = efficient pricing or too uncertain."
+    )
+
+    response = await llm.compute(
+        prompt=prompt,
+        purpose="quick_score",
+        market_id=market.condition_id,
+    )
+
+    try:
+        data = json.loads(response.text)
+        return {"score": int(data.get("score", 50)), "reason": data.get("reason", "")}
+    except (json.JSONDecodeError, ValueError):
+        return {"score": 50, "reason": "Failed to parse score"}
 
 
 async def batch_analyze(

@@ -10,13 +10,14 @@ from typing import Optional
 
 from rich.console import Console
 
-from polyedge.ai.analyst import analyze_market
+from polyedge.ai.analyst import analyze_market, quick_score_market
 from polyedge.ai.llm import LLMClient
 from polyedge.ai.news import get_news_context
 from polyedge.core.config import Settings
 from polyedge.core.client import PolyClient
 from polyedge.core.db import Database
 from polyedge.core.models import AgentMode, Market, Signal, Side
+from polyedge.data.book_analyzer import get_book_intelligence, format_book_for_ai
 from polyedge.data.indexer import MarketIndexer
 from polyedge.risk.sizing import calculate_position_size
 from polyedge.risk.kelly import fractional_kelly
@@ -140,25 +141,63 @@ class TradingAgent:
                     f"(budget remaining: ${budget_left:.2f})...[/dim]"
                 )
 
+                # Step 1: Quick-score with cheap compute model to pre-filter
+                scored = []
                 for market in candidates:
-                    # Check if we already have a recent analysis
                     existing = await self.db.get_latest_analysis(market.condition_id)
                     if existing and self._analysis_still_fresh(existing, market):
                         continue
 
-                    # Re-check budget mid-loop
+                    if await self.llm.get_budget_remaining() <= 0.01:
+                        console.print("[yellow]AI budget hit mid-scan — stopping")
+                        break
+
+                    try:
+                        score = await quick_score_market(self.llm, market)
+                        scored.append((market, score))
+                    except Exception as e:
+                        logger.debug(f"Quick score failed for {market.question[:50]}: {e}")
+                        scored.append((market, {"score": 50, "reason": "score failed"}))
+
+                # Sort by score descending — only deep-analyze top half
+                scored.sort(key=lambda x: x[1].get("score", 0), reverse=True)
+                top_candidates = scored[:max(len(scored) // 2, 5)]
+
+                console.print(
+                    f"[dim]Quick-scored {len(scored)} markets, "
+                    f"deep-analyzing top {len(top_candidates)}[/dim]"
+                )
+
+                # Step 2: Deep analysis with research model on top candidates
+                for market, score_data in top_candidates:
                     if await self.llm.get_budget_remaining() <= 0.01:
                         console.print("[yellow]AI budget hit mid-scan — stopping analysis")
                         break
 
                     try:
+                        # Get order book intelligence
+                        book_context = ""
+                        try:
+                            book_intel = get_book_intelligence(self.client, market)
+                            book_context = format_book_for_ai(book_intel)
+                        except Exception:
+                            pass  # Book data is nice-to-have, not critical
+
+                        # Get agent memory for this market
+                        memory_context = await self._get_market_context(market)
+
                         # Get news context
                         news = await get_news_context(
                             self.llm, market, self.settings.news_api_key
                         )
 
-                        # Analyze with purpose tracking
-                        analysis = await analyze_market(self.llm, market, news_context=news)
+                        # Deep analysis with research model
+                        analysis = await analyze_market(
+                            self.llm, market,
+                            news_context=news,
+                            book_context=book_context,
+                            memory_context=memory_context,
+                        )
                         await self.db.save_analysis(analysis.model_dump())
 
                         # Check for edge
@@ -176,6 +215,12 @@ class TradingAgent:
                                 ai_probability=analysis.probability,
                             )
                             ai_signals.append(signal)
+                        else:
+                            await self._remember_skip(
+                                market,
+                                f"Edge too small ({abs(edge):.1%}). "
+                                f"AI: {analysis.probability:.0%} vs Market: {market.yes_price:.0%}"
+                            )
 
                     except Exception as e:
                         logger.warning(f"Analysis failed for {market.question[:50]}: {e}")

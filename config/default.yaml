@@ -11,6 +11,8 @@ ai:
   ensemble: false
   temperature: 0.2
   max_analysis_cost_per_day: 5.00
+  research_model: "claude-sonnet-4-6"         # Deep analysis + web search for outside info
+  compute_model: "claude-haiku-4-5-20251001"  # Fast + cheap for number crunching
 
 risk:
   max_position_pct: 0.10

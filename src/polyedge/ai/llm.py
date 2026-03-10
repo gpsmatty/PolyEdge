@@ -89,6 +89,46 @@ class LLMClient:
                 pass
         return max(0, self.config.max_analysis_cost_per_day - self._total_cost_today)
 
+    async def research(
+        self,
+        prompt: str,
+        system: str = "",
+        purpose: str = "",
+        market_id: str = "",
+    ) -> LLMResponse:
+        """Use the expensive research model for deep analysis.
+
+        Best for: probability estimation, news interpretation, complex reasoning.
+        Uses the research_model from config (default: Sonnet).
+        """
+        return await self.analyze(
+            prompt=prompt,
+            system=system,
+            model=self.config.research_model,
+            purpose=purpose or "research",
+            market_id=market_id,
+        )
+
+    async def compute(
+        self,
+        prompt: str,
+        system: str = "",
+        purpose: str = "",
+        market_id: str = "",
+    ) -> LLMResponse:
+        """Use the cheap/fast compute model for number crunching.
+
+        Best for: EV calculations, scoring, structured data extraction, quick checks.
+        Uses the compute_model from config (default: Haiku).
+        """
+        return await self.analyze(
+            prompt=prompt,
+            system=system,
+            model=self.config.compute_model,
+            purpose=purpose or "compute",
+            market_id=market_id,
+        )
+
     async def analyze(
         self,
         prompt: str,
