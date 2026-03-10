@@ -158,6 +158,27 @@ DURATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Markets we CAN'T model — reject these even if patterns match
+# These are either too vague, relative comparisons, or lack a concrete price level
+EXCLUDED_PATTERNS = re.compile(
+    r"(?:"
+    r"all\s+time\s+high"            # "Ethereum all time high by ..."
+    r"|outperform"                   # "Will Bitcoin outperform Silver ..."
+    r"|flip"                         # "Will SOL flip ETH?"
+    r"|market\s+cap"                 # Market cap, not price
+    r"|dominance"                    # BTC dominance %
+    r"|by\s+(?:December|January|February|March|April|May|June|July|August|September|October|November)\s+\d{1,2},?\s+20\d{2}"
+                                     # "by December 31, 2026" — long-dated
+    r"|by\s+\d{4}"                   # "by 2026"
+    r"|in\s+20(?:2[7-9]|[3-9]\d)"   # "in 2027" or later
+    r")",
+    re.IGNORECASE,
+)
+
+# Max time horizon for threshold/bucket markets (seconds)
+# Our vol model is only useful for short-term — beyond 7 days it's noise
+MAX_THRESHOLD_HORIZON_SECONDS = 7 * 24 * 3600  # 7 days
+
 # Broad pattern to identify ANY crypto market (used as pre-filter)
 CRYPTO_KEYWORDS = re.compile(
     r"\b(Bitcoin|BTC|Ethereum|ETH|Ether|Solana|SOL|XRP|Ripple|Dogecoin|DOGE)\b",
@@ -245,9 +266,18 @@ class CryptoSniperStrategy(Strategy):
         return None
 
     def parse_market(self, market: Market) -> Optional[ParsedCryptoMarket]:
-        """Parse a crypto market question into structured data."""
+        """Parse a crypto market question into structured data.
+
+        Rejects markets we can't model:
+        - Excluded patterns (ATH, outperform, market cap, very long-dated)
+        - Threshold/bucket markets with no end_date or > 7 days out
+        """
         mtype = self.classify_market(market)
         if mtype is None:
+            return None
+
+        # Reject markets with patterns we can't model
+        if EXCLUDED_PATTERNS.search(market.question):
             return None
 
         symbol = self.get_symbol(market)
@@ -256,6 +286,11 @@ class CryptoSniperStrategy(Strategy):
 
         if mtype == CryptoMarketType.UP_DOWN:
             return ParsedCryptoMarket(market_type=mtype, symbol=symbol)
+
+        # For threshold/bucket, enforce time horizon
+        if mtype in (CryptoMarketType.THRESHOLD, CryptoMarketType.BUCKET):
+            if not self._within_horizon(market):
+                return None
 
         if mtype == CryptoMarketType.THRESHOLD:
             strike = self._extract_threshold(market.question)
@@ -271,6 +306,16 @@ class CryptoSniperStrategy(Strategy):
             return self._parse_bucket_market(market, symbol)
 
         return None
+
+    def _within_horizon(self, market: Market) -> bool:
+        """Check if market expires within our tradeable horizon (7 days)."""
+        if not market.end_date:
+            return False
+        now = datetime.now(timezone.utc)
+        remaining = (market.end_date - now).total_seconds()
+        if remaining <= 0:
+            return False
+        return remaining <= MAX_THRESHOLD_HORIZON_SECONDS
 
     def get_symbol(self, market: Market) -> Optional[str]:
         """Extract the Binance symbol from a crypto market question."""
@@ -822,15 +867,21 @@ def _parse_number(s: str) -> Optional[float]:
 
 
 def find_crypto_markets(markets: list[Market]) -> list[Market]:
-    """Filter markets to ALL tradeable crypto markets (up/down + threshold + bucket)."""
+    """Filter markets to ALL tradeable crypto markets (up/down + threshold + bucket).
+
+    Also rejects markets with excluded patterns (ATH, outperform, etc.)
+    that we can't model.
+    """
     results = []
     for m in markets:
-        if CRYPTO_KEYWORDS.search(m.question):
-            # Check if it matches any of our supported types
-            if (UP_DOWN_PATTERN.search(m.question) or
-                    THRESHOLD_PATTERN.search(m.question) or
-                    BUCKET_PATTERN.search(m.question)):
-                results.append(m)
+        if not CRYPTO_KEYWORDS.search(m.question):
+            continue
+        if EXCLUDED_PATTERNS.search(m.question):
+            continue
+        if (UP_DOWN_PATTERN.search(m.question) or
+                THRESHOLD_PATTERN.search(m.question) or
+                BUCKET_PATTERN.search(m.question)):
+            results.append(m)
     return results
 
 

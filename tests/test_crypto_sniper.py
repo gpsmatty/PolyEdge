@@ -132,6 +132,21 @@ BUCKET_RANGE_FALLBACK = re.compile(
     re.IGNORECASE,
 )
 
+# Exclusion pattern — markets we can't model
+EXCLUDED_PATTERNS = re.compile(
+    r"(?:"
+    r"all\s+time\s+high"
+    r"|outperform"
+    r"|flip"
+    r"|market\s+cap"
+    r"|dominance"
+    r"|by\s+(?:December|January|February|March|April|May|June|July|August|September|October|November)\s+\d{1,2},?\s+20\d{2}"
+    r"|by\s+\d{4}"
+    r"|in\s+20(?:2[7-9]|[3-9]\d)"
+    r")",
+    re.IGNORECASE,
+)
+
 BUCKET_ABOVE_PATTERN = re.compile(r"[↑]\s*[\$]?([\d,]+(?:\.\d+)?)")
 BUCKET_BELOW_PATTERN = re.compile(r"[↓]\s*[\$]?([\d,]+(?:\.\d+)?)")
 
@@ -179,6 +194,8 @@ def match_market_to_symbol(question):
 
 
 def classify_market(question):
+    if EXCLUDED_PATTERNS.search(question):
+        return None
     if UP_DOWN_PATTERN.search(question):
         return "up_down"
     if THRESHOLD_PATTERN.search(question):
@@ -191,6 +208,58 @@ def classify_market(question):
 # ══════════════════════════════════════════════════════════════════════
 # Tests
 # ══════════════════════════════════════════════════════════════════════
+
+class TestExcludedPatterns:
+    """Test that we reject markets we can't model."""
+
+    def test_excludes_ath(self):
+        assert EXCLUDED_PATTERNS.search("Ethereum all time high by September 30, 2026?")
+
+    def test_excludes_outperform(self):
+        assert EXCLUDED_PATTERNS.search("Will Bitcoin outperform Silver in March 2026?")
+
+    def test_excludes_by_december(self):
+        assert EXCLUDED_PATTERNS.search("Will Bitcoin reach $100,000 by December 31, 2026?")
+
+    def test_excludes_by_year(self):
+        assert EXCLUDED_PATTERNS.search("Will ETH reach $4,000 by 2027?")
+
+    def test_excludes_flip(self):
+        assert EXCLUDED_PATTERNS.search("Will SOL flip ETH?")
+
+    def test_excludes_market_cap(self):
+        assert EXCLUDED_PATTERNS.search("Bitcoin market cap above 2 trillion?")
+
+    def test_excludes_dominance(self):
+        assert EXCLUDED_PATTERNS.search("Bitcoin dominance above 60%?")
+
+    def test_keeps_short_term_reach(self):
+        assert not EXCLUDED_PATTERNS.search("Will Bitcoin reach $85,000 in March?")
+
+    def test_keeps_short_term_dip(self):
+        assert not EXCLUDED_PATTERNS.search("Will Bitcoin dip to $50,000 in March?")
+
+    def test_keeps_threshold(self):
+        assert not EXCLUDED_PATTERNS.search("Will the price of Bitcoin be greater than $78,000 on March 10?")
+
+    def test_keeps_bucket(self):
+        assert not EXCLUDED_PATTERNS.search("Will the price of Bitcoin be between $74,000 and $76,000 on March 11?")
+
+    def test_keeps_up_down(self):
+        assert not EXCLUDED_PATTERNS.search("Bitcoin Up or Down - March 10, 5:15PM-5:30PM ET")
+
+    def test_classify_rejects_excluded(self):
+        """classify_market should return None for excluded markets."""
+        assert classify_market("Will Bitcoin reach $100,000 by December 31, 2026?") is None
+        assert classify_market("Ethereum all time high by September 30, 2026?") is None
+        assert classify_market("Will Bitcoin outperform Silver in March 2026?") is None
+
+    def test_classify_keeps_valid(self):
+        """classify_market should still work for valid markets."""
+        assert classify_market("Will Bitcoin reach $85,000 in March?") == "threshold"
+        assert classify_market("Will the price of Bitcoin be between $74,000 and $76,000 on March 11?") == "bucket"
+        assert classify_market("Bitcoin Up or Down - March 10, 5:15PM-5:30PM ET") == "up_down"
+
 
 class TestNormalCDF:
     """Test the Abramowitz & Stegun CDF approximation."""
@@ -599,11 +668,18 @@ class TestFindCryptoMarkets:
         return FakeMarket(question=question, description=desc)
 
     def _filter(self, markets):
-        """Inline version of find_crypto_markets."""
-        return [m for m in markets if CRYPTO_KEYWORDS.search(m.question) and
-                (UP_DOWN_PATTERN.search(m.question) or
-                 THRESHOLD_PATTERN.search(m.question) or
-                 BUCKET_PATTERN.search(m.question))]
+        """Inline version of find_crypto_markets (with exclusion filter)."""
+        results = []
+        for m in markets:
+            if not CRYPTO_KEYWORDS.search(m.question):
+                continue
+            if EXCLUDED_PATTERNS.search(m.question):
+                continue
+            if (UP_DOWN_PATTERN.search(m.question) or
+                    THRESHOLD_PATTERN.search(m.question) or
+                    BUCKET_PATTERN.search(m.question)):
+                results.append(m)
+        return results
 
     def test_finds_up_down(self):
         markets = [
@@ -662,6 +738,35 @@ class TestFindCryptoMarkets:
     def test_rejects_generic_crypto_mention(self):
         markets = [self._make_market("Bitcoin is a great investment")]
         assert len(self._filter(markets)) == 0
+
+    def test_rejects_excluded_markets(self):
+        """Excluded markets should not pass find_crypto_markets."""
+        markets = [
+            self._make_market("Will Bitcoin reach $100,000 by December 31, 2026?"),
+            self._make_market("Ethereum all time high by September 30, 2026?"),
+            self._make_market("Will Bitcoin outperform Silver in March 2026?"),
+            self._make_market("Will Solana reach $200 by December 31, 2026?"),
+            self._make_market("Will Ethereum reach $4,000 by December 31, 2026?"),
+        ]
+        assert len(self._filter(markets)) == 0
+
+    def test_mixed_valid_and_excluded(self):
+        """Real-world mix: should only keep short-term tradeable markets."""
+        markets = [
+            # Keep these (short-term, modelable)
+            self._make_market("Bitcoin Up or Down - March 10, 5:15PM-5:30PM ET"),
+            self._make_market("Will the price of Bitcoin be greater than $78,000 on March 10?"),
+            self._make_market("Will the price of Bitcoin be between $74,000 and $76,000 on March 11?"),
+            self._make_market("Will Bitcoin reach $85,000 in March?"),
+            # Exclude these (long-dated or unmodelable)
+            self._make_market("Will Bitcoin reach $100,000 by December 31, 2026?"),
+            self._make_market("Ethereum all time high by September 30, 2026?"),
+            self._make_market("Will Bitcoin outperform Silver in March 2026?"),
+            # Not crypto at all
+            self._make_market("Will it rain in NYC?"),
+        ]
+        found = self._filter(markets)
+        assert len(found) == 4
 
 
 class TestParseNumber:
