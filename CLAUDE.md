@@ -33,7 +33,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 |------|---------|-------------|
 | `config.py` | All configuration. Loads from Keychain + `.env` + `config/default.yaml`. | `Settings`, `load_config()`, `AIConfig`, `RiskConfig`, `AgentConfig`, `CryptoSniperConfig`, `WeatherSniperConfig`, `MicroSniperConfig`, `_get_from_keychain()`, `_set_in_keychain()`, `load_keychain_secrets()`, `KEYCHAIN_KEYS` |
 | `models.py` | Every data model (Pydantic). | `Market`, `OrderBook`, `OrderBookLevel`, `Signal`, `Order`, `Position`, `Trade`, `AIAnalysis`, `PortfolioSnapshot`, `Side`, `AgentMode` |
-| `client.py` | Wrapper around `py-clob-client`. Handles auth, order placement, market data. | `PolyClient` |
+| `client.py` | Wrapper around `py-clob-client`. Handles auth, order placement, market data, trade history, balance checks. | `PolyClient` (methods: `get_collateral_balance()`, `get_token_balance()`, `get_trades()`, `get_order()`) |
 | `db.py` | PostgreSQL storage. All tables defined in `SCHEMA_SQL` string at top of file. | `Database` (async, uses connection pool) |
 
 ### AI (`src/polyedge/ai/`)
@@ -88,11 +88,14 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | File | Purpose | Key exports |
 |------|---------|-------------|
 | `engine.py` | Places orders via CLOB API. Runs risk checks before every trade. Requires user confirmation in copilot mode. | `ExecutionEngine` |
-| `tracker.py` | P&L tracking and display. | `PnLTracker` |
+| `tracker.py` | P&L tracking and display (internal, today's trades). | `PnLTracker` |
+| `reconciler.py` | P&L reconciliation against CLOB API fills. Pulls actual fill prices and fees, matches buy/sell pairs (FIFO), computes gross/net/true-net P&L. Also checks for resolved markets. | `PnLReconciler` |
 
 ### CLI (`src/polyedge/cli.py`)
 
-Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `autopilot`, `sniper`, `weather`, `micro`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `pnl reconcile`, `pnl history`, `pnl strategy`, `status`, `autopilot`, `sniper`, `weather`, `micro`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+
+The `status` command smoke tests all CLOB connectivity: wallet balance, API creds, open orders, trade history access, and order signing.
 
 The `sniper` command runs the crypto sniper as a persistent real-time loop (separate from the 5-minute `autopilot` agent). Flags: `--auto` (auto-execute), `--dry` (watch only).
 
@@ -116,6 +119,8 @@ All tables in the `polyedge` schema (PostgreSQL). Defined in `core/db.py` as the
 | `price_history` | Price snapshots per market per sync. Used for price mover detection. |
 | `ai_cost_log` | Every AI API call with tokens, cost, purpose. Used for budget tracking. |
 | `agent_memory` | Persistent agent memory: trade decisions, skip reasons, lessons. |
+| `pnl_ledger` | Reconciled P&L entries: each row is a completed buy/sell pair or resolution with gross P&L, fees, net P&L, gas estimate. |
+| `reconcile_state` | Tracks last CLOB API sync cursor for incremental reconciliation. |
 
 ## Polymarket API Details
 
