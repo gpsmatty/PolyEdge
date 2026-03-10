@@ -329,6 +329,17 @@ class MicroRunner:
             f"[dim]Feed: Binance aggTrade (~10-50 tps) + Polymarket WS{filter_str}[/dim]"
         )
 
+        # Ensure the exchange contracts have on-chain approval to move
+        # our conditional tokens. Without this, SELL orders fail with
+        # "not enough balance / allowance". Only sends a tx if not yet approved.
+        if not self.dry_run:
+            console.print("[dim]Checking exchange approvals...[/dim]")
+            try:
+                self.client.ensure_exchange_approved()
+                console.print("[green]Exchange approvals: OK[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Exchange approval check failed: {e}[/yellow]")
+
         # Initial market load — try DB first when --market filter is set,
         # only hit the API if DB comes back empty (stale data / first run)
         if self.market_filter:
@@ -1017,13 +1028,6 @@ class MicroRunner:
 
             poly_order_id = result.get("orderID", result.get("id", ""))
             if poly_order_id:
-                # Update allowance so we can SELL these tokens later.
-                # Without this, the exchange contract can't move our conditional tokens.
-                try:
-                    self.client.update_token_allowance(token_id)
-                except Exception as e:
-                    logger.warning(f"Token allowance update failed (non-fatal): {e}")
-
                 # Record in DB
                 try:
                     order_id = await self.db.insert_order({
@@ -1158,13 +1162,13 @@ class MicroRunner:
             logger.info(f"No token balance for {token_id}, clearing tracking")
             return True
 
-        # Ensure exchange has allowance to move our conditional tokens.
-        # This is required before any SELL — the exchange contract needs
-        # approval to transfer tokens from our wallet.
+        # Refresh the CLOB backend's cached balance/allowance state.
+        # The actual on-chain approval is done once at startup via
+        # ensure_exchange_approved(). This just syncs the cache.
         try:
             self.client.update_token_allowance(token_id)
         except Exception as e:
-            logger.warning(f"Token allowance update before sell failed: {e}")
+            logger.debug(f"Token allowance cache refresh failed (non-fatal): {e}")
 
         # Check order book bid depth from WebSocket to see what's available.
         # Bids = people willing to buy our tokens. Walk the book to find

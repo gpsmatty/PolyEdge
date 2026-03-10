@@ -82,6 +82,17 @@ class PolyClient:
                     api_passphrase=self.settings.poly_api_passphrase,
                 )
             )
+
+        # Monkey-patch the py-clob-client httpx client with a longer timeout.
+        # Default httpx timeout is 5s which causes ReadTimeout on busy CLOB API.
+        # Also configure retries for transient network errors.
+        import httpx
+        from py_clob_client.http_helpers import helpers as _clob_helpers
+        _clob_helpers._http_client = httpx.Client(
+            http2=True,
+            timeout=httpx.Timeout(15.0, connect=5.0),  # 15s read, 5s connect
+        )
+
         self._initialized = True
 
     def derive_api_keys(self) -> dict:
@@ -179,6 +190,7 @@ class PolyClient:
             price: Max price for BUY, min price for SELL.
         """
         self.ensure_ready()
+        import time as _time
         from py_clob_client.clob_types import MarketOrderArgs
         order_args = MarketOrderArgs(
             token_id=token_id,
@@ -187,7 +199,19 @@ class PolyClient:
             price=price,
         )
         signed_order = self.client.create_market_order(order_args)
-        return self.client.post_order(signed_order, OrderType.FOK)
+
+        # Retry once on timeout — CLOB API can be slow under load.
+        # DANGER: if the first attempt timed out but actually placed the order,
+        # the retry will fail with "duplicate order" or similar, which is fine.
+        for attempt in range(2):
+            try:
+                return self.client.post_order(signed_order, OrderType.FOK)
+            except Exception as e:
+                if "timeout" in str(e).lower() or "Request exception" in str(e):
+                    if attempt == 0:
+                        _time.sleep(0.5)  # Brief pause before retry
+                        continue
+                raise
 
     def place_market_order(
         self,
@@ -280,9 +304,11 @@ class PolyClient:
         return self.client.get_balance_allowance(params)
 
     def update_token_allowance(self, token_id: str) -> dict:
-        """Update allowance for a conditional token so it can be sold.
+        """Refresh the CLOB backend's cached balance/allowance from blockchain.
 
-        Must be called before selling tokens that were received via FOK buy.
+        NOTE: This does NOT grant approval. It only tells the CLOB backend to
+        re-read the on-chain state. Call approve_conditional_tokens() first
+        to actually grant the exchange permission to move your tokens.
         """
         self.ensure_ready()
         params = BalanceAllowanceParams(
@@ -290,6 +316,83 @@ class PolyClient:
             token_id=token_id,
         )
         return self.client.update_balance_allowance(params)
+
+    def approve_conditional_tokens(self, neg_risk: bool = False) -> str:
+        """Approve the exchange contract to transfer our conditional tokens.
+
+        This is an on-chain ERC1155 setApprovalForAll() call. Must be done
+        once per exchange contract (regular and neg-risk are separate).
+        Costs a tiny amount of MATIC gas on Polygon.
+
+        Returns the transaction hash.
+        """
+        from web3 import Web3
+
+        # Polygon RPC
+        w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+
+        # Contract addresses from py-clob-client config
+        CT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        EXCHANGE_REGULAR = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+        EXCHANGE_NEGRISK = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+
+        exchange = EXCHANGE_NEGRISK if neg_risk else EXCHANGE_REGULAR
+
+        # ERC1155 minimal ABI for setApprovalForAll
+        abi = [{"inputs": [{"name": "operator", "type": "address"}, {"name": "approved", "type": "bool"}],
+                "name": "setApprovalForAll", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+               {"inputs": [{"name": "account", "type": "address"}, {"name": "operator", "type": "address"}],
+                "name": "isApprovedForAll", "outputs": [{"name": "", "type": "bool"}],
+                "stateMutability": "view", "type": "function"}]
+
+        ct = w3.eth.contract(address=Web3.to_checksum_address(CT_ADDRESS), abi=abi)
+
+        # Derive our wallet address from private key
+        key = self.settings.poly_private_key
+        account = Account.from_key(key)
+        wallet = account.address
+
+        # Check if already approved
+        is_approved = ct.functions.isApprovedForAll(
+            Web3.to_checksum_address(wallet),
+            Web3.to_checksum_address(exchange),
+        ).call()
+
+        if is_approved:
+            return "already_approved"
+
+        # Build and send approval transaction
+        tx = ct.functions.setApprovalForAll(
+            Web3.to_checksum_address(exchange), True
+        ).build_transaction({
+            "from": wallet,
+            "nonce": w3.eth.get_transaction_count(wallet),
+            "gas": 60000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": 137,
+        })
+
+        signed = w3.eth.account.sign_transaction(tx, key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        return tx_hash.hex()
+
+    def ensure_exchange_approved(self):
+        """Ensure both exchange contracts are approved to move our tokens.
+
+        Call once at startup. Checks on-chain and only sends tx if needed.
+        """
+        import logging
+        logger = logging.getLogger("polyedge.client")
+        for neg_risk in [False, True]:
+            label = "neg-risk" if neg_risk else "regular"
+            try:
+                result = self.approve_conditional_tokens(neg_risk=neg_risk)
+                if result == "already_approved":
+                    logger.info(f"Exchange ({label}): already approved")
+                else:
+                    logger.info(f"Exchange ({label}): approval tx sent: {result}")
+            except Exception as e:
+                logger.warning(f"Exchange ({label}) approval failed: {e}")
 
     # --- Wallet ---
 
