@@ -42,15 +42,17 @@ class PolyClient:
         chain_id = self.settings.polymarket.chain_id
         key = self.settings.poly_private_key
 
-        # If proxy address is set, use signature_type=1 (poly proxy)
-        # This is required when using a wallet imported via Polymarket's web UI
+        # If proxy address is set, use signature_type=2 (Polymarket proxy/MagicLink)
+        # signature_type=0: EOA wallet (no proxy)
+        # signature_type=1: Gnosis Safe (returns $0 for Polymarket web wallets)
+        # signature_type=2: Polymarket proxy wallet (web UI / MagicLink imports)
         funder = self.settings.poly_proxy_address or None
         if funder:
             self.client = ClobClient(
                 host,
                 key=key,
                 chain_id=chain_id,
-                signature_type=1,
+                signature_type=2,
                 funder=funder,
             )
         else:
@@ -127,8 +129,14 @@ class PolyClient:
         side: str,
         price: float,
         size: float,
+        order_type: str = "GTC",
     ) -> dict:
-        """Place a limit order on Polymarket."""
+        """Place a limit order on Polymarket.
+
+        Args:
+            order_type: "GTC" (rests on book), "FOK" (fill all or cancel),
+                        "FAK" (fill what you can, cancel rest).
+        """
         self.ensure_ready()
         order_args = OrderArgs(
             token_id=token_id,
@@ -137,7 +145,10 @@ class PolyClient:
             side=get_poly_side(side),
         )
         signed_order = self.client.create_order(order_args)
-        return self.client.post_order(signed_order, OrderType.GTC)
+        otype = {"GTC": OrderType.GTC, "FOK": OrderType.FOK, "FAK": OrderType.FAK}.get(
+            order_type.upper(), OrderType.GTC
+        )
+        return self.client.post_order(signed_order, otype)
 
     def place_market_order(
         self,

@@ -864,10 +864,15 @@ def status():
 
         # 3. Wallet address
         wallet = settings.poly_wallet_address
+        proxy = settings.poly_proxy_address
         if wallet:
-            console.print(f"  [green]✓ Wallet:[/green] {wallet[:6]}...{wallet[-4:]}")
+            console.print(f"  [green]✓ Wallet (EOA):[/green] {wallet[:6]}...{wallet[-4:]}")
         else:
             console.print("  [yellow]⚠ No wallet address configured[/yellow]")
+        if proxy:
+            console.print(f"  [green]✓ Proxy (funder):[/green] {proxy[:6]}...{proxy[-4:]}")
+        else:
+            console.print("  [dim]  No proxy address (using EOA-only mode)[/dim]")
 
         # 4. USDC balance
         console.print("[dim]Checking USDC balance...[/dim]")

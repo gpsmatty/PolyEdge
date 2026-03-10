@@ -39,8 +39,12 @@ class ExecutionEngine:
         reasoning: str = "",
         ai_probability: Optional[float] = None,
         force: bool = False,
+        order_type: str = "GTC",
     ) -> Optional[str]:
         """Place an order with risk checks.
+
+        Args:
+            order_type: "GTC" (default, rests on book), "FOK" (fill all or cancel).
 
         Returns order_id on success, None on failure.
         """
@@ -76,7 +80,7 @@ class ExecutionEngine:
             "market_id": market.condition_id,
             "token_id": token_id,
             "side": side,
-            "order_type": "LIMIT",
+            "order_type": order_type,
             "price": price,
             "size": size,
             "amount_usd": amount_usd,
@@ -91,6 +95,7 @@ class ExecutionEngine:
                 side=side,
                 price=price,
                 size=size,
+                order_type=order_type,
             )
 
             poly_order_id = result.get("orderID", result.get("id", order_id))

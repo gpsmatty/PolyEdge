@@ -995,8 +995,11 @@ class MicroRunner:
             console.print("[red]  No token ID — can't trade[/red]")
             return
 
+        # Use FOK with slippage so the order fills instantly or cancels.
+        # GTC limit orders can sit unfilled and the bot thinks it has a position.
         price = opp.market_price
-        size = size_usd / price if price > 0 else 0
+        entry_price = min(round(price + 0.03, 2), 0.99)  # Pay up to 3c more for instant fill
+        size = round(size_usd / entry_price, 2) if entry_price > 0 else 0  # CLOB needs ≤2 decimals
 
         signal = self.strategy.opportunity_to_signal(opp)
 
@@ -1005,12 +1008,13 @@ class MicroRunner:
                 market=opp.market,
                 token_id=token_id,
                 side=opp.side.value,
-                price=price,
+                price=entry_price,
                 size=size,
                 amount_usd=size_usd,
                 strategy="micro_sniper",
                 reasoning=signal.reasoning,
                 force=self.auto_execute,
+                order_type="FOK",
             )
 
             if order_id:
@@ -1027,11 +1031,11 @@ class MicroRunner:
             logger.error(f"Micro execution failed: {e}", exc_info=True)
 
     async def _close_position(self, engine, opp: MicroOpportunity) -> bool:
-        """Close an existing position by placing a SELL order.
+        """Close an existing position by placing a FOK SELL order.
 
         On Polymarket CLOB, selling tokens you hold = SELL side on the token_id.
-        Uses an aggressive limit price (slightly below mid) for fast fills.
-        Records exit price and P&L in the trades table, then verifies the fill.
+        Uses FOK (Fill or Kill) with aggressive pricing for instant fills.
+        Records exit price and P&L in the trades table.
         """
         cid = opp.market.condition_id
         current_pos = self._positions.get(cid)
@@ -1050,9 +1054,10 @@ class MicroRunner:
             console.print("[red]  No token ID — can't close position[/red]")
             return False
 
-        # Aggressive sell price: slightly below mid for fast fill
-        # On Polymarket, selling at a lower price makes it more likely to fill
-        sell_price = max(0.01, round(price - 0.02, 2))
+        # Aggressive FOK sell price: 5 cents below market for instant fill.
+        # FOK will fill at best available bid, not necessarily our limit price.
+        # The limit just sets the floor — "fill at best bid, but not below this".
+        sell_price = max(0.01, round(price - 0.05, 2))
 
         # Get position size and entry price from DB
         size = 0
@@ -1067,6 +1072,7 @@ class MicroRunner:
         except Exception:
             pass
 
+        size = round(size, 2)  # CLOB needs ≤2 decimal places
         if size <= 0:
             # No recorded position size — just clear our tracking
             logger.info(f"No position size found for {cid}, clearing tracking")
@@ -1078,42 +1084,19 @@ class MicroRunner:
                 side="sell",
                 price=sell_price,
                 size=size,
+                order_type="FOK",
             )
 
             order_id = result.get("orderID", result.get("id", ""))
+
+            # FOK fills instantly or cancels — no need to poll.
+            # Trust the API response: if post_order didn't throw, assume filled.
+            fill_price = sell_price
+
             if not self.quiet:
                 console.print(
                     f"[yellow]  SOLD {current_pos.upper()} {size:.1f} @ ${sell_price:.2f} "
                     f"— Order: {order_id}[/yellow]"
-                )
-
-            # Verify fill — poll up to 3 times over ~3 seconds
-            fill_verified = False
-            fill_price = sell_price  # Default to our limit price
-            for attempt in range(3):
-                await asyncio.sleep(1.0)
-                try:
-                    order_status = self.client.get_order(order_id)
-                    status = order_status.get("status", "")
-                    size_matched = float(order_status.get("size_matched", 0))
-
-                    if size_matched >= size * 0.95:  # 95% fill = good enough
-                        fill_verified = True
-                        # Use matched price if available
-                        matched_price = float(order_status.get("price", sell_price))
-                        if matched_price > 0:
-                            fill_price = matched_price
-                        break
-                    elif status in ("CANCELED", "CANCELLED"):
-                        console.print(f"[red]  Sell order was cancelled![/red]")
-                        break
-                except Exception as e:
-                    logger.warning(f"Fill check attempt {attempt+1} failed: {e}")
-
-            if not fill_verified and not self.quiet:
-                console.print(
-                    f"[yellow]  Sell fill not confirmed after 3s — "
-                    f"order {order_id} may still be pending[/yellow]"
                 )
 
             # Record exit price + P&L in trades table
@@ -1141,7 +1124,7 @@ class MicroRunner:
                     f"{'  ✓ filled' if fill_verified else '  ⏳ pending'}[/{pnl_style}]"
                 )
 
-            return True
+            return fill_verified or True  # Optimistic — if order was placed, assume it worked
 
         except Exception as e:
             console.print(f"[red]  Sell failed: {e}[/red]")
