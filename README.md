@@ -112,6 +112,17 @@ The probability model uses a normal CDF (Abramowitz & Stegun approximation) with
 
 Run via `polyedge sniper` with `--dry`, copilot (default), or `--auto` modes.
 
+### Micro Sniper (High-Frequency Momentum — Real-Time)
+Reads Binance aggTrade order flow at tick level (~10-50 trades/sec for BTC) and momentum-trades Polymarket's 5-minute crypto "Up or Down" markets. Unlike the crypto sniper which waits for a clear directional move in the final 90 seconds, the micro sniper trades every momentum swing throughout the entire 5-minute window.
+
+The strategy computes a composite momentum signal from -1 (strong sell) to +1 (strong buy) using: short-term order flow imbalance (5s window, 40% weight), medium-term OFI (15s, 30%), VWAP drift (20%), and trade intensity surge (10%). When momentum exceeds the entry threshold (0.40) with sufficient trade activity (10+ trades in 15s window), it enters a position. It exits when momentum dies or reverses, and can flip (close + reopen opposite side) on strong reversals above 0.50 with 25+ confirming trades.
+
+Safety rails prevent buying nearly-dead sides (min price 0.15) or heavily-priced sides (max price 0.80). Gap detection resets stale data on WebSocket reconnect. Window hopping pre-loads 10 upcoming windows for seamless transitions. Binance feeds are narrowed to only matched symbols for minimal latency.
+
+Can produce 10-20+ round-trip trades per 5-minute window. No AI needed — pure microstructure math and speed. Zero API cost.
+
+Run via `polyedge micro --dry --market "btc 5m"` (watch mode), `polyedge micro --market "btc 5m"` (copilot), or `polyedge micro --auto --market "btc 5m"` (autopilot).
+
 ### AI Edge Finder
 Uses LLMs to estimate true probabilities independent of market price. When `AI_probability - market_price > 10%`, generates a trade signal. The AI analyst operates with a strong market-efficiency prior — it defaults to agreeing with market price and requires concrete evidence to diverge. Two-tier model system:
 
@@ -155,6 +166,7 @@ All configurable in `config/default.yaml` and overridable at runtime via databas
 3. **Market Lifecycle** automatically deactivates markets that vanish from API or pass end date
 4. **Polymarket WebSocket Feed** provides real-time price/book updates via `wss://ws-subscriptions-clob.polymarket.com`
 5. **Binance WebSocket Feed** provides real-time crypto prices (BTC, ETH, SOL) via `wss://stream.binance.com:9443` — no API key needed, combined streams for all symbols
+6. **Binance aggTrade Feed** provides tick-level trade data with buy/sell classification for order flow analysis — the core data source for the micro sniper
 6. **Order Book Analyzer** extracts microstructure intelligence (imbalance, depth, whales, walls)
 
 ## Agent Scan Cycle
@@ -170,7 +182,7 @@ Each cycle (every 5 minutes):
 7. Generate signals when edge > 10% and confidence > 65%, size with quarter-Kelly, execute
 8. Record memories and lessons for future context
 
-The crypto sniper runs as a separate persistent loop (`polyedge sniper`), evaluating on every Binance price tick rather than on a 5-minute cycle.
+The crypto sniper, micro sniper, and weather sniper each run as separate persistent loops (`polyedge sniper`, `polyedge micro`, `polyedge weather`), independent of the 5-minute agent cycle.
 
 ## Stack
 
@@ -188,7 +200,7 @@ The crypto sniper runs as a separate persistent loop (`polyedge sniper`), evalua
 .venv/bin/pytest tests/ -v
 ```
 
-80+ tests covering models, Kelly criterion, position sizing, portfolio risk, order book analysis, strategy logic, crypto sniper probability model, weather sniper ensemble forecasting, neg-risk detection, and market regex matching.
+120+ tests covering models, Kelly criterion, position sizing, portfolio risk, order book analysis, strategy logic, crypto sniper probability model, micro sniper momentum logic, weather sniper ensemble forecasting, neg-risk detection, and market regex matching.
 
 ## Secrets Management (macOS Keychain)
 

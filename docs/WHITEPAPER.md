@@ -107,6 +107,44 @@ Polymarket has 300+ active weather markets covering daily city temperatures, pre
 
 Run via `polyedge weather` with `--dry`, copilot (default), or `--auto` modes.
 
+### 6. Micro Sniper (High-Frequency Momentum — aggTrade Order Flow)
+
+The most aggressive strategy in the system. While the crypto sniper waits for a clear directional move in the final 90 seconds, the micro sniper trades every momentum swing throughout the entire 5-minute window by reading Binance's tick-level aggTrade data.
+
+**Core insight:** Binance's aggTrade stream delivers every single trade as it happens (~10-50 messages/sec for BTC), with the critical field `m` (buyer is maker) that tells you whether the buyer or seller was the aggressor. When aggressive buyers dominate the last few seconds, BTC is about to move up — and Polymarket's 5-minute up/down market prices lag that signal by seconds.
+
+**The momentum signal** is a composite score from -1 (strong sell) to +1 (strong buy):
+
+- Order Flow Imbalance over 5s window (40% weight) — the most reactive indicator
+- Order Flow Imbalance over 15s window (30% weight) — smoothed confirmation
+- VWAP drift over 15s (20% weight) — are trades executing at higher or lower prices?
+- Trade intensity surge (10% weight) — volume spikes signal conviction
+
+OFI (Order Flow Imbalance) = `(buy_volume - sell_volume) / total_volume`. A value of +0.80 means 90% of recent volume came from aggressive buyers.
+
+**Entry:** When `|momentum| > 0.40` with at least 10 trades in the 15s window, confidence > 0.40, and the Polymarket price for our side is between $0.15 and $0.80.
+
+**Exit:** When momentum reverses past 0.15 against our position, or drops below 0.08 even if aligned (signal dying), or with <8 seconds remaining in the window.
+
+**Flip:** When momentum reverses past 0.50 with high confidence and 25+ confirming trades, close the current position and immediately open the opposite side. The higher thresholds exist because flips are expensive — you pay spread twice (close + reopen).
+
+**Window management:** Pre-loads 10 upcoming 5-minute windows from the Polymarket Gamma API. When the current window expires, instantly promotes the next one. Refetches from the API when ≤3 windows remain. An asyncio lock prevents concurrent API fetches from the refresh loop and hop handler racing.
+
+**Safety mechanisms:**
+
+- Minimum entry price of $0.15 — if the market says 85%+ chance of the other side, a brief OFI blip doesn't override that
+- Maximum entry price of $0.80 — don't buy heavily-priced sides (not enough upside)
+- Gap detection — if >5 seconds pass between aggTrade ticks (WebSocket disconnect), reset all flow windows to avoid trading on stale momentum
+- 10-second cooldown between trades on the same market to prevent whipsaw
+- Maximum 50 trades per window (circuit breaker)
+- Binance feeds narrowed to only matched symbols (when filtering by `--market btc 5m`, only subscribes to `btcusdt@aggTrade`)
+
+**Early results show:** The strategy correctly identifies momentum direction most of the time. The main risk is counter-trend entries — buying against a strong established trend on a brief OFI blip that doesn't follow through. With-trend trades are consistently profitable; counter-trend trades are where losses concentrate.
+
+No AI needed. Zero API cost per trade. Pure microstructure math and speed.
+
+Run via `polyedge micro --dry --market "btc 5m"` (watch), copilot (default), or `--auto` (autopilot).
+
 ## Order Book Intelligence
 
 Most prediction market bots only look at price. PolyEdge also reads the order book to extract microstructure signals:
@@ -171,6 +209,8 @@ Before analyzing a market, the agent retrieves its memory context and feeds it t
 **Polymarket WebSocket Feed:** For real-time market data, PolyEdge connects to Polymarket's market WebSocket channel. No authentication needed. Receives order book snapshots, incremental price changes, trade executions, and best bid/ask updates.
 
 **Binance WebSocket Feed:** For real-time crypto price data, PolyEdge connects to Binance's public combined streams endpoint. Tracks BTC, ETH, and SOL via 24hr ticker updates. Maintains latest price snapshots and rolling price windows per symbol. Automatic reconnection with exponential backoff (2s base, 30s max). No API key needed — fully public data.
+
+**Binance aggTrade Feed:** For tick-level order flow data, PolyEdge connects to Binance's aggTrade stream (`wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade`). Delivers every individual trade with buy/sell classification at ~10-50 messages/sec for BTC. Maintains rolling microstructure state (5s/15s/30s flow windows) per symbol with OFI, VWAP drift, and trade intensity metrics. Gap detection resets stale data on WebSocket reconnect.
 
 **PostgreSQL Schema:** 10 tables across markets, orders, trades, positions, AI analyses, portfolio snapshots, risk config, price history, AI cost log, and agent memory. All data persists across restarts.
 
