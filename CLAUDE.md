@@ -4,7 +4,7 @@ This document is for AI assistants working on this codebase. It contains everyth
 
 ## What This Project Is
 
-PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a monolith Python application that scans markets, uses LLMs to estimate true probabilities, detects mispricings, sizes positions with Kelly criterion, and executes real trades via the Polymarket CLOB API. Starting bankroll is $200 USD.
+PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a monolith Python application that scans markets, uses LLMs to estimate true probabilities, detects mispricings, sizes positions with Kelly criterion, and executes real trades via the Polymarket CLOB API. It includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, and a weather sniper that compares ensemble weather forecasts against Polymarket weather market prices. Starting bankroll is $200 USD.
 
 ## Project Root
 
@@ -15,7 +15,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 - Python 3.11+ (currently 3.13), async throughout
 - `asyncpg` for PostgreSQL
 - `py-clob-client` — official Polymarket CLOB SDK (REST only, no WebSocket)
-- `websockets` — for real-time market data feed
+- `websockets` — for real-time market data feed (Polymarket + Binance)
 - `anthropic` SDK + `openai` SDK — LLM backends
 - `pydantic` v2 + `pydantic-settings` — all models and config
 - `click` — CLI framework
@@ -31,7 +31,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 
 | File | Purpose | Key exports |
 |------|---------|-------------|
-| `config.py` | All configuration. Loads from Keychain + `.env` + `config/default.yaml`. | `Settings`, `load_config()`, `AIConfig`, `RiskConfig`, `AgentConfig`, `_get_from_keychain()`, `_set_in_keychain()`, `load_keychain_secrets()`, `KEYCHAIN_KEYS` |
+| `config.py` | All configuration. Loads from Keychain + `.env` + `config/default.yaml`. | `Settings`, `load_config()`, `AIConfig`, `RiskConfig`, `AgentConfig`, `CryptoSniperConfig`, `WeatherSniperConfig`, `_get_from_keychain()`, `_set_in_keychain()`, `load_keychain_secrets()`, `KEYCHAIN_KEYS` |
 | `models.py` | Every data model (Pydantic). | `Market`, `OrderBook`, `OrderBookLevel`, `Signal`, `Order`, `Position`, `Trade`, `AIAnalysis`, `PortfolioSnapshot`, `Side`, `AgentMode` |
 | `client.py` | Wrapper around `py-clob-client`. Handles auth, order placement, market data. | `PolyClient` |
 | `db.py` | PostgreSQL storage. All tables defined in `SCHEMA_SQL` string at top of file. | `Database` (async, uses connection pool) |
@@ -54,7 +54,9 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | `indexer.py` | Syncs all markets from API to PostgreSQL. Deactivates stale/closed markets. Tracks price history. | `MarketIndexer` |
 | `orderbook.py` | Fetches raw order book from CLOB API. | `get_order_book()`, `get_prices()` |
 | `book_analyzer.py` | Order book microstructure analysis. Computes imbalance, depth, whale detection, wall detection. | `analyze_book()`, `get_book_intelligence()`, `format_book_for_ai()`, `BookIntelligence` |
-| `ws_feed.py` | WebSocket feed for real-time market data. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. No auth needed. Must send `PING` every 10s. | `MarketFeed` |
+| `binance_feed.py` | Binance WebSocket feed for real-time crypto prices (BTC, ETH, SOL). No auth needed. Combined streams, auto-reconnect. | `BinanceFeed`, `PriceSnapshot`, `PriceWindow` |
+| `weather_feed.py` | Weather forecast feed from Open-Meteo (ensemble) and NOAA (official). Caches forecasts, supports multiple locations. No API key needed. | `WeatherFeed`, `EnsembleForecast`, `NOAAForecast`, `LOCATIONS`, `find_location()` |
+| `ws_feed.py` | WebSocket feed for real-time Polymarket data. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. No auth needed. Must send `PING` every 10s. | `MarketFeed` |
 | `signals.py` | External data sources (stub). | — |
 
 ### Strategies (`src/polyedge/strategies/`)
@@ -62,8 +64,12 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | File | Purpose | Key exports |
 |------|---------|-------------|
 | `base.py` | Strategy ABC with `evaluate(market) -> Signal`. | `Strategy` |
-| `cheap_hunter.py` | Finds underpriced tail events (<$0.15). Zero AI cost. Uses liquidity/time/price heuristics. | `CheapHunterStrategy` |
-| `edge_finder.py` | Converts AI analysis into trade signals when edge > threshold. | `EdgeFinderStrategy` |
+| `crypto_sniper.py` | Real-time crypto price feed arbitrage. Maps Binance price movement to implied probability using normal CDF with sqrt(time) volatility scaling. | `CryptoSniperStrategy`, `SniperOpportunity`, `find_crypto_markets()`, `match_market_to_symbol()` |
+| `sniper_runner.py` | Persistent async loop connecting Binance prices to Polymarket crypto markets. Evaluates on every tick, executes snipes. | `SniperRunner` |
+| `weather_sniper.py` | Weather forecast arbitrage. Compares Open-Meteo ensemble probabilities to Polymarket weather market prices. Detects neg-risk on multi-bucket events. | `WeatherSniperStrategy`, `WeatherOpportunity`, `NegRiskOpportunity`, `find_weather_markets()`, `group_weather_events()` |
+| `weather_runner.py` | Persistent async loop for weather sniper. Refreshes markets (5 min) and forecasts (30 min), evaluates all weather markets. | `WeatherRunner` |
+| `cheap_hunter.py` | Finds underpriced tail events (<$0.15). Zero AI cost. **Disabled** — heuristic boosts generate false positives. | `CheapHunterStrategy` |
+| `edge_finder.py` | Converts AI analysis into trade signals when edge > 10% threshold. | `EdgeFinderStrategy` |
 | `market_maker.py` | Spread capture strategy (WIP, not fully implemented). | `MarketMakerStrategy` |
 
 ### Risk (`src/polyedge/risk/`)
@@ -83,7 +89,11 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 
 ### CLI (`src/polyedge/cli.py`)
 
-Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `autopilot`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `autopilot`, `sniper`, `weather`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+
+The `sniper` command runs the crypto sniper as a persistent real-time loop (separate from the 5-minute `autopilot` agent). Flags: `--auto` (auto-execute), `--dry` (watch only).
+
+The `weather` command runs the weather sniper as a persistent polling loop. Flags: `--auto` (auto-execute), `--dry` (watch only). Default is copilot mode.
 
 ## Database Schema
 
@@ -123,6 +133,18 @@ All tables in the `polyedge` schema (PostgreSQL). Defined in `core/db.py` as the
 
 **Key distinction:** `condition_id` identifies a market. `clob_token_ids` are the numeric token IDs for YES (index 0) and NO (index 1) outcomes. The CLOB and WebSocket APIs use token IDs, not condition IDs.
 
+## Binance API Details
+
+**WebSocket** (`wss://stream.binance.com:9443`):
+- Combined streams: `/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker`
+- Format: `{"stream": "btcusdt@ticker", "data": {...}}`
+- Key fields in ticker data: `c` (last price), `b` (best bid), `a` (best ask), `v` (24h volume), `P` (24h change %)
+- No authentication needed — fully public API
+- Ping interval: 20 seconds (handled by websockets library)
+- Auto-reconnect with exponential backoff (2s base, 30s max)
+
+Used exclusively by the crypto sniper strategy as a price oracle to compare against Polymarket's short-duration crypto markets.
+
 ## Agent Scan Cycle (How It Works)
 
 Defined in `agent.py` `_scan_cycle()`. Every 5 minutes:
@@ -130,13 +152,36 @@ Defined in `agent.py` `_scan_cycle()`. Every 5 minutes:
 1. **Housekeeping** — Review resolved positions for lessons, clean expired memories.
 2. **Circuit breaker check** — Daily trade limit, daily loss limit.
 3. **Load markets** — From DB via `MarketIndexer` (auto-syncs from API if stale, every 15 min).
-4. **Cheap Hunter** — Run on all markets. Zero AI cost. Generates `Signal` objects.
-5. **Pick AI candidates** — `_pick_ai_candidates()`: price movers first (markets that moved >3% in last hour), then highest volume. Capped at `max_markets_per_scan` (default 20).
-6. **Quick score** — `quick_score_market()` via compute model (Haiku). Scores 0-100. ~$0.001 each.
-7. **Deep analysis** — Top half of scored candidates get `analyze_market()` via research model (Sonnet). Includes order book context (`format_book_for_ai()`), news context, agent memory context. ~$0.003 each.
-8. **Signal generation** — If `|AI_prob - market_price| > min_edge_threshold` and `confidence > min_confidence`, create a `Signal`.
-9. **Execution** — Based on mode: autopilot (auto-execute), copilot (recommend + confirm), signals (display only).
-10. **Memory** — Record trade decisions and skip reasons.
+4. **Pick AI candidates** — `_pick_ai_candidates()`: scores markets 0-9 via `_candidate_score()` based on price range (mid-range 20-80% scores highest), liquidity ($2K-$100K sweet spot), volume, and time to resolution. Filters out blacklisted categories (meme, celebrity, entertainment) via `_is_blacklisted()` and short-duration crypto markets via `_is_short_duration_crypto()` (handled by sniper). Capped at `max_markets_per_scan` (default 10).
+5. **Quick score** — `quick_score_market()` via compute model (Haiku). Scores 0-100 on **mispricing potential** (not trading potential). ~$0.001 each.
+6. **Deep analysis** — Top half of scored candidates get `analyze_market()` via research model (Sonnet). AI operates with **market-efficiency prior** — defaults to agreeing with market price, needs strong evidence to diverge. Includes order book context, news context (only when API key configured), agent memory context. ~$0.003 each.
+7. **Signal generation** — If `|AI_prob - market_price| > 10%` (min_edge_threshold) and `confidence > 65%` (min_confidence), create a `Signal`.
+8. **Execution** — Based on mode: autopilot (auto-execute), copilot (recommend + confirm), signals (display only).
+9. **Memory** — Record trade decisions and skip reasons.
+
+## Crypto Sniper Loop (How It Works)
+
+Defined in `sniper_runner.py` `SniperRunner.run()`. Runs as a persistent async process, separate from the agent scan cycle:
+
+1. **Connect** — Opens WebSocket to Binance combined streams for BTC, ETH, SOL tickers.
+2. **Market refresh** — Every 60 seconds, fetches active crypto "Up or Down" markets from Polymarket Gamma API. Groups by symbol. Starts price windows for new markets.
+3. **Price callback** — On every Binance price tick (~1/sec per symbol), evaluates all tracked markets via `CryptoSniperStrategy.evaluate_with_price()`.
+4. **Probability model** — Computes implied probability from price change using normal CDF with sqrt(time) volatility scaling. Conservative tuning: 0.3% vol floor, +15s execution buffer, 0.05 min remaining fraction.
+5. **Edge check** — If `implied_prob - market_price > 8%` (min_edge) and price moved >0.2% and <90 seconds remain, generate a `SniperOpportunity`.
+6. **Execution** — Size with Kelly (max 5% of bankroll per snipe). In `--dry` mode, display only. In copilot, ask for confirmation. In `--auto`, execute immediately. Tracks `_traded_markets` set to prevent double-entry.
+7. **Status** — Prints price/stats summary every 30 seconds.
+
+## Weather Sniper Loop (How It Works)
+
+Defined in `weather_runner.py` `WeatherRunner.run()`. Runs as a persistent async process, separate from the agent and crypto sniper:
+
+1. **Start** — Launches three concurrent async tasks: market refresh, forecast refresh, and status display.
+2. **Market refresh** (every 5 min) — Fetches weather markets from Polymarket Gamma API via `find_weather_markets()`. Filters to configured locations. Groups multi-bucket events via `group_weather_events()` (uses `groupSlug` from raw Gamma data, falls back to `groupItemTitle`/category).
+3. **Forecast refresh** (every 30 min) — For each tracked weather market, fetches ensemble forecast from Open-Meteo. Parses market question to extract location, target date, and bucket range via `WeatherSniperStrategy.parse_market()`.
+4. **Evaluation** — For each market with a forecast, computes forecast probability (fraction of ensemble members in bucket range) and compares to market price. If `forecast_prob - market_price > 10%` (min_edge) and ensemble confidence > 60%, generates a `WeatherOpportunity`.
+5. **Neg-risk check** — For each event group (multi-bucket temperature events), checks if YES prices sum != $1.00. If sum > $1.00 by more than 3% (min_neg_risk_edge), signals sell-all arbitrage. If sum < $1.00 by same margin, signals buy-all.
+6. **Execution** — Size with Kelly (max 8% of bankroll per weather trade). In `--dry` mode, display only. In copilot, ask for confirmation. In `--auto`, execute immediately.
+7. **Status** — Prints tracked market count and opportunity stats every 60 seconds.
 
 ## Tiered AI Model System
 
@@ -201,6 +246,9 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 - **No paper trading** — Real money from day one. $200 bankroll.
 - **Quarter Kelly** — Full Kelly is mathematically optimal but assumes perfect probability estimates. Quarter Kelly dramatically reduces variance.
 - **Two-tier AI** — Cheap model filters before expensive model analyzes. Keeps costs under $1/hour.
+- **Market-efficiency prior** — AI analyst defaults to agreeing with market price. Needs strong specific evidence to disagree by >5%. Prevents LLM from hallucinating edges.
+- **Crypto sniper** — Separate persistent loop from the 5-minute agent. Evaluates on every Binance price tick. Zero AI cost — pure math.
+- **Weather sniper** — Separate polling loop. Compares free ensemble weather forecasts against Polymarket prices. Also detects neg-risk arbitrage on multi-bucket temperature events. Zero AI cost — pure data comparison.
 - **Agent memory** — Persistent across sessions. Lessons never expire. Trade decisions expire after 30 days. Skip reasons expire after 6 hours.
 - **Market indexer** — Don't hit the Gamma API every scan cycle. Sync to DB periodically, read from DB always.
 - **Keychain over .env** — Secrets encrypted at rest by macOS. No plaintext keys in the repo directory.
@@ -212,7 +260,7 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 .venv/bin/pytest tests/ -v
 ```
 
-44 tests. Pure logic tests (no DB, no API mocks needed for most). Test files:
+80+ tests. Pure logic tests (no DB, no API mocks needed for most). Test files:
 
 | File | Tests |
 |------|-------|
@@ -222,6 +270,8 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 | `test_cheap_hunter.py` | Cheap event detection, filtering, batch ranking |
 | `test_portfolio_risk.py` | Risk checks: max positions, exposure, daily limits, circuit breaker |
 | `test_book_analyzer.py` | Order book analysis: spread, imbalance, whales, walls, depth |
+| `test_crypto_sniper.py` | Normal CDF accuracy (Abramowitz & Stegun), implied probability model, crypto market regex matching, duration parsing, candidate scoring, threshold filtering |
+| `test_weather_sniper.py` | Ensemble probability (in-range, above, below, boundary), location matching, market parsing (bucket ranges, below/above, precipitation), weather identification, event grouping, evaluate with forecast, neg-risk detection, confidence scoring, config defaults, signal conversion |
 
 ## Common Modification Patterns
 
@@ -256,6 +306,48 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 2. Format as text context string
 3. Pass to `analyze_market()` via `additional_context` parameter
 4. Or add a new dedicated parameter to `_build_analysis_prompt()` in `analyst.py`
+
+**Adding a real-time strategy (like crypto sniper):**
+1. Create `strategies/new_strategy.py` with strategy logic
+2. Create `strategies/new_runner.py` with persistent async loop
+3. Add config model in `config.py` (see `CryptoSniperConfig` as template), add to `StrategiesConfig`
+4. Add to `default.yaml`
+5. Add CLI command in `cli.py` that wires up the runner
+6. This runs separately from the 5-minute agent cycle
+
+**Crypto sniper config keys** (all under `strategies.crypto_sniper.*`):
+- `enabled` (bool, default true)
+- `min_edge` (float, default 0.08 = 8%)
+- `min_price_move_pct` (float, default 0.002 = 0.2%)
+- `max_seconds_before_entry` (float, default 90)
+- `symbols` (list[str], default ["btcusdt", "ethusdt", "solusdt"])
+- `max_position_per_trade` (float, default 0.05 = 5% of bankroll)
+- `min_liquidity` (float, default 500)
+
+**Weather sniper config keys** (all under `strategies.weather_sniper.*`):
+- `enabled` (bool, default true)
+- `min_edge` (float, default 0.10 = 10%)
+- `min_confidence` (float, default 0.60 = 60% ensemble agreement)
+- `min_neg_risk_edge` (float, default 0.03 = 3% for multi-bucket arbitrage)
+- `max_position_per_trade` (float, default 0.08 = 8% of bankroll)
+- `min_liquidity` (float, default 200)
+- `forecast_interval_minutes` (int, default 30)
+- `locations` (list[str], default ["nyc", "london", "seoul", "chicago", "miami"])
+
+## Weather API Details
+
+**Open-Meteo Ensemble API** (`https://ensemble-api.open-meteo.com/v1/ensemble`):
+- Free, no API key needed. 10,000 calls/day on free tier.
+- GFS ensemble forecasts with multiple model runs (up to 50 ensemble members).
+- Query params: `latitude`, `longitude`, `daily` (e.g., `temperature_2m_max`), `models=gfs_seamless`, `forecast_days`.
+- Response includes `temperature_2m_max_member01`, `_member02`, etc. — each member is one model run.
+- Natural probability distribution: count members in range / total members = probability estimate.
+
+**NOAA API** (`https://api.weather.gov`):
+- Free, no API key needed. Requires `User-Agent` header.
+- Two-step process: `/points/{lat},{lon}` → get grid coordinates → `/gridpoints/{office}/{gridX},{gridY}/forecast`.
+- Official US government data that directly matches Polymarket resolution source for US weather markets.
+- Used as cross-reference for US locations alongside Open-Meteo ensemble data.
 
 ## Owner Preferences
 

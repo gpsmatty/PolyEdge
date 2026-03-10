@@ -2,7 +2,7 @@
 
 AI-powered trading bot for [Polymarket](https://polymarket.com) prediction markets.
 
-Scans thousands of markets, estimates true probabilities with LLMs, detects mispricings, sizes positions with Kelly criterion, and executes trades on the CLOB — all from a single Python process.
+Scans thousands of markets, estimates true probabilities with LLMs, detects mispricings, sizes positions with Kelly criterion, and executes trades on the CLOB — all from a single Python process. Includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets.
 
 ## Quick Start
 
@@ -22,12 +22,21 @@ polyedge setup
 
 # Scan markets
 polyedge scan
-polyedge hunt          # Find cheap underpriced events
 polyedge edges         # AI-powered edge detection
 polyedge book "trump"  # Order book intelligence
 polyedge movers        # Markets with price movement
 
-# Start the agent
+# Crypto sniper — real-time price feed arbitrage
+polyedge sniper --dry   # Watch mode — show opportunities, don't trade
+polyedge sniper         # Copilot — confirm each snipe
+polyedge sniper --auto  # Autopilot — auto-execute snipes
+
+# Weather sniper — forecast vs market price arbitrage
+polyedge weather --dry   # Watch mode
+polyedge weather         # Copilot
+polyedge weather --auto  # Autopilot
+
+# Start the general agent
 polyedge autopilot --mode signals    # Display-only mode
 polyedge autopilot --mode copilot    # Recommends, you approve
 polyedge autopilot --mode autopilot  # Fully autonomous
@@ -59,10 +68,12 @@ polyedge/
 │   ├── db.py           # PostgreSQL (asyncpg)
 │   └── models.py       # All data models
 ├── data/
+│   ├── binance_feed.py   # Binance WebSocket price feed (BTC/ETH/SOL)
 │   ├── book_analyzer.py  # Order book microstructure analysis
 │   ├── indexer.py        # Market sync (API → DB)
 │   ├── markets.py        # Gamma API fetching
 │   ├── orderbook.py      # Order book fetching
+│   ├── weather_feed.py   # Open-Meteo + NOAA weather forecast feed
 │   └── ws_feed.py        # WebSocket real-time feed
 ├── execution/
 │   ├── engine.py       # Order placement + risk checks
@@ -72,9 +83,13 @@ polyedge/
 │   ├── portfolio.py    # Portfolio-level risk management
 │   └── sizing.py       # Position sizing
 ├── strategies/
-│   ├── cheap_hunter.py # Underpriced tail events
-│   ├── edge_finder.py  # AI-detected mispricings
-│   └── market_maker.py # Spread capture (WIP)
+│   ├── cheap_hunter.py    # Underpriced tail events (disabled)
+│   ├── crypto_sniper.py   # Real-time crypto price feed arbitrage
+│   ├── edge_finder.py     # AI-detected mispricings
+│   ├── market_maker.py    # Spread capture (WIP)
+│   ├── sniper_runner.py   # Persistent async loop for crypto sniper
+│   ├── weather_sniper.py  # Weather forecast vs market price arbitrage
+│   └── weather_runner.py  # Persistent loop for weather sniper
 ├── dashboard/
 │   └── live.py         # Rich terminal dashboard
 └── cli.py              # Click CLI entry point
@@ -82,13 +97,28 @@ polyedge/
 
 ## Strategies
 
-### Cheap Event Hunter
-Zero AI cost. Scans all markets for YES/NO outcomes priced under $0.15. Estimates true probability via liquidity, time, and price heuristics. Ranks by expected value per dollar.
+### Crypto Sniper (Primary — Real-Time)
+Exploits latency between Binance spot prices and Polymarket's short-duration (5-min / 15-min) crypto "Up or Down" markets. Connects to Binance WebSocket for real-time BTC, ETH, and SOL prices. When crypto moves significantly with little time remaining in a Polymarket window, the outcome is near-certain but the market hasn't repriced yet. No AI needed — pure math and speed.
+
+The probability model uses a normal CDF (Abramowitz & Stegun approximation) with sqrt(time) volatility scaling, calibrated against 5-minute BTC dynamics. Conservative tuning includes a 0.3% volatility floor, 15-second execution latency buffer, and 8% minimum edge to trade.
+
+Run via `polyedge sniper` with `--dry`, copilot (default), or `--auto` modes.
 
 ### AI Edge Finder
-Uses LLMs to estimate true probabilities independent of market price. When `AI_probability - market_price > 5%`, generates a trade signal. Two-tier model system:
-- **Compute model** (Haiku) — quick-scores all candidates, ~$0.001/market
+Uses LLMs to estimate true probabilities independent of market price. When `AI_probability - market_price > 10%`, generates a trade signal. The AI analyst operates with a strong market-efficiency prior — it defaults to agreeing with market price and requires concrete evidence to diverge. Two-tier model system:
+
+- **Compute model** (Haiku) — quick-scores candidates on mispricing potential, ~$0.001/market
 - **Research model** (Sonnet) — deep analysis on top candidates with news + order book context, ~$0.003/market
+
+Candidate selection uses a scoring system that favors mid-range prices (20-80%), moderate liquidity ($2K-$100K), and filters out meme/celebrity/entertainment categories and short-duration crypto markets (handled by sniper).
+
+### Weather Sniper (Data-Driven)
+Trades Polymarket weather markets (temperature buckets, precipitation) by comparing ensemble weather forecasts against market prices. Uses Open-Meteo's GFS ensemble data (free, no API key) for probability estimation and NOAA for US market resolution source matching. Also detects neg-risk arbitrage on multi-bucket temperature events when YES prices don't sum to $1.00. No AI needed — pure data comparison.
+
+Run via `polyedge weather` with `--dry`, copilot (default), or `--auto` modes.
+
+### Cheap Event Hunter (Disabled)
+Previously scanned for outcomes priced under $0.15. Disabled after testing showed mechanical heuristic boosts generate false positives without domain-specific awareness. May be re-enabled with smarter filtering in the future.
 
 ### Market Maker (WIP)
 Quote both sides on wide-spread markets. Inventory management and adverse selection avoidance.
@@ -103,8 +133,8 @@ All configurable in `config/default.yaml` and overridable at runtime via databas
 | max_exposure_pct | 50% | Max total exposure |
 | max_positions | 10 | Max concurrent positions |
 | kelly_fraction | 0.25 | Quarter Kelly (conservative) |
-| min_edge_threshold | 5% | Minimum edge to trade |
-| min_confidence | 60% | Minimum AI confidence |
+| min_edge_threshold | 10% | Minimum edge to trade (AI strategies) |
+| min_confidence | 65% | Minimum AI confidence |
 | max_trades_per_day | 20 | Daily trade limit |
 | daily_loss_limit_pct | 15% | Stop-loss for the day |
 | drawdown_circuit_breaker | 25% | Pause trading if bankroll drops 25% |
@@ -115,21 +145,24 @@ All configurable in `config/default.yaml` and overridable at runtime via databas
 1. **Market Indexer** syncs all markets from Gamma API to PostgreSQL every 15 minutes (paginated, handles 1000+ markets)
 2. **Price History** records snapshots each sync for movement detection
 3. **Market Lifecycle** automatically deactivates markets that vanish from API or pass end date
-4. **WebSocket Feed** provides real-time price/book updates via `wss://ws-subscriptions-clob.polymarket.com`
-5. **Order Book Analyzer** extracts microstructure intelligence (imbalance, depth, whales, walls)
+4. **Polymarket WebSocket Feed** provides real-time price/book updates via `wss://ws-subscriptions-clob.polymarket.com`
+5. **Binance WebSocket Feed** provides real-time crypto prices (BTC, ETH, SOL) via `wss://stream.binance.com:9443` — no API key needed, combined streams for all symbols
+6. **Order Book Analyzer** extracts microstructure intelligence (imbalance, depth, whales, walls)
 
 ## Agent Scan Cycle
 
 Each cycle (every 5 minutes):
 
 1. Load markets from DB (auto-sync if stale)
-2. Run Cheap Hunter on all markets (free)
-3. Pick top 20 AI candidates (price movers + highest volume)
-4. Quick-score with Haiku ($0.001/market)
+2. Score and rank top 10 AI candidates (mid-range price, moderate liquidity, recent movers)
+3. Filter out blacklisted categories (meme, celebrity, entertainment) and short-duration crypto (handled by sniper)
+4. Quick-score with Haiku on mispricing potential ($0.001/market)
 5. Deep-analyze top half with Sonnet + news + book context ($0.003/market)
-6. Fetch order book intelligence for trade candidates
-7. Generate signals, size positions with Kelly, execute trades
+6. AI operates with market-efficiency prior — needs strong evidence to disagree with market price
+7. Generate signals when edge > 10% and confidence > 65%, size with quarter-Kelly, execute
 8. Record memories and lessons for future context
+
+The crypto sniper runs as a separate persistent loop (`polyedge sniper`), evaluating on every Binance price tick rather than on a 5-minute cycle.
 
 ## Stack
 
@@ -137,7 +170,7 @@ Each cycle (every 5 minutes):
 - py-clob-client (Polymarket SDK)
 - asyncpg + PostgreSQL
 - Anthropic SDK (Claude) + OpenAI SDK
-- websockets (real-time feed)
+- websockets (Polymarket + Binance real-time feeds)
 - Click (CLI) + Rich (terminal UI)
 - Pydantic v2 (config + models)
 
@@ -147,7 +180,7 @@ Each cycle (every 5 minutes):
 .venv/bin/pytest tests/ -v
 ```
 
-44 tests covering models, Kelly criterion, position sizing, portfolio risk, order book analysis, and strategy logic.
+80+ tests covering models, Kelly criterion, position sizing, portfolio risk, order book analysis, strategy logic, crypto sniper probability model, weather sniper ensemble forecasting, neg-risk detection, and market regex matching.
 
 ## Secrets Management (macOS Keychain)
 
