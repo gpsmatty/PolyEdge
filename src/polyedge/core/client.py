@@ -7,7 +7,14 @@ from typing import Optional
 
 from eth_account import Account
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+from py_clob_client.clob_types import (
+    ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
+    OrderArgs,
+    OrderType,
+    TradeParams,
+)
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from polyedge.core.config import Settings
@@ -151,6 +158,64 @@ class PolyClient:
         """Get all open orders."""
         self.ensure_ready()
         return self.client.get_orders()
+
+    def get_order(self, order_id: str) -> dict:
+        """Get a specific order by ID. Requires L2 auth."""
+        self.ensure_ready()
+        return self.client.get_order(order_id)
+
+    # --- Trade History (auth required) ---
+
+    def get_trades(
+        self,
+        market: str | None = None,
+        asset_id: str | None = None,
+        after: int | None = None,
+        before: int | None = None,
+    ) -> list[dict]:
+        """Get trade fill history for this account.
+
+        Returns all fills (paginated automatically by the SDK).
+        Each fill includes: id, taker_order_id, market, asset_id,
+        side, size, fee_rate_bps, price, status, match_time, type.
+
+        Args:
+            market: Filter by condition_id.
+            asset_id: Filter by token_id.
+            after: Unix timestamp — only fills after this time.
+            before: Unix timestamp — only fills before this time.
+        """
+        self.ensure_ready()
+        params = TradeParams(
+            market=market,
+            asset_id=asset_id,
+            after=after,
+            before=before,
+        )
+        return self.client.get_trades(params)
+
+    # --- Balance (auth required) ---
+
+    def get_collateral_balance(self) -> dict:
+        """Get USDC collateral balance and allowance.
+
+        Returns dict with 'balance' (USDC amount) and 'allowance'.
+        """
+        self.ensure_ready()
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        return self.client.get_balance_allowance(params)
+
+    def get_token_balance(self, token_id: str) -> dict:
+        """Get balance for a specific conditional token (YES/NO position).
+
+        Returns dict with 'balance' (token amount) and 'allowance'.
+        """
+        self.ensure_ready()
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        )
+        return self.client.get_balance_allowance(params)
 
     # --- Wallet ---
 
