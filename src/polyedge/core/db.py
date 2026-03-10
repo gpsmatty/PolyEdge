@@ -462,6 +462,26 @@ class Database:
                 json.dumps(value),
             )
 
+    async def get_all_config(self) -> dict[str, any]:
+        """Get all config key-value pairs from risk_config table."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT key, value FROM polyedge.risk_config")
+            return {row["key"]: json.loads(row["value"]) for row in rows}
+
+    async def set_config_bulk(self, configs: dict[str, any]):
+        """Bulk upsert config values into risk_config table."""
+        async with self.pool.acquire() as conn:
+            for key, value in configs.items():
+                await conn.execute(
+                    """
+                    INSERT INTO polyedge.risk_config (key, value, updated_at)
+                    VALUES ($1, $2, NOW())
+                    ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
+                    """,
+                    key,
+                    json.dumps(value),
+                )
+
     # --- Price History ---
 
     async def record_price_snapshot(self, market_id: str, yes_price: float, no_price: float,

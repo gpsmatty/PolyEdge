@@ -1,14 +1,85 @@
-"""Configuration management — loads from YAML + env + database."""
+"""Configuration management — loads from Keychain + env + YAML + database.
+
+Priority (highest wins):
+  1. Database (risk_config table) — portable across environments
+  2. macOS Keychain (secrets only)
+  3. Environment variables
+  4. .env file
+  5. YAML config (defaults / fallback)
+  6. Pydantic defaults
+"""
 
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
 import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
+
+
+# --- macOS Keychain integration ---
+
+KEYCHAIN_SERVICE = "polyedge"
+
+# Maps Settings field names to Keychain account names
+KEYCHAIN_KEYS = [
+    "poly_private_key",
+    "poly_wallet_address",
+    "poly_api_key",
+    "poly_api_secret",
+    "poly_api_passphrase",
+    "database_url",
+    "anthropic_api_key",
+    "openai_api_key",
+    "news_api_key",
+]
+
+
+def _get_from_keychain(account: str) -> Optional[str]:
+    """Retrieve a secret from macOS Keychain. Returns None if not found."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
+def _set_in_keychain(account: str, value: str) -> bool:
+    """Store a secret in macOS Keychain. Updates if exists."""
+    # Delete existing entry first (ignore errors if not found)
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account],
+        capture_output=True,
+        timeout=5,
+    )
+    result = subprocess.run(
+        ["security", "add-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w", value],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return result.returncode == 0
+
+
+def load_keychain_secrets() -> dict[str, str]:
+    """Load all known secrets from macOS Keychain."""
+    secrets = {}
+    for key in KEYCHAIN_KEYS:
+        value = _get_from_keychain(key)
+        if value:
+            secrets[key] = value
+    return secrets
 
 
 class PolymarketConfig(BaseModel):
@@ -114,13 +185,28 @@ class Settings(BaseSettings):
 
 
 def load_config(config_path: Optional[str] = None) -> Settings:
-    """Load settings from .env + YAML config file."""
-    # First load env vars
+    """Load settings from Keychain → env vars → .env → YAML.
+
+    Priority (highest wins):
+      1. macOS Keychain (secrets)
+      2. Environment variables
+      3. .env file
+      4. YAML config (non-secret params only)
+      5. Pydantic defaults
+    """
+    # Load Keychain secrets into env BEFORE Settings() reads them.
+    # This way Keychain values override .env but explicit env vars
+    # still win (since os.environ is checked first by pydantic-settings).
+    keychain_secrets = load_keychain_secrets()
+    for key, value in keychain_secrets.items():
+        env_key = key.upper()
+        if env_key not in os.environ:
+            os.environ[env_key] = value
+
     settings = Settings()
 
-    # Then overlay YAML config
+    # Overlay YAML config (non-secret params: strategies, risk, etc.)
     if config_path is None:
-        # Look for config relative to project root
         candidates = [
             Path("config/default.yaml"),
             Path(__file__).parent.parent.parent.parent / "config" / "default.yaml",
@@ -146,3 +232,80 @@ def load_config(config_path: Optional[str] = None) -> Settings:
             settings.agent = AgentConfig(**yaml_config["agent"])
 
     return settings
+
+
+# --- Database config (portable across environments) ---
+
+# Maps config sections to their Pydantic model classes
+_CONFIG_SECTIONS = {
+    "risk": RiskConfig,
+    "ai": AIConfig,
+    "agent": AgentConfig,
+    "strategies.cheap_hunter": CheapHunterConfig,
+    "strategies.edge_finder": EdgeFinderConfig,
+    "strategies.market_maker": MarketMakerConfig,
+}
+
+
+def settings_to_db_dict(settings: Settings) -> dict[str, any]:
+    """Flatten settings into namespaced key-value pairs for DB storage.
+
+    Returns dict like {"risk.kelly_fraction": 0.25, "ai.provider": "claude", ...}
+    """
+    config = {}
+
+    for field, value in settings.risk.model_dump().items():
+        config[f"risk.{field}"] = value
+    for field, value in settings.ai.model_dump().items():
+        config[f"ai.{field}"] = value
+    for field, value in settings.agent.model_dump().items():
+        config[f"agent.{field}"] = value
+    for field, value in settings.strategies.cheap_hunter.model_dump().items():
+        config[f"strategies.cheap_hunter.{field}"] = value
+    for field, value in settings.strategies.edge_finder.model_dump().items():
+        config[f"strategies.edge_finder.{field}"] = value
+    for field, value in settings.strategies.market_maker.model_dump().items():
+        config[f"strategies.market_maker.{field}"] = value
+
+    return config
+
+
+async def apply_db_config(settings: Settings, db) -> Settings:
+    """Overlay database config onto settings. DB values win over YAML/defaults.
+
+    Reads all keys from polyedge.risk_config and applies them to the
+    matching Settings fields. Keys use dot notation: "risk.kelly_fraction",
+    "ai.provider", "agent.mode", etc.
+    """
+    db_config = await db.get_all_config()
+    if not db_config:
+        return settings
+
+    for key, value in db_config.items():
+        parts = key.split(".", 1)
+        if len(parts) != 2:
+            continue
+
+        section, field = parts[0], parts[1]
+
+        # Handle nested strategies (strategies.cheap_hunter.enabled)
+        if section == "strategies" and "." in field:
+            sub_parts = field.split(".", 1)
+            strategy_name, strategy_field = sub_parts[0], sub_parts[1]
+            strategy_obj = getattr(settings.strategies, strategy_name, None)
+            if strategy_obj and hasattr(strategy_obj, strategy_field):
+                setattr(strategy_obj, strategy_field, value)
+            continue
+
+        # Handle top-level sections (risk.*, ai.*, agent.*)
+        section_obj = getattr(settings, section, None)
+        if section_obj and hasattr(section_obj, field):
+            setattr(section_obj, field, value)
+
+    return settings
+
+
+async def save_config_to_db(settings: Settings, db):
+    """Write all non-secret settings to the database for portability."""
+    config = settings_to_db_dict(settings)
+    await db.set_config_bulk(config)
