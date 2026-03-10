@@ -99,8 +99,6 @@ class MicroRunner:
         self.quiet = quiet
         self.running = False
         self.market_filter = market_filter.lower() if market_filter else None
-        # Split filter into words so "btc 5m" matches slug "btc-updown-5m-..."
-        # but NOT "btc-updown-15m-..." (5m != 15m)
         self._filter_words = self.market_filter.split() if self.market_filter else []
 
         # Expand crypto ticker aliases so "btc" also matches "bitcoin" in
@@ -113,12 +111,22 @@ class MicroRunner:
             "doge": "dogecoin", "dogecoin": "doge",
         }
 
-        # Pre-compile regex patterns for each filter word — match as whole
-        # segments in slug (split by -) or whole words in question text.
-        # This prevents "5m" from matching inside "15m".
+        # Duration filter: "5m" → 5 minutes, "15m" → 15 minutes, "1h" → 60 min.
+        # Parsed from the time range in the question (e.g. "3:20PM-3:25PM" = 5 min).
         import re
+        _DURATION_RE = re.compile(r'^(\d+)(m|h)$')
+        self._duration_filter_minutes: int | None = None
+
+        # Pre-compile regex patterns for each filter word.
         self._filter_patterns = []
         for w in self._filter_words:
+            # Check if this is a duration filter like "5m" or "1h"
+            dur_match = _DURATION_RE.match(w)
+            if dur_match:
+                val, unit = int(dur_match.group(1)), dur_match.group(2)
+                self._duration_filter_minutes = val * 60 if unit == 'h' else val
+                continue  # Don't add as a text pattern
+
             # Build pattern that matches the word OR its alias
             alias = _ALIASES.get(w)
             if alias:
@@ -317,13 +325,38 @@ class MicroRunner:
     def _matches_filter(self, market: Market) -> bool:
         """Check if a market matches the --market filter words.
 
-        Uses word-boundary matching so "5m" matches "btc-updown-5m-123"
-        but NOT "btc-updown-15m-123".
+        Text patterns use word-boundary matching. Duration filters like "5m"
+        are matched by parsing the time range from the question text
+        (e.g. "3:20PM-3:25PM" = 5 minutes).
         """
-        if not self._filter_patterns:
+        if not self._filter_patterns and self._duration_filter_minutes is None:
             return True
+
         haystack = f"{market.question} {market.slug or ''}"
-        return all(p.search(haystack) for p in self._filter_patterns)
+        if not all(p.search(haystack) for p in self._filter_patterns):
+            return False
+
+        # Duration filter — parse time range from question like "3:20PM-3:25PM"
+        if self._duration_filter_minutes is not None:
+            import re
+            time_range = re.search(
+                r'(\d{1,2}):(\d{2})\s*(AM|PM)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(AM|PM)',
+                market.question, re.IGNORECASE,
+            )
+            if not time_range:
+                return False
+            h1, m1, ap1 = int(time_range.group(1)), int(time_range.group(2)), time_range.group(3).upper()
+            h2, m2, ap2 = int(time_range.group(4)), int(time_range.group(5)), time_range.group(6).upper()
+            # Convert to minutes since midnight
+            mins1 = (h1 % 12 + (12 if ap1 == 'PM' else 0)) * 60 + m1
+            mins2 = (h2 % 12 + (12 if ap2 == 'PM' else 0)) * 60 + m2
+            if mins2 <= mins1:
+                mins2 += 24 * 60  # Crosses midnight
+            duration = mins2 - mins1
+            if duration != self._duration_filter_minutes:
+                return False
+
+        return True
 
     async def run(self):
         """Main micro sniper loop."""
