@@ -12,8 +12,8 @@ This lets us compute order flow imbalance: when aggressive buyers dominate,
 price is likely to go up, and vice versa.
 
 Streams:
-  Combined: wss://stream.binance.us:9443/stream?streams=btcusdt@aggTrade/...
-  Single:   wss://stream.binance.us:9443/ws/btcusdt@aggTrade
+  Combined: wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/...
+  Single:   wss://stream.binance.com:9443/ws/btcusdt@aggTrade
 
 We maintain rolling windows of trade flow metrics:
   - Buy/sell volume over 5s, 15s, 30s windows
@@ -37,7 +37,7 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger("polyedge.binance_aggtrade")
 
-BINANCE_WS_BASE = "wss://stream.binance.us:9443"
+BINANCE_WS_BASE = "wss://stream.binance.com:9443"
 
 DEFAULT_SYMBOLS = ["btcusdt"]
 

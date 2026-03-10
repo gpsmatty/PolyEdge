@@ -165,7 +165,7 @@ class MicroSniperConfig(BaseModel):
     flip_threshold: float = 0.35           # Reverse momentum threshold to flip
     flip_min_confidence: float = 0.40      # Min confidence to flip
     min_confidence: float = 0.30           # Min confidence to enter
-    min_trades_in_window: int = 10         # Min trades in 15s window to consider
+    min_trades_in_window: int = 3           # Min trades in 15s window to consider
     min_seconds_remaining: float = 15.0    # Don't enter with less than this left
     force_exit_seconds: float = 8.0        # Force exit with this many seconds left
     max_entry_price: float = 0.80          # Don't buy a side priced above this
