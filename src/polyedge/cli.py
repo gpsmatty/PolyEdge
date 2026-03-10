@@ -790,7 +790,8 @@ def autopilot(mode):
 @cli.command()
 @click.option("--auto", is_flag=True, help="Auto-execute trades (no confirmation)")
 @click.option("--dry", is_flag=True, help="Dry run — show opportunities but don't trade")
-def sniper(auto, dry):
+@click.option("--verbose", "-v", is_flag=True, help="Show detailed evaluation for every market")
+def sniper(auto, dry, verbose):
     """Start the crypto sniper — real-time trading on short-duration crypto markets.
 
     Connects to Binance for live prices, watches Polymarket's 5-minute and
@@ -827,6 +828,7 @@ def sniper(auto, dry):
             db=db,
             auto_execute=auto,
             dry_run=dry,
+            verbose=verbose,
         )
 
         try:
