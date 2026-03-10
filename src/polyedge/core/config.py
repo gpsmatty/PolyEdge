@@ -160,18 +160,21 @@ class MicroSniperConfig(BaseModel):
     enabled: bool = True
     symbols: list[str] = Field(default_factory=lambda: ["btcusdt"])
     entry_threshold: float = 0.40          # Momentum signal threshold to enter (raised from 0.25 — less noise)
+    counter_trend_threshold: float = 0.55  # Higher bar for entries against 30s trend (kills counter-trend losers)
     exit_threshold: float = 0.15           # Reverse momentum threshold to exit
     hold_threshold: float = 0.08           # Below this (aligned), exit for weak signal
-    flip_threshold: float = 0.50           # Reverse momentum threshold to flip (raised — flips are costly)
+    enable_flips: bool = False             # Flips disabled — marginal profitability, strong reversals just EXIT
+    flip_threshold: float = 0.50           # Reverse momentum threshold to flip (only if enable_flips=True)
     flip_min_confidence: float = 0.50      # Min confidence to flip
     min_confidence: float = 0.40           # Min confidence to enter (raised from 0.30)
     min_trades_in_window: int = 10          # Min trades in 15s window to consider (raised — we get 10+ tps now)
     min_trades_for_flip: int = 25          # Min trades in 15s window to flip (higher bar — flips are costly)
     min_seconds_remaining: float = 15.0    # Don't enter with less than this left
     force_exit_seconds: float = 8.0        # Force exit with this many seconds left
-    min_entry_price: float = 0.15          # Don't buy a side priced below this (market says <15% — don't fight it)
-    max_entry_price: float = 0.80          # Don't buy a side priced above this
-    max_position_per_trade: float = 0.03   # 3% of bankroll per micro trade
+    min_entry_price: float = 0.20          # Don't buy a side priced below this (raised from 0.15 — stop fighting the market)
+    max_entry_price: float = 0.70          # Don't buy a side priced above this (lowered from 0.80 — less overpaying)
+    max_position_per_trade: float = 0.03   # 3% of bankroll per micro trade (used if fixed_position_usd is 0)
+    fixed_position_usd: float = 10.0       # Fixed $ per trade — simpler than Kelly for micro. 0 = use Kelly sizing
     max_trades_per_window: int = 50        # Max trades in a single 5-min window
     min_liquidity: float = 500             # Min market liquidity to trade
 
