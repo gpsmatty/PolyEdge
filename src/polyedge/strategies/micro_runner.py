@@ -311,10 +311,13 @@ class MicroRunner:
 
         mode = "DRY RUN" if self.dry_run else ("AUTOPILOT" if self.auto_execute else "COPILOT")
         console.print(f"\n[bold green]Micro Sniper started in {mode} mode[/bold green]")
+        flip_str = f"Flip: momentum > {self.config.flip_threshold:.0%}" if self.config.enable_flips else "Flips: OFF"
+        size_str = f"${self.config.fixed_position_usd:.0f}/trade" if self.config.fixed_position_usd > 0 else f"{self.config.max_position_per_trade:.0%} Kelly"
         console.print(
-            f"[dim]Entry: momentum > {self.config.entry_threshold:.0%} | "
-            f"Flip: momentum > {self.config.flip_threshold:.0%} | "
-            f"Max trades/window: {self.config.max_trades_per_window}[/dim]"
+            f"[dim]Entry: momentum > {self.config.entry_threshold:.0%} "
+            f"(counter-trend > {self.config.counter_trend_threshold:.0%}) | "
+            f"{flip_str} | {size_str} | "
+            f"Price range: {self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}[/dim]"
         )
         filter_str = f" | Filter: '{self.market_filter}'" if self.market_filter else ""
         console.print(
@@ -853,20 +856,24 @@ class MicroRunner:
 
         # Live trading
         bankroll = await self._get_bankroll()
-        max_pct = min(
-            self.config.max_position_per_trade,
-            self.settings.risk.max_position_pct,
-        )
 
-        # Smaller position sizes for micro trades
-        est_edge = abs(opp.momentum) * 0.15
-        size_usd = calculate_position_size(
-            bankroll=bankroll,
-            edge=est_edge,
-            probability=0.55,  # Conservative for momentum trades
-            kelly_fraction=self.settings.risk.kelly_fraction,
-            max_position_pct=max_pct,
-        )
+        # Fixed dollar sizing (simpler, more predictable for micro trades)
+        if self.config.fixed_position_usd > 0:
+            size_usd = min(self.config.fixed_position_usd, bankroll * 0.10)
+        else:
+            # Fall back to Kelly sizing
+            max_pct = min(
+                self.config.max_position_per_trade,
+                self.settings.risk.max_position_pct,
+            )
+            est_edge = abs(opp.momentum) * 0.15
+            size_usd = calculate_position_size(
+                bankroll=bankroll,
+                edge=est_edge,
+                probability=0.55,  # Conservative for momentum trades
+                kelly_fraction=self.settings.risk.kelly_fraction,
+                max_position_pct=max_pct,
+            )
 
         if size_usd < 1.0:
             if not self.quiet:
