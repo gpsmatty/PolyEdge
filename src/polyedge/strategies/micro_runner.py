@@ -204,11 +204,11 @@ class MicroRunner:
         found: list[Market] = []
         batch_size = 100
 
-        console.print("[dim]Targeted fetch (sorting by endDate)...[/dim]")
+        console.print("[dim]Targeted fetch (searching 'up or down')...[/dim]")
 
-        # Fetch markets sorted by endDate ascending — currently-live markets
-        # appear first since they expire soonest
-        for page in range(20):  # Up to 2000 markets, usually find matches in <5 pages
+        # Use Gamma API search to find "up or down" markets directly instead
+        # of paging through 8000+ markets. Much faster, especially on VPN.
+        for page in range(10):  # 1000 results should be plenty for up/down markets
             url = f"{gamma_url}/markets"
             params = {
                 "limit": batch_size,
@@ -217,6 +217,7 @@ class MicroRunner:
                 "closed": "false",
                 "order": "endDate",
                 "ascending": "true",
+                "search": "up or down",
             }
 
             try:
