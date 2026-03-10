@@ -58,7 +58,7 @@ async def fetch_active_markets(
 async def fetch_all_markets(
     settings: Settings,
     min_liquidity: float = 0,
-    max_pages: int = 50,
+    max_pages: int = 100,
 ) -> list[Market]:
     """Fetch ALL active markets, paginating with offset until exhausted.
 
@@ -71,6 +71,7 @@ async def fetch_all_markets(
     """
     all_markets = []
     batch_size = 100
+    pages_fetched = 0
 
     for page in range(max_pages):
         batch, raw_count = await fetch_active_markets(
@@ -80,8 +81,15 @@ async def fetch_all_markets(
             min_liquidity=min_liquidity,
         )
         all_markets.extend(batch)
+        pages_fetched = page + 1
         if raw_count < batch_size:
             break  # Last page — no more results
+
+    import logging
+    logging.getLogger("polyedge.markets").info(
+        f"Fetched {len(all_markets)} markets across {pages_fetched} pages"
+        + (f" (hit max_pages={max_pages} cap!)" if pages_fetched >= max_pages else "")
+    )
 
     return all_markets
 

@@ -57,7 +57,7 @@ class MarketIndexer:
         markets = await fetch_all_markets(
             self.settings,
             min_liquidity=0,  # Get everything, filter later
-            max_pages=50,     # Up to 5000 markets
+            max_pages=100,    # Up to 10,000 markets
         )
 
         if not markets:
