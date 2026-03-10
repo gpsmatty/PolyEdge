@@ -161,6 +161,34 @@ class PolyClient:
         )
         return self.client.post_order(signed_order, otype)
 
+    def place_fok_order(
+        self,
+        token_id: str,
+        side: str,
+        amount: float,
+        price: float,
+    ) -> dict:
+        """Place a FOK (Fill or Kill) order using market order amounts.
+
+        Unlike place_limit_order, this takes the USD amount for BUY orders
+        (or share count for SELL) and lets the SDK round correctly. This avoids
+        the "invalid amounts" error where maker_amount has >2 decimal places.
+
+        Args:
+            amount: For BUY — USD amount to spend. For SELL — number of shares.
+            price: Max price for BUY, min price for SELL.
+        """
+        self.ensure_ready()
+        from py_clob_client.clob_types import MarketOrderArgs
+        order_args = MarketOrderArgs(
+            token_id=token_id,
+            amount=round(amount, 2),
+            side=get_poly_side(side),
+            price=price,
+        )
+        signed_order = self.client.create_market_order(order_args)
+        return self.client.post_order(signed_order, OrderType.FOK)
+
     def place_market_order(
         self,
         token_id: str,

@@ -997,36 +997,75 @@ class MicroRunner:
 
         # Use FOK with slippage so the order fills instantly or cancels.
         # GTC limit orders can sit unfilled and the bot thinks it has a position.
+        # place_fok_order takes USD amount directly — SDK handles rounding to avoid
+        # the "invalid amounts" error where maker_amount has >2 decimal places.
         price = opp.market_price
         entry_price = min(round(price + 0.03, 2), 0.99)  # Pay up to 3c more for instant fill
-        size = round(size_usd / entry_price, 2) if entry_price > 0 else 0  # CLOB needs ≤2 decimals
+        size = round(size_usd / entry_price, 2) if entry_price > 0 else 0
 
         signal = self.strategy.opportunity_to_signal(opp)
 
         try:
-            # Side is always "BUY" for entry — the token_id determines YES vs NO.
-            # opp.side.value is "YES"/"NO" but the CLOB expects "BUY"/"SELL".
-            order_id = await engine.place_order(
-                market=opp.market,
+            # Place FOK order directly — bypasses engine's place_limit_order
+            # to use create_market_order which handles USD rounding correctly.
+            result = self.client.place_fok_order(
                 token_id=token_id,
                 side="BUY",
+                amount=size_usd,
                 price=entry_price,
-                size=size,
-                amount_usd=size_usd,
-                strategy="micro_sniper",
-                reasoning=signal.reasoning,
-                force=self.auto_execute,
-                order_type="FOK",
             )
 
-            if order_id:
+            poly_order_id = result.get("orderID", result.get("id", ""))
+            if poly_order_id:
+                # Record in DB
+                try:
+                    order_id = await self.db.insert_order({
+                        "market_id": cid,
+                        "token_id": token_id,
+                        "side": "BUY",
+                        "order_type": "FOK",
+                        "price": entry_price,
+                        "size": size,
+                        "amount_usd": size_usd,
+                        "status": "FILLED",
+                        "strategy": "micro_sniper",
+                    })
+                    await self.db.insert_trade({
+                        "trade_id": order_id,
+                        "market_id": cid,
+                        "token_id": token_id,
+                        "question": opp.market.question,
+                        "side": opp.side.value,
+                        "entry_price": entry_price,
+                        "size": size,
+                        "status": "OPEN",
+                        "strategy": "micro_sniper",
+                        "reasoning": signal.reasoning,
+                    })
+                    await self.db.upsert_position({
+                        "market_id": cid,
+                        "token_id": token_id,
+                        "question": opp.market.question,
+                        "side": opp.side.value,
+                        "size": size,
+                        "entry_price": entry_price,
+                        "current_price": entry_price,
+                        "strategy": "micro_sniper",
+                    })
+                except Exception as e:
+                    logger.warning(f"DB recording failed (non-fatal): {e}")
+
                 self._positions[cid] = "yes" if opp.side == Side.YES else "no"
                 self._trades_this_window += 1
                 self._total_trades += 1
                 self._last_trade_log[cid] = time.time()
-                console.print(f"[green]  MICRO SNIPED! Order: {order_id}[/green]")
+                console.print(
+                    f"[green]Order placed: {opp.side.value} {size:.1f} @ ${entry_price:.3f} "
+                    f"(${size_usd:.2f}) — ID: {poly_order_id}[/green]"
+                )
+                console.print(f"[green]  MICRO SNIPED! Order: {poly_order_id}[/green]")
             else:
-                console.print("[red]  Trade failed[/red]")
+                console.print("[red]  Trade failed — no order ID returned[/red]")
 
         except Exception as e:
             console.print(f"[red]  Execution error: {e}[/red]")
@@ -1081,12 +1120,12 @@ class MicroRunner:
             return True
 
         try:
-            result = self.client.place_limit_order(
+            # For SELL FOK, amount = shares to sell (not USD)
+            result = self.client.place_fok_order(
                 token_id=token_id,
-                side="sell",
+                side="SELL",
+                amount=size,
                 price=sell_price,
-                size=size,
-                order_type="FOK",
             )
 
             order_id = result.get("orderID", result.get("id", ""))
