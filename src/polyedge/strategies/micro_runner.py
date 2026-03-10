@@ -162,13 +162,17 @@ class MicroRunner:
             f"[dim]Feed: Binance aggTrade (~10-50 tps) + Polymarket WS{filter_str}[/dim]"
         )
 
-        # Initial market sync
-        console.print("[dim]Syncing markets...[/dim]")
-        try:
-            synced = await self.indexer.sync(force=True)
-            console.print(f"[green]Synced {synced} markets[/green]")
-        except Exception as e:
-            console.print(f"[yellow]Initial sync failed ({e}) — using DB data[/yellow]")
+        # Initial market load — skip API sync if we have a --market filter
+        # (no point syncing 5000 markets when you just want one BTC window)
+        if self.market_filter:
+            console.print("[dim]Loading markets from DB (skipping API sync — filter active)...[/dim]")
+        else:
+            console.print("[dim]Syncing markets from API...[/dim]")
+            try:
+                synced = await self.indexer.sync(force=True)
+                console.print(f"[green]Synced {synced} markets[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Sync failed ({e}) — using DB data[/yellow]")
 
         # Register aggTrade callback — this is the main eval loop
         self.agg_feed.on_any_trade(self._on_agg_trade)
@@ -312,9 +316,22 @@ class MicroRunner:
     # ------------------------------------------------------------------
 
     async def _market_refresh_loop(self):
-        """Periodically refresh active up/down markets."""
+        """Periodically refresh active up/down markets.
+
+        When a --market filter is set, skip the API sync entirely and just
+        read from DB.  The regular `polyedge sync` or autopilot keeps the DB
+        fresh enough — no need to hit the Gamma API every 2 minutes when
+        you're targeting a single known window.
+        """
         while self.running:
             try:
+                # Sync from API only when running unfiltered
+                if not self.market_filter:
+                    try:
+                        await self.indexer.sync()
+                    except Exception as e:
+                        logger.warning(f"Background sync failed: {e}")
+
                 await self._refresh_markets()
             except Exception as e:
                 logger.error(f"Market refresh failed: {e}")
