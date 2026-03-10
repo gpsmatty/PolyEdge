@@ -73,60 +73,83 @@ ALL_SUPPORTED_SYMBOLS = list(set(CRYPTO_SYMBOL_MAP.values()))
 
 # ---------------------------------------------------------------------------
 # Regex patterns for each market type
+# Patterns based on ACTUAL Polymarket question phrasings (March 2026)
 # ---------------------------------------------------------------------------
 
+# Crypto name group used across all patterns
+_CRYPTO = r"(?:Bitcoin|BTC|Ethereum|ETH|Ether|Solana|SOL|XRP|Ripple|Dogecoin|DOGE)"
+
 # Type 1: Up or Down markets
-# "BTC 5 Minute Up or Down", "Solana Up or Down - March 10, 3:10PM-3:15PM ET"
+# "Bitcoin Up or Down - March 10, 5:15PM-5:30PM ET"
+# "Solana Up or Down - March 10, 12:00AM-4:00AM ET"
 UP_DOWN_PATTERN = re.compile(
-    r"(Bitcoin|BTC|Ethereum|ETH|Ether|Solana|SOL|XRP|Ripple|Dogecoin|DOGE)\s+"
-    r".*?[Uu]p\s+or\s+[Dd]own",
+    _CRYPTO + r"\s+.*?[Uu]p\s+or\s+[Dd]own",
     re.IGNORECASE,
 )
 
-# Type 2: Threshold markets
-# "Bitcoin above ___ on March 10?", "Ethereum above ___ on March 10?"
-# "Solana above ___ on March 10?"
+# Type 2: Threshold markets — multiple phrasings on Polymarket:
+# "Will the price of Bitcoin be greater than $78,000 on March 10?"
+# "Will the price of Ethereum be above $2,600 on March 11?"
+# "Will the price of Bitcoin be less than $64,000 on March 11?"
+# "Will the price of Solana be above $110 on March 10?"
+# "Will the price of XRP be above $1.40 on March 12?"
+# "Will Bitcoin reach $85,000 in March?"
+# "Will Bitcoin dip to $50,000 in March?"
+# "Ethereum all time high by September 30, 2026?"
 THRESHOLD_PATTERN = re.compile(
-    r"(Bitcoin|BTC|Ethereum|ETH|Ether|Solana|SOL|XRP|Ripple|Dogecoin|DOGE)\s+"
-    r"above\s+[\$]?([\d,]+(?:\.\d+)?)",
+    r"(?:"
+    # "Will the price of Bitcoin be greater than / above / less than $X"
+    r"price\s+of\s+" + _CRYPTO + r"\s+be\s+(?:greater\s+than|above|less\s+than|below)\s+[\$]?[\d,]+(?:\.\d+)?"
+    r"|"
+    # "Will Bitcoin reach $X" / "Will Bitcoin dip to $X"
+    + _CRYPTO + r"\s+(?:reach|dip\s+to)\s+[\$]?[\d,]+(?:\.\d+)?"
+    r")",
     re.IGNORECASE,
 )
 
-# Type 3: Bucket / price target markets
-# "What price will Bitcoin hit on March 9?"
-# "What price will Solana hit in March?"
+# Type 3: Bucket / price range markets:
+# "Will the price of Bitcoin be between $74,000 and $76,000 on March 11?"
+# "Will the price of Ethereum be between $2,100 and $2,200 on March 10?"
+# "Will the price of Solana be between $90 and $100 on March 10?"
+# "Will the price of XRP be between $1.20 and $1.30 on March 11?"
 BUCKET_PATTERN = re.compile(
-    r"[Ww]hat\s+price\s+will\s+"
-    r"(Bitcoin|BTC|Ethereum|ETH|Ether|Solana|SOL|XRP|Ripple|Dogecoin|DOGE)\s+"
-    r"hit",
+    r"price\s+of\s+" + _CRYPTO + r"\s+be\s+between\s+",
     re.IGNORECASE,
 )
 
-# Extract threshold value from question text (for threshold markets)
-# Matches: "above 70,000", "above $1,500", "above 85.50"
+# ---------------------------------------------------------------------------
+# Value extraction patterns
+# ---------------------------------------------------------------------------
+
+# Extract threshold value — handles all phrasings:
+# "greater than $78,000", "above $2,600", "less than $64,000", "reach $85,000", "dip to $50,000"
 THRESHOLD_VALUE_PATTERN = re.compile(
-    r"above\s+[\$]?([\d,]+(?:\.\d+)?)",
+    r"(?:greater\s+than|above|less\s+than|below|reach|dip\s+to)\s+[\$]?([\d,]+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
-# Extract "up" arrow price targets from bucket markets
-# Matches: "↑ 70,000" or "↑ 110" (means price >= this value)
-BUCKET_ABOVE_PATTERN = re.compile(
-    r"[↑]\s*[\$]?([\d,]+(?:\.\d+)?)",
+# Detect if this is a "less than" / "below" / "dip to" threshold (bearish)
+THRESHOLD_BEARISH_PATTERN = re.compile(
+    r"(?:less\s+than|below|dip\s+to)",
+    re.IGNORECASE,
 )
 
-# Extract "down" arrow price targets from bucket markets
-# Matches: "↓ 66,000" (means price <= this value)
-BUCKET_BELOW_PATTERN = re.compile(
-    r"[↓]\s*[\$]?([\d,]+(?:\.\d+)?)",
-)
-
-# Extract price range for bucket markets from question or description
-# Matches: "$68,000 to $70,000", "85 to 90", "$1,500-$1,600"
+# Extract "between X and Y" range from bucket markets
 BUCKET_RANGE_PATTERN = re.compile(
+    r"between\s+[\$]?([\d,]+(?:\.\d+)?)\s+and\s+[\$]?([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Fallback range pattern for description text: "$68,000 to $70,000", "85-90"
+BUCKET_RANGE_FALLBACK = re.compile(
     r"[\$]?([\d,]+(?:\.\d+)?)\s*(?:to|[-–])\s*[\$]?([\d,]+(?:\.\d+)?)",
     re.IGNORECASE,
 )
+
+# Arrow-style bucket markers (from Polymarket UI, may appear in descriptions)
+# "↑ 70,000" means price >= this value, "↓ 66,000" means price <= this value
+BUCKET_ABOVE_PATTERN = re.compile(r"[↑]\s*[\$]?([\d,]+(?:\.\d+)?)")
+BUCKET_BELOW_PATTERN = re.compile(r"[↓]\s*[\$]?([\d,]+(?:\.\d+)?)")
 
 # Pattern to extract time window duration from question
 # "3:10PM-3:15PM" -> 5 minutes
@@ -162,6 +185,7 @@ class ParsedCryptoMarket:
     market_type: CryptoMarketType
     symbol: str                           # Binance symbol e.g. "btcusdt"
     strike: Optional[float] = None        # For threshold: the price level
+    is_bearish: bool = False              # True for "less than" / "dip to" thresholds
     bucket_low: Optional[float] = None    # For bucket: lower bound
     bucket_high: Optional[float] = None   # For bucket: upper bound
     bucket_direction: Optional[str] = None  # "above" or "below" for arrow buckets
@@ -237,8 +261,10 @@ class CryptoSniperStrategy(Strategy):
             strike = self._extract_threshold(market.question)
             if strike is None:
                 return None
+            is_bearish = bool(THRESHOLD_BEARISH_PATTERN.search(market.question))
             return ParsedCryptoMarket(
                 market_type=mtype, symbol=symbol, strike=strike,
+                is_bearish=is_bearish,
             )
 
         if mtype == CryptoMarketType.BUCKET:
@@ -386,7 +412,13 @@ class CryptoSniperStrategy(Strategy):
         current_price: PriceSnapshot,
         seconds_remaining: float,
     ) -> Optional[SniperOpportunity]:
-        """Evaluate a threshold market — P(price > strike at expiry)."""
+        """Evaluate a threshold market.
+
+        For bullish ("above", "greater than", "reach"):
+            YES = price > strike.  P(YES) = CDF model.
+        For bearish ("less than", "dip to"):
+            YES = price < strike.  P(YES) = 1 - CDF model.
+        """
         strike = parsed.strike
         if strike is None or strike <= 0:
             return None
@@ -396,24 +428,28 @@ class CryptoSniperStrategy(Strategy):
             return None
 
         # Compute P(price > strike at expiry) using log-normal model
-        implied_prob = self._compute_threshold_probability(
+        prob_above = self._compute_threshold_probability(
             current_price=price,
             strike=strike,
             seconds_remaining=seconds_remaining,
             symbol=parsed.symbol,
         )
 
-        # If prob > 0.5, the market should be pricing YES high
-        # If prob < 0.5, the market should be pricing YES low (NO high)
-        if implied_prob >= 0.5:
+        # For bearish markets ("less than", "dip to"), YES means price < strike
+        if parsed.is_bearish:
+            implied_yes_prob = 1 - prob_above
+        else:
+            implied_yes_prob = prob_above
+
+        # Compare our implied YES probability to what market is showing
+        if implied_yes_prob >= 0.5:
             side = Side.YES
             market_price = market.yes_price
-            edge = implied_prob - market_price
+            edge = implied_yes_prob - market_price
         else:
             side = Side.NO
             market_price = market.no_price
-            # Our implied NO prob = 1 - implied_prob
-            edge = (1 - implied_prob) - market_price
+            edge = (1 - implied_yes_prob) - market_price
 
         if edge < self.config.min_edge:
             return None
@@ -431,7 +467,7 @@ class CryptoSniperStrategy(Strategy):
             side=side,
             binance_price=price,
             price_change_pct=(price - strike) / strike,
-            implied_prob=implied_prob if side == Side.YES else (1 - implied_prob),
+            implied_prob=implied_yes_prob if side == Side.YES else (1 - implied_yes_prob),
             market_price=market_price,
             edge=edge,
             seconds_remaining=seconds_remaining,
@@ -666,11 +702,44 @@ class CryptoSniperStrategy(Strategy):
     def _parse_bucket_market(
         self, market: Market, symbol: str,
     ) -> Optional[ParsedCryptoMarket]:
-        """Parse a bucket market, extracting price range from question/description."""
+        """Parse a bucket market, extracting price range from question/description.
+
+        Priority order:
+        1. "between X and Y" in question text (most common on Polymarket)
+        2. "between X and Y" in description
+        3. Arrow-style "↑ X" / "↓ X" in question or description
+        4. "X to Y" fallback pattern in description
+        """
         q = market.question
         desc = market.description or ""
 
-        # Check for arrow-style buckets in the question
+        # 1. Check for "between X and Y" in question first (most common phrasing)
+        range_match = BUCKET_RANGE_PATTERN.search(q)
+        if range_match:
+            low = _parse_number(range_match.group(1))
+            high = _parse_number(range_match.group(2))
+            if low and high and low < high:
+                return ParsedCryptoMarket(
+                    market_type=CryptoMarketType.BUCKET,
+                    symbol=symbol,
+                    bucket_low=low,
+                    bucket_high=high,
+                )
+
+        # 2. Check for "between X and Y" in description
+        range_match = BUCKET_RANGE_PATTERN.search(desc)
+        if range_match:
+            low = _parse_number(range_match.group(1))
+            high = _parse_number(range_match.group(2))
+            if low and high and low < high:
+                return ParsedCryptoMarket(
+                    market_type=CryptoMarketType.BUCKET,
+                    symbol=symbol,
+                    bucket_low=low,
+                    bucket_high=high,
+                )
+
+        # 3. Arrow-style buckets (from Polymarket UI, may appear in descriptions)
         # "↑ 70,000" means "above $70,000"
         above_match = BUCKET_ABOVE_PATTERN.search(q) or BUCKET_ABOVE_PATTERN.search(desc)
         if above_match:
@@ -695,11 +764,11 @@ class CryptoSniperStrategy(Strategy):
                     bucket_direction="below",
                 )
 
-        # Check for range-style buckets in description
-        range_match = BUCKET_RANGE_PATTERN.search(desc) or BUCKET_RANGE_PATTERN.search(q)
-        if range_match:
-            low = _parse_number(range_match.group(1))
-            high = _parse_number(range_match.group(2))
+        # 4. Fallback: "X to Y" or "X-Y" in description
+        fallback_match = BUCKET_RANGE_FALLBACK.search(desc)
+        if fallback_match:
+            low = _parse_number(fallback_match.group(1))
+            high = _parse_number(fallback_match.group(2))
             if low and high and low < high:
                 return ParsedCryptoMarket(
                     market_type=CryptoMarketType.BUCKET,
