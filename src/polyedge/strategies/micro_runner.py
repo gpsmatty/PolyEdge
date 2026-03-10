@@ -103,14 +103,29 @@ class MicroRunner:
         # but NOT "btc-updown-15m-..." (5m != 15m)
         self._filter_words = self.market_filter.split() if self.market_filter else []
 
+        # Expand crypto ticker aliases so "btc" also matches "bitcoin" in
+        # question text (Gamma API questions use full names like "Bitcoin").
+        _ALIASES = {
+            "btc": "bitcoin", "bitcoin": "btc",
+            "eth": "ethereum", "ethereum": "eth",
+            "sol": "solana", "solana": "sol",
+            "xrp": "ripple", "ripple": "xrp",
+            "doge": "dogecoin", "dogecoin": "doge",
+        }
+
         # Pre-compile regex patterns for each filter word — match as whole
         # segments in slug (split by -) or whole words in question text.
         # This prevents "5m" from matching inside "15m".
         import re
-        self._filter_patterns = [
-            re.compile(r'(?:^|[\s\-–,])' + re.escape(w) + r'(?:[\s\-–,]|$)', re.IGNORECASE)
-            for w in self._filter_words
-        ]
+        self._filter_patterns = []
+        for w in self._filter_words:
+            # Build pattern that matches the word OR its alias
+            alias = _ALIASES.get(w)
+            if alias:
+                pat = r'(?:^|[\s\-–,])(?:' + re.escape(w) + '|' + re.escape(alias) + r')(?:[\s\-–,]|$)'
+            else:
+                pat = r'(?:^|[\s\-–,])' + re.escape(w) + r'(?:[\s\-–,]|$)'
+            self._filter_patterns.append(re.compile(pat, re.IGNORECASE))
 
         # Config
         self.config = settings.strategies.micro_sniper
