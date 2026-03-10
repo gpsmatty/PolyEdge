@@ -80,19 +80,22 @@ class MicroSniperStrategy:
     trades Polymarket's up/down markets accordingly.
 
     Entry conditions (ALL must be true):
-    1. Momentum signal > entry_threshold (default 0.25)
-    2. Confidence > min_confidence (default 0.30)
+    1. Momentum signal > entry_threshold (0.40), or > counter_trend_threshold
+       (0.55) if entering against the 30s trend
+    2. Confidence > min_confidence (0.40)
     3. At least min_trades_in_window trades in 15s window
-    4. Time remaining > min_seconds_remaining (don't enter in last 10s)
+    4. Time remaining > min_seconds_remaining (don't enter in last 15s)
+    5. Market price between min_entry_price (0.20) and max_entry_price (0.70)
 
     Exit conditions (ANY triggers exit):
     1. Momentum signal reverses past exit_threshold
     2. Momentum signal drops below hold_threshold for our direction
     3. Time remaining < force_exit_seconds (exit before window closes)
 
-    Flip conditions (close + reverse):
-    1. Momentum signal reverses past flip_threshold (default 0.35)
+    Flip conditions (disabled by default — enable_flips=False):
+    1. Momentum signal reverses past flip_threshold (0.50)
     2. Confidence > flip_min_confidence
+    When disabled, strong reversals trigger EXIT instead.
     """
 
     name = "micro_sniper"
@@ -180,8 +183,18 @@ class MicroSniperStrategy:
         """Check if we should open a new position."""
         abs_momentum = abs(momentum)
 
+        # 30s trend filter — if entry direction disagrees with the dominant
+        # 30-second trend, require a higher momentum threshold. This kills
+        # counter-trend entries that are the #1 source of losses.
+        trend_ofi = micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0
+        is_counter_trend = (is_bullish and trend_ofi < -0.05) or (not is_bullish and trend_ofi > 0.05)
+        effective_threshold = (
+            self.config.counter_trend_threshold if is_counter_trend
+            else self.config.entry_threshold
+        )
+
         # Need strong enough signal
-        if abs_momentum < self.config.entry_threshold:
+        if abs_momentum < effective_threshold:
             return None
 
         # Need enough confidence
@@ -252,42 +265,44 @@ class MicroSniperStrategy:
             return None
 
         # --- FLIP: strong reversal ---
-        # Flips are expensive (close + reopen) so require more trade activity
-        has_enough_trades_for_flip = (
-            micro.flow_15s.total_count >= self.config.min_trades_for_flip
-        )
-        if not aligned and abs_momentum >= self.config.flip_threshold:
-            if confidence >= self.config.flip_min_confidence and has_enough_trades_for_flip:
-                if is_bullish:
-                    action = MicroAction.FLIP_YES
-                    side = Side.YES
-                    market_price = market.yes_price
-                else:
-                    action = MicroAction.FLIP_NO
-                    side = Side.NO
-                    market_price = market.no_price
+        # Flips are expensive (close + reopen) so require more trade activity.
+        # Disabled by default (enable_flips=False) — strong reversals just EXIT.
+        if self.config.enable_flips:
+            has_enough_trades_for_flip = (
+                micro.flow_15s.total_count >= self.config.min_trades_for_flip
+            )
+            if not aligned and abs_momentum >= self.config.flip_threshold:
+                if confidence >= self.config.flip_min_confidence and has_enough_trades_for_flip:
+                    if is_bullish:
+                        action = MicroAction.FLIP_YES
+                        side = Side.YES
+                        market_price = market.yes_price
+                    else:
+                        action = MicroAction.FLIP_NO
+                        side = Side.NO
+                        market_price = market.no_price
 
-                # Don't flip into a nearly-dead or heavily priced side
-                if market_price < self.config.min_entry_price:
-                    pass  # Fall through to exit check instead
-                elif market_price <= self.config.max_entry_price:
-                    return MicroOpportunity(
-                        market=market,
-                        symbol=micro.symbol,
-                        action=action,
-                        side=side,
-                        momentum=momentum,
-                        confidence=confidence,
-                        ofi_5s=micro.flow_5s.ofi,
-                        ofi_15s=micro.flow_15s.ofi,
-                        vwap_drift=micro.flow_15s.vwap_drift,
-                        trade_intensity=micro.flow_5s.trade_intensity,
-                        binance_price=micro.current_price,
-                        price_change_pct=micro.price_change_pct,
-                        market_price=market_price,
-                        seconds_remaining=seconds_remaining,
-                        is_flip=True,
-                    )
+                    # Don't flip into a nearly-dead or heavily priced side
+                    if market_price < self.config.min_entry_price:
+                        pass  # Fall through to exit check instead
+                    elif market_price <= self.config.max_entry_price:
+                        return MicroOpportunity(
+                            market=market,
+                            symbol=micro.symbol,
+                            action=action,
+                            side=side,
+                            momentum=momentum,
+                            confidence=confidence,
+                            ofi_5s=micro.flow_5s.ofi,
+                            ofi_15s=micro.flow_15s.ofi,
+                            vwap_drift=micro.flow_15s.vwap_drift,
+                            trade_intensity=micro.flow_5s.trade_intensity,
+                            binance_price=micro.current_price,
+                            price_change_pct=micro.price_change_pct,
+                            market_price=market_price,
+                            seconds_remaining=seconds_remaining,
+                            is_flip=True,
+                        )
 
         # --- EXIT: momentum died or reversed weakly ---
         if not aligned and abs_momentum >= self.config.exit_threshold:
