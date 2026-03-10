@@ -1136,7 +1136,8 @@ class MicroRunner:
         size = 0
         try:
             bal = self.client.get_token_balance(token_id)
-            logger.info(f"Token balance response for {token_id}: {bal}")
+            if not self.quiet:
+                console.print(f"  [dim]CLOB response: {bal}[/dim]")
             # Balance may be a raw string number or dict with 'balance' key
             if isinstance(bal, dict):
                 raw_bal = bal.get("balance", 0)
