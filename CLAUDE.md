@@ -232,6 +232,7 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `fixed_position_usd` (float, default 10.0) — fixed $ per trade, 0 = use Kelly sizing
 - `max_trades_per_window` (int, default 50)
 - `min_liquidity` (float, default 500)
+- `dead_market_band` (float, default 0.02) — skip entry when YES is within this band of 0.50 (market not reacting to price moves)
 
 ## Tiered AI Model System
 
