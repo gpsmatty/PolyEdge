@@ -10,14 +10,18 @@ from typing import Optional
 from polyedge.ai.llm import LLMClient
 from polyedge.core.models import AIAnalysis, Market
 
-SYSTEM_PROMPT = """You are an expert prediction market analyst. Your job is to estimate the TRUE probability of events, independent of what the market currently prices them at.
+SYSTEM_PROMPT = """You are an expert prediction market analyst. Your job is to estimate the TRUE probability of events and identify MISPRICINGS — cases where the market price is meaningfully wrong.
+
+CRITICAL PRIOR: Prediction markets are generally well-calibrated. The market price reflects the aggregated wisdom of many informed traders with real money at stake. You need STRONG, SPECIFIC evidence to disagree with the market by more than 5%. Vague reasoning or "gut feeling" is not sufficient.
 
 Rules:
 1. Be CALIBRATED. A 70% probability should resolve YES ~70% of the time.
 2. Focus on the RESOLUTION CRITERIA, not just the headline question.
 3. Consider base rates, recent news, and domain-specific data.
-4. Account for uncertainty — if you're unsure, push your estimate toward 50%.
+4. Account for uncertainty — if you're unsure, your estimate should be CLOSE TO the market price, not pushed to 50%.
 5. Be explicit about what could make you wrong.
+6. Only output a probability that differs significantly from the market if you have concrete evidence the market is missing or misweighting.
+7. If you have no strong evidence either way, output a probability within 3% of the current market price and a LOW confidence score.
 
 Output format (STRICT JSON):
 {
@@ -171,9 +175,9 @@ async def quick_score_market(
     Used to pre-filter markets before expensive deep analysis.
     """
     prompt = (
-        f"Score this prediction market opportunity 0-100 based on trading potential.\n\n"
+        f"Score this prediction market for MISPRICING potential (0-100).\n\n"
         f"Question: {market.question}\n"
-        f"YES price: ${market.yes_price:.2f} | NO price: ${market.no_price:.2f}\n"
+        f"YES price: ${market.yes_price:.2f} ({market.yes_price*100:.0f}% implied) | NO price: ${market.no_price:.2f}\n"
         f"Volume: ${market.volume:,.0f} | Liquidity: ${market.liquidity:,.0f}\n"
     )
 
@@ -184,8 +188,13 @@ async def quick_score_market(
         prompt += f"\n{book_context}\n"
 
     prompt += (
-        "\nOutput ONLY JSON: {\"score\": <0-100>, \"reason\": \"<one sentence>\"}\n"
-        "High scores = clear mispricing or strong signal. Low scores = efficient pricing or too uncertain."
+        "\nScore ONLY based on whether the market price is likely WRONG — not on general trading quality.\n"
+        "Ask yourself: do I have specific knowledge suggesting the true probability differs from {:.0f}%?\n".format(market.yes_price * 100)
+        + "High scores (70+) = strong evidence the market is mispriced.\n"
+        "Medium scores (40-70) = some reason to think market may be off.\n"
+        "Low scores (0-40) = market price looks about right, no clear edge.\n"
+        "Default to LOW scores unless you have specific contrary evidence.\n\n"
+        "Output ONLY JSON: {\"score\": <0-100>, \"reason\": \"<one sentence>\"}"
     )
 
     response = await llm.compute(

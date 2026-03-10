@@ -186,10 +186,12 @@ class TradingAgent:
                         # Get agent memory for this market
                         memory_context = await self._get_market_context(market)
 
-                        # Get news context
-                        news = await get_news_context(
-                            self.llm, market, self.settings.news_api_key
-                        )
+                        # Get news context (empty if no API key configured)
+                        news = ""
+                        if self.settings.news_api_key:
+                            news = await get_news_context(
+                                self.llm, market, self.settings.news_api_key
+                            )
 
                         # Deep analysis with research model
                         analysis = await analyze_market(
@@ -253,12 +255,18 @@ class TradingAgent:
     async def _pick_ai_candidates(self, markets: list[Market]) -> list[Market]:
         """Pick the best candidates for AI analysis.
 
-        Smart selection: price movers first, then highest volume, capped at max_markets_per_scan.
-        This is the key to keeping AI costs low — we don't analyze 500 markets, only ~10-20.
+        Smart selection focused on markets where we're most likely to find real edge:
+        1. Price movers (something happened — news, event, catalyst)
+        2. Mid-range prices (20-80% implied) — most room for mispricing
+        3. Moderate liquidity ($1K-$100K) — enough to trade, thin enough to misprice
+        4. Filter out categories where LLMs have no edge
+
+        Capped at max_markets_per_scan.
         """
         max_candidates = self.settings.agent.max_markets_per_scan
         candidates = []
         seen_ids = set()
+        blacklist = set(c.lower() for c in self.settings.risk.categories_blacklist)
 
         # Priority 1: Markets that moved in price (something happened)
         try:
@@ -267,21 +275,98 @@ class TradingAgent:
             )
             for mover in movers[:max_candidates // 2]:
                 m = mover["market"]
-                if m.condition_id not in seen_ids:
+                if m.condition_id not in seen_ids and not self._is_blacklisted(m, blacklist):
                     candidates.append(m)
                     seen_ids.add(m.condition_id)
         except Exception:
             pass
 
-        # Priority 2: Highest volume markets (most liquid = best for trading)
+        # Priority 2: Score remaining markets on mispricing potential
+        scored_markets = []
         for market in markets:
+            if market.condition_id in seen_ids:
+                continue
+            if self._is_blacklisted(market, blacklist):
+                continue
+            if self._is_short_duration_crypto(market):
+                continue  # Handled by crypto sniper
+
+            score = self._candidate_score(market)
+            if score > 0:
+                scored_markets.append((market, score))
+
+        scored_markets.sort(key=lambda x: x[1], reverse=True)
+        for market, score in scored_markets:
             if len(candidates) >= max_candidates:
                 break
-            if market.condition_id not in seen_ids:
-                candidates.append(market)
-                seen_ids.add(market.condition_id)
+            candidates.append(market)
+            seen_ids.add(market.condition_id)
 
         return candidates
+
+    def _candidate_score(self, market: Market) -> float:
+        """Score a market for AI analysis potential.
+
+        Higher score = more likely to have exploitable mispricing.
+        Returns 0 to skip entirely.
+        """
+        price = market.yes_price
+        score = 0.0
+
+        # Mid-range prices: 20-80% implied probability
+        # Extremes (<10% or >90%) rarely have real edge
+        if 0.20 <= price <= 0.80:
+            score += 3.0
+            if 0.30 <= price <= 0.70:
+                score += 2.0  # Sweet spot
+        elif 0.10 <= price <= 0.90:
+            score += 1.0
+        else:
+            return 0.0  # Too extreme
+
+        # Moderate liquidity: enough to trade, thin enough to misprice
+        liq = market.liquidity
+        if 2000 <= liq <= 100_000:
+            score += 2.0
+        elif 100_000 < liq <= 300_000:
+            score += 1.0
+        elif 300_000 < liq <= 500_000:
+            score += 0.5  # Getting efficient
+        elif liq > 500_000:
+            score += 0.0  # Almost certainly efficiently priced
+        else:
+            return 0.0
+
+        # Volume = real interest
+        if market.volume >= 10_000:
+            score += 1.0
+        elif market.volume >= 5_000:
+            score += 0.5
+
+        # Time to resolution: 1-30 days is the sweet spot
+        hours = market.hours_to_resolution
+        if hours and 24 <= hours <= 720:
+            score += 1.0
+        elif hours and hours < 24:
+            score += 0.5
+
+        return score
+
+    def _is_blacklisted(self, market: Market, blacklist: set[str]) -> bool:
+        """Check if a market's category is blacklisted."""
+        if not blacklist:
+            return False
+        cat = market.category.lower()
+        q = market.question.lower()
+        return any(b in cat or b in q for b in blacklist)
+
+    def _is_short_duration_crypto(self, market: Market) -> bool:
+        """Check if this is a short-duration crypto market (handled by sniper)."""
+        import re
+        q = market.question.lower()
+        return bool(re.search(
+            r"(bitcoin|btc|ethereum|eth|solana|sol)\s+up\s+or\s+down", q
+        ))
 
     async def _autopilot_execute(self, signals: list[Signal]):
         """Auto-execute top signals within risk limits."""

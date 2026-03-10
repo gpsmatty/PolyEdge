@@ -20,26 +20,37 @@ risk:
   max_positions: 10
   drawdown_circuit_breaker: 0.25
   kelly_fraction: 0.25
-  min_edge_threshold: 0.05
-  min_confidence: 0.60
+  min_edge_threshold: 0.10   # Raised from 0.05 — LLM needs >10% to be actionable
+  min_confidence: 0.65       # Raised from 0.60
   max_trades_per_day: 20
   daily_loss_limit_pct: 0.15
   confirm_trades: true
-  categories_blacklist: []
+  categories_blacklist:
+    - "meme"
+    - "celebrity"
+    - "entertainment"
   min_liquidity: 1000
   min_time_to_resolution_hours: 24
 
 strategies:
   cheap_hunter:
-    enabled: true
+    enabled: false    # Disabled — heuristic boosts generate false positives
     max_price: 0.15
     min_volume: 500
     min_ev: 0.02
   edge_finder:
     enabled: true
-    min_edge: 0.05
+    min_edge: 0.10    # Raised from 0.05 — LLM needs >10% disagreement to be actionable
     use_ai: true
     use_news: true
+  crypto_sniper:
+    enabled: true
+    min_edge: 0.08                 # 8% edge minimum
+    min_price_move_pct: 0.002      # 0.2% minimum crypto price move
+    max_seconds_before_entry: 90   # Enter in last 90 seconds of window
+    symbols: ["btcusdt", "ethusdt", "solusdt"]
+    max_position_per_trade: 0.05   # 5% of bankroll per snipe ($10 on $200)
+    min_liquidity: 500
   market_maker:
     enabled: false
     min_spread: 0.05
@@ -50,5 +61,5 @@ agent:
   mode: "copilot"  # "autopilot" | "copilot" | "signals"
   scan_interval_minutes: 5
   sync_interval_minutes: 15  # Re-fetch all markets from API every 15 min
-  max_markets_per_scan: 20   # Only AI-analyze top 20 candidates per cycle
+  max_markets_per_scan: 10   # Reduced from 20 — fewer but better candidates
   reanalyze_price_change_pct: 0.05

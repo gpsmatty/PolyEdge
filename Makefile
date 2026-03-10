@@ -1,13 +1,13 @@
 .PHONY: install dev test scan hunt edges autopilot dashboard setup initdb
 
 install:
-	pip install -e .
+	.venv/bin/pip install -e .
 
 dev:
-	pip install -e ".[dev]"
+	.venv/bin/pip install -e ".[dev]"
 
 test:
-	python -m pytest tests/ -v
+	.venv/bin/python -m pytest tests/ -v
 
 scan:
 	polyedge scan
