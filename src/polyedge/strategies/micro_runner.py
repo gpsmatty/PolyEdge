@@ -480,29 +480,45 @@ class MicroRunner:
     async def _market_refresh_loop(self):
         """Periodically refresh active up/down markets.
 
-        When --market filter is set: skip API sync as long as we have
-        matching markets.  If markets drop to 0 (window expired), do a
-        sync to pick up the next window.
+        When --market filter is set: DON'T re-read from DB (the DB query
+        filters out 5-min markets). Instead, just prune expired windows from
+        the in-memory list. Only fetch from API when we run out of windows.
         """
         while self.running:
             try:
-                if not self.market_filter:
+                if self.market_filter:
+                    # Prune expired windows from memory — don't touch DB
+                    now = datetime.now(timezone.utc)
+                    for symbol in list(self.updown_markets.keys()):
+                        live = [
+                            (m, p) for m, p in self.updown_markets[symbol]
+                            if m.end_date and m.end_date > now
+                        ]
+                        if live:
+                            self.updown_markets[symbol] = live
+                        else:
+                            del self.updown_markets[symbol]
+
+                    self._total_markets = sum(
+                        len(v) for v in self.updown_markets.values()
+                    )
+
+                    # If we're running low on windows, fetch more from API
+                    if self._total_markets <= 1:
+                        try:
+                            fetched = await self._quick_sync()
+                            if fetched:
+                                await self._refresh_markets(prefetched=fetched)
+                        except Exception as e:
+                            logger.warning(f"Quick sync failed: {e}")
+                else:
                     # Full sync for unfiltered mode
                     try:
                         await self.indexer.sync()
                     except Exception as e:
                         logger.warning(f"Background sync failed: {e}")
-                elif self._total_markets == 0:
-                    # Quick targeted fetch when filtered and out of windows
-                    try:
-                        fetched = await self._quick_sync()
-                        if fetched:
-                            await self._refresh_markets(prefetched=fetched)
-                            continue
-                    except Exception as e:
-                        logger.warning(f"Quick sync failed: {e}")
+                    await self._refresh_markets()
 
-                await self._refresh_markets()
             except Exception as e:
                 logger.error(f"Market refresh failed: {e}")
             interval = MARKET_REFRESH_INTERVAL_FILTERED if self.market_filter else MARKET_REFRESH_INTERVAL
