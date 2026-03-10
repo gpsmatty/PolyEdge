@@ -328,8 +328,24 @@ class PolyClient:
         """
         from web3 import Web3
 
-        # Polygon RPC
-        w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        # Polygon RPC — try multiple free endpoints
+        rpc_urls = [
+            "https://polygon.llamarpc.com",
+            "https://rpc.ankr.com/polygon",
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon-rpc.com",
+        ]
+        w3 = None
+        for rpc_url in rpc_urls:
+            try:
+                _w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+                if _w3.is_connected():
+                    w3 = _w3
+                    break
+            except Exception:
+                continue
+        if w3 is None:
+            raise RuntimeError("Could not connect to any Polygon RPC endpoint")
 
         # Contract addresses from py-clob-client config
         CT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
