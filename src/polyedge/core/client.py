@@ -378,13 +378,17 @@ class PolyClient:
             return "already_approved"
 
         # Build and send approval transaction
+        # Use "pending" nonce to avoid "replacement transaction underpriced"
+        # when there's already a pending tx at the confirmed nonce.
+        nonce = w3.eth.get_transaction_count(wallet, "pending")
+        gas_price = max(w3.eth.gas_price, Web3.to_wei(50, "gwei"))  # At least 50 gwei
         tx = ct.functions.setApprovalForAll(
             Web3.to_checksum_address(exchange), True
         ).build_transaction({
             "from": wallet,
-            "nonce": w3.eth.get_transaction_count(wallet),
+            "nonce": nonce,
             "gas": 60000,
-            "gasPrice": w3.eth.gas_price,
+            "gasPrice": gas_price,
             "chainId": 137,
         })
 
