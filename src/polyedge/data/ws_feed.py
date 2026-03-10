@@ -168,12 +168,19 @@ class MarketFeed:
                         continue
 
                     try:
-                        event = json.loads(raw_msg)
+                        data = json.loads(raw_msg)
                     except json.JSONDecodeError:
                         logger.debug(f"Non-JSON message: {raw_msg[:100]}")
                         continue
 
-                    await self._dispatch(event)
+                    # Polymarket WS can send a single event (dict)
+                    # or a batch of events (list of dicts)
+                    if isinstance(data, list):
+                        for event in data:
+                            if isinstance(event, dict):
+                                await self._dispatch(event)
+                    elif isinstance(data, dict):
+                        await self._dispatch(data)
             finally:
                 heartbeat_task.cancel()
                 try:
