@@ -4,7 +4,7 @@ This document is for AI assistants working on this codebase. It contains everyth
 
 ## What This Project Is
 
-PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a monolith Python application that scans markets, uses LLMs to estimate true probabilities, detects mispricings, sizes positions with Kelly criterion, and executes real trades via the Polymarket CLOB API. It includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, and a weather sniper that compares ensemble weather forecasts against Polymarket weather market prices. Starting bankroll is $200 USD.
+PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a monolith Python application that scans markets, uses LLMs to estimate true probabilities, detects mispricings, sizes positions with Kelly criterion, and executes real trades via the Polymarket CLOB API. It includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, a weather sniper that compares ensemble weather forecasts against Polymarket weather market prices, and a high-frequency micro sniper that reads Binance aggTrade order flow to momentum-trade 5-minute crypto up/down markets. Starting bankroll is $200 USD.
 
 ## Project Root
 
@@ -31,7 +31,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 
 | File | Purpose | Key exports |
 |------|---------|-------------|
-| `config.py` | All configuration. Loads from Keychain + `.env` + `config/default.yaml`. | `Settings`, `load_config()`, `AIConfig`, `RiskConfig`, `AgentConfig`, `CryptoSniperConfig`, `WeatherSniperConfig`, `_get_from_keychain()`, `_set_in_keychain()`, `load_keychain_secrets()`, `KEYCHAIN_KEYS` |
+| `config.py` | All configuration. Loads from Keychain + `.env` + `config/default.yaml`. | `Settings`, `load_config()`, `AIConfig`, `RiskConfig`, `AgentConfig`, `CryptoSniperConfig`, `WeatherSniperConfig`, `MicroSniperConfig`, `_get_from_keychain()`, `_set_in_keychain()`, `load_keychain_secrets()`, `KEYCHAIN_KEYS` |
 | `models.py` | Every data model (Pydantic). | `Market`, `OrderBook`, `OrderBookLevel`, `Signal`, `Order`, `Position`, `Trade`, `AIAnalysis`, `PortfolioSnapshot`, `Side`, `AgentMode` |
 | `client.py` | Wrapper around `py-clob-client`. Handles auth, order placement, market data. | `PolyClient` |
 | `db.py` | PostgreSQL storage. All tables defined in `SCHEMA_SQL` string at top of file. | `Database` (async, uses connection pool) |
@@ -55,6 +55,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | `orderbook.py` | Fetches raw order book from CLOB API. | `get_order_book()`, `get_prices()` |
 | `book_analyzer.py` | Order book microstructure analysis. Computes imbalance, depth, whale detection, wall detection. | `analyze_book()`, `get_book_intelligence()`, `format_book_for_ai()`, `BookIntelligence` |
 | `binance_feed.py` | Binance WebSocket feed for real-time crypto prices (BTC, ETH, SOL). No auth needed. Combined streams, auto-reconnect. | `BinanceFeed`, `PriceSnapshot`, `PriceWindow` |
+| `binance_aggtrade.py` | Binance aggTrade WebSocket feed — tick-level trade data with buy/sell classification (~10-50 tps for BTC). Maintains rolling flow windows (5s/15s/30s) for OFI, VWAP drift, trade intensity. Gap detection resets stale data on reconnect. | `BinanceAggTradeFeed`, `AggTrade`, `MicroStructure`, `TradeFlowWindow` |
 | `weather_feed.py` | Weather forecast feed from Open-Meteo (ensemble) and NOAA (official). Caches forecasts, supports multiple locations. No API key needed. | `WeatherFeed`, `EnsembleForecast`, `NOAAForecast`, `LOCATIONS`, `find_location()` |
 | `ws_feed.py` | WebSocket feed for real-time Polymarket data. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. No auth needed. Must send `PING` every 10s. | `MarketFeed` |
 | `signals.py` | External data sources (stub). | — |
@@ -68,6 +69,8 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | `sniper_runner.py` | Persistent async loop connecting Binance prices to all Polymarket crypto markets. Up/down evaluated on every tick, threshold/bucket evaluated every 30s. Fetches up to 1000 markets. | `SniperRunner` |
 | `weather_sniper.py` | Weather forecast arbitrage. Compares Open-Meteo ensemble probabilities to Polymarket weather market prices. Detects neg-risk on multi-bucket events. | `WeatherSniperStrategy`, `WeatherOpportunity`, `NegRiskOpportunity`, `find_weather_markets()`, `group_weather_events()` |
 | `weather_runner.py` | Persistent async loop for weather sniper. Refreshes markets (5 min) and forecasts (30 min), evaluates all weather markets. | `WeatherRunner` |
+| `micro_sniper.py` | High-frequency momentum strategy for 5-min crypto up/down markets. Reads Binance aggTrade order flow (OFI, VWAP drift, intensity) and trades momentum on every swing. Entry/exit/flip logic with configurable thresholds. Zero AI cost. | `MicroSniperStrategy`, `MicroAction`, `MicroOpportunity` |
+| `micro_runner.py` | Persistent async loop for micro sniper. Connects Binance aggTrade + Polymarket WS. Evaluates on every 5th trade tick. Handles window hopping (pre-loads 10 windows), position tracking, sell orders. Narrows Binance feeds to only matched symbols. | `MicroRunner` |
 | `cheap_hunter.py` | Finds underpriced tail events (<$0.15). Zero AI cost. **Disabled** — heuristic boosts generate false positives. | `CheapHunterStrategy` |
 | `edge_finder.py` | Converts AI analysis into trade signals when edge > 10% threshold. | `EdgeFinderStrategy` |
 | `market_maker.py` | Spread capture strategy (WIP, not fully implemented). | `MarketMakerStrategy` |
@@ -89,11 +92,13 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 
 ### CLI (`src/polyedge/cli.py`)
 
-Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `autopilot`, `sniper`, `weather`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `autopilot`, `sniper`, `weather`, `micro`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
 
 The `sniper` command runs the crypto sniper as a persistent real-time loop (separate from the 5-minute `autopilot` agent). Flags: `--auto` (auto-execute), `--dry` (watch only).
 
 The `weather` command runs the weather sniper as a persistent polling loop. Flags: `--auto` (auto-execute), `--dry` (watch only). Default is copilot mode.
+
+The `micro` command runs the micro sniper as a persistent real-time loop (separate from both the `sniper` and `autopilot` commands). Reads Binance aggTrade tick data for order flow momentum. Flags: `--auto` (auto-execute), `--dry` (watch only), `--market "btc 5m"` (filter by keyword), `-v` (verbose), `-q` (quiet). Default is copilot mode.
 
 ## Database Schema
 
@@ -184,6 +189,42 @@ Defined in `weather_runner.py` `WeatherRunner.run()`. Runs as a persistent async
 6. **Execution** — Size with Kelly (max 8% of bankroll per weather trade). In `--dry` mode, display only. In copilot, ask for confirmation. In `--auto`, execute immediately.
 7. **Status** — Prints tracked market count and opportunity stats every 60 seconds.
 
+## Micro Sniper Loop (How It Works)
+
+Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async process, separate from the agent, crypto sniper, and weather sniper. Reads tick-level Binance aggTrade data to momentum-trade Polymarket's 5-minute crypto up/down markets.
+
+1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket.
+2. **aggTrade callback** (every 5th trade tick, ~2-10 evals/sec) — On each Binance aggTrade, updates `MicroStructure` rolling flow windows (5s/15s/30s OFI, VWAP drift, trade intensity). Evaluates only the current (first) window — rest are pre-loaded for seamless hopping.
+3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 40% OFI_5s + 30% OFI_15s + 20% VWAP drift + 10% intensity surge.
+4. **Entry** — When `|momentum| > 0.40` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.15-0.80, enter a position (BUY YES if bullish, BUY NO if bearish).
+5. **Exit** — When momentum reverses past exit_threshold (0.15) against our position, or momentum drops below hold_threshold (0.08) even if aligned, or force exit with <8s remaining.
+6. **Flip** — When momentum reverses past flip_threshold (0.50) with confidence > 0.50 and at least 25 trades in window, close current position and open opposite side. Flips require higher thresholds because they're expensive (close + reopen).
+7. **Window hopping** — Pre-loads 10 upcoming windows. When current window expires, instantly promotes next window. Refetches from API when ≤3 windows remain. Uses `asyncio.Lock` to prevent concurrent API fetches.
+8. **Gap detection** — If >5 seconds pass between aggTrade ticks (WebSocket disconnect), resets all flow windows to avoid trading on stale momentum.
+9. **Trade cooldown** — 10 seconds between trades on the same market to prevent whipsaw.
+10. **Status** — Prints microstructure state every 15 seconds.
+
+The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "btc 5m"`. Flags: `--auto` (auto-execute), `--dry` (watch only), `--market` (filter by keyword), `-v` (verbose), `-q` (quiet).
+
+**Micro sniper config keys** (all under `strategies.micro_sniper.*`):
+- `enabled` (bool, default true)
+- `symbols` (list[str], default ["btcusdt"])
+- `entry_threshold` (float, default 0.40)
+- `exit_threshold` (float, default 0.15)
+- `hold_threshold` (float, default 0.08)
+- `flip_threshold` (float, default 0.50)
+- `flip_min_confidence` (float, default 0.50)
+- `min_confidence` (float, default 0.40)
+- `min_trades_in_window` (int, default 10)
+- `min_trades_for_flip` (int, default 25)
+- `min_seconds_remaining` (float, default 15.0)
+- `force_exit_seconds` (float, default 8.0)
+- `min_entry_price` (float, default 0.15)
+- `max_entry_price` (float, default 0.80)
+- `max_position_per_trade` (float, default 0.03 = 3% of bankroll)
+- `max_trades_per_window` (int, default 50)
+- `min_liquidity` (float, default 500)
+
 ## Tiered AI Model System
 
 | Tier | Config Key | Default Model | Cost | Used For |
@@ -273,6 +314,7 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 | `test_book_analyzer.py` | Order book analysis: spread, imbalance, whales, walls, depth |
 | `test_crypto_sniper.py` | Normal CDF accuracy, market type classification (up/down, threshold, bucket), symbol extraction (BTC/ETH/SOL/XRP/DOGE), threshold probability (log-normal), bucket probability (range CDF), direction probability, regex patterns, strike extraction, arrow/range bucket parsing |
 | `test_weather_sniper.py` | Ensemble probability (in-range, above, below, boundary), location matching, market parsing (bucket ranges, below/above, precipitation), weather identification, event grouping, evaluate with forecast, neg-risk detection, confidence scoring, config defaults, signal conversion |
+| `test_micro_sniper.py` | Momentum entry/exit/flip logic, threshold validation, sparse data guard, min_entry_price guard, confidence filtering, force exit, config defaults, trade count requirements for flips |
 
 ## Common Modification Patterns
 
