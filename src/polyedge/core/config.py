@@ -138,7 +138,7 @@ class CryptoSniperConfig(BaseModel):
     min_edge: float = 0.08              # 8% minimum edge to trade
     min_price_move_pct: float = 0.002   # 0.2% minimum price move to consider
     max_seconds_before_entry: float = 90  # Only enter with <90s remaining
-    symbols: list[str] = Field(default_factory=lambda: ["btcusdt", "ethusdt", "solusdt"])
+    symbols: list[str] = Field(default_factory=lambda: ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "dogeusdt"])
     max_position_per_trade: float = 0.05  # 5% of bankroll per snipe
     min_liquidity: float = 500           # Min market liquidity to trade
 

@@ -1,13 +1,10 @@
-"""Sniper Runner — real-time loop that connects Binance prices to Polymarket
+"""Sniper Runner — real-time loop that connects Binance prices to ALL Polymarket
 crypto markets and executes sniper trades.
 
-This runs as a persistent async loop (separate from the 5-minute scan agent).
-It:
-1. Connects to Binance WebSocket for real-time crypto prices
-2. Periodically fetches active crypto "Up or Down" markets from Polymarket
-3. Tracks price windows aligned to market start/end times
-4. Evaluates sniper opportunities on every price tick
-5. Executes trades when edge exceeds threshold
+Handles three market types via a unified pipeline:
+1. Up/Down — short-duration direction bets (evaluated on every price tick)
+2. Threshold — "above X" price level bets (evaluated on price ticks + periodic)
+3. Bucket — "what price will X hit" range bets (evaluated periodically)
 
 Usage:
     polyedge sniper          # Run in copilot mode (confirm trades)
@@ -33,10 +30,12 @@ from polyedge.core.client import PolyClient
 from polyedge.core.db import Database
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_feed import BinanceFeed, PriceSnapshot
-from polyedge.data.markets import fetch_active_markets
+from polyedge.data.markets import fetch_active_markets, fetch_all_markets
 from polyedge.risk.sizing import calculate_position_size
 from polyedge.strategies.crypto_sniper import (
     CryptoSniperStrategy,
+    CryptoMarketType,
+    ParsedCryptoMarket,
     SniperOpportunity,
     find_crypto_markets,
     match_market_to_symbol,
@@ -47,6 +46,9 @@ console = Console()
 
 # How often to refresh the crypto market list from Polymarket
 MARKET_REFRESH_INTERVAL = 60  # seconds
+
+# How often to evaluate threshold/bucket markets (they don't need tick-by-tick)
+SLOW_EVAL_INTERVAL = 30  # seconds
 
 
 class SniperRunner:
@@ -74,8 +76,11 @@ class SniperRunner:
         # Binance price feed
         self.binance = BinanceFeed(symbols=sniper_config.symbols)
 
-        # Active crypto markets: symbol -> list of markets
-        self.crypto_markets: dict[str, list[Market]] = {}
+        # Active crypto markets grouped by type
+        # symbol -> list of (market, parsed) for up/down (tick-evaluated)
+        self.updown_markets: dict[str, list[tuple[Market, ParsedCryptoMarket]]] = {}
+        # All threshold/bucket markets (periodically evaluated)
+        self.slow_markets: list[tuple[Market, ParsedCryptoMarket]] = []
 
         # Track which markets we've already traded to avoid double-entry
         self._traded_markets: set[str] = set()
@@ -84,6 +89,7 @@ class SniperRunner:
         self.opportunities_seen = 0
         self.trades_executed = 0
         self.total_edge_captured = 0.0
+        self._total_markets = 0
 
     async def run(self):
         """Main sniper loop."""
@@ -95,16 +101,21 @@ class SniperRunner:
         console.print(
             f"[dim]Tracking: {', '.join(s.upper() for s in sniper_config.symbols)} | "
             f"Min edge: {sniper_config.min_edge:.0%} | "
-            f"Entry window: last {sniper_config.max_seconds_before_entry:.0f}s[/dim]"
+            f"Entry window (up/down): last {sniper_config.max_seconds_before_entry:.0f}s[/dim]"
+        )
+        console.print(
+            f"[dim]Market types: Up/Down + Threshold + Bucket | "
+            f"Fetching all crypto markets from Polymarket[/dim]"
         )
 
-        # Register price callback for opportunity detection
+        # Register price callback for up/down opportunity detection
         self.binance.on_any_price(self._on_price_update)
 
         # Start tasks
         tasks = [
             asyncio.create_task(self.binance.start()),
             asyncio.create_task(self._market_refresh_loop()),
+            asyncio.create_task(self._slow_eval_loop()),
             asyncio.create_task(self._status_loop()),
         ]
 
@@ -143,12 +154,13 @@ class SniperRunner:
             await asyncio.sleep(MARKET_REFRESH_INTERVAL)
 
     async def _refresh_crypto_markets(self):
-        """Fetch and filter for active crypto up/down markets."""
+        """Fetch and classify all active crypto markets."""
         try:
-            all_markets = await fetch_active_markets(
+            # Fetch more markets to catch threshold/bucket markets beyond top 100
+            all_markets = await fetch_all_markets(
                 self.settings,
-                limit=100,
                 min_liquidity=self.settings.strategies.crypto_sniper.min_liquidity,
+                max_pages=10,  # Up to 1000 markets
             )
         except Exception as e:
             logger.warning(f"Failed to fetch markets: {e}")
@@ -156,31 +168,52 @@ class SniperRunner:
 
         crypto = find_crypto_markets(all_markets)
 
-        # Group by symbol
-        self.crypto_markets.clear()
+        # Classify and group
+        self.updown_markets.clear()
+        self.slow_markets.clear()
+
         for market in crypto:
-            symbol = match_market_to_symbol(market)
-            if symbol:
-                if symbol not in self.crypto_markets:
-                    self.crypto_markets[symbol] = []
-                self.crypto_markets[symbol].append(market)
+            parsed = self.strategy.parse_market(market)
+            if not parsed:
+                continue
 
-                # Start price window for this market if not already tracking
-                window = self.binance.get_window(symbol)
+            # Only track markets with symbols we're actually streaming from Binance
+            if parsed.symbol not in self.settings.strategies.crypto_sniper.symbols:
+                continue
+
+            if parsed.market_type == CryptoMarketType.UP_DOWN:
+                if parsed.symbol not in self.updown_markets:
+                    self.updown_markets[parsed.symbol] = []
+                self.updown_markets[parsed.symbol].append((market, parsed))
+
+                # Start price window for up/down markets
+                window = self.binance.get_window(parsed.symbol)
                 if window and window.window_start_price <= 0:
-                    self.binance.start_window(symbol)
+                    self.binance.start_window(parsed.symbol)
+            else:
+                # Threshold and bucket markets go to slow eval
+                self.slow_markets.append((market, parsed))
 
-        total = sum(len(v) for v in self.crypto_markets.values())
-        if total > 0:
-            symbols_str = ", ".join(
-                f"{s.upper()}({len(m)})" for s, m in self.crypto_markets.items()
-            )
-            logger.info(f"Tracking {total} crypto markets: {symbols_str}")
+        n_updown = sum(len(v) for v in self.updown_markets.values())
+        n_slow = len(self.slow_markets)
+        self._total_markets = n_updown + n_slow
+
+        if self._total_markets > 0:
+            parts = []
+            if n_updown > 0:
+                ud_str = ", ".join(
+                    f"{s.upper()}({len(m)})"
+                    for s, m in self.updown_markets.items()
+                )
+                parts.append(f"Up/Down: {ud_str}")
+            if n_slow > 0:
+                parts.append(f"Threshold/Bucket: {n_slow}")
+            logger.info(f"Tracking {self._total_markets} crypto markets — {' | '.join(parts)}")
 
     async def _on_price_update(self, snapshot: PriceSnapshot):
-        """Called on every Binance price tick — evaluate sniper opportunities."""
+        """Called on every Binance price tick — evaluate up/down markets."""
         symbol = snapshot.symbol
-        markets = self.crypto_markets.get(symbol, [])
+        markets = self.updown_markets.get(symbol, [])
         if not markets:
             return
 
@@ -188,43 +221,83 @@ class SniperRunner:
         if not window or window.window_start_price <= 0:
             return
 
-        for market in markets:
+        for market, parsed in markets:
             if market.condition_id in self._traded_markets:
                 continue
 
-            # Calculate seconds remaining (from end_date)
             if not market.end_date:
                 continue
 
             now = datetime.now(timezone.utc)
             remaining = (market.end_date - now).total_seconds()
 
-            # Evaluate
             opp = self.strategy.evaluate_with_price(
                 market=market,
                 price_window=window,
                 current_price=snapshot,
                 seconds_remaining=remaining,
+                parsed=parsed,
             )
 
             if opp:
                 self.opportunities_seen += 1
                 await self._handle_opportunity(opp)
 
+    async def _slow_eval_loop(self):
+        """Periodically evaluate threshold and bucket markets."""
+        while self.running:
+            await asyncio.sleep(SLOW_EVAL_INTERVAL)
+
+            for market, parsed in self.slow_markets:
+                if market.condition_id in self._traded_markets:
+                    continue
+
+                if not market.end_date:
+                    continue
+
+                now = datetime.now(timezone.utc)
+                remaining = (market.end_date - now).total_seconds()
+                if remaining <= 0:
+                    continue
+
+                # Get current price from Binance
+                snapshot = self.binance.get_price(parsed.symbol)
+                if not snapshot or not snapshot.is_fresh:
+                    continue
+
+                # Threshold/bucket don't need a price window
+                from polyedge.data.binance_feed import PriceWindow
+                dummy_window = PriceWindow(symbol=parsed.symbol)
+
+                opp = self.strategy.evaluate_with_price(
+                    market=market,
+                    price_window=dummy_window,
+                    current_price=snapshot,
+                    seconds_remaining=remaining,
+                    parsed=parsed,
+                )
+
+                if opp:
+                    self.opportunities_seen += 1
+                    await self._handle_opportunity(opp)
+
     async def _handle_opportunity(self, opp: SniperOpportunity):
         """Handle a detected sniper opportunity."""
         signal = self.strategy.opportunity_to_signal(opp)
 
+        type_label = opp.market_type.value.upper()
         console.print(
-            f"\n[bold yellow]SNIPER OPPORTUNITY[/bold yellow] "
+            f"\n[bold yellow]SNIPER [{type_label}][/bold yellow] "
             f"{opp.symbol.upper()} {opp.side.value} "
             f"| Edge: {opp.edge:.1%} "
-            f"| Move: {opp.price_change_pct:+.3%} "
-            f"| Time left: {opp.seconds_remaining:.0f}s "
-            f"| Binance: ${opp.binance_price:,.2f}"
+            f"| Price: ${opp.binance_price:,.2f} "
+            f"{'| Strike: $' + f'{opp.strike:,.2f}' if opp.strike else ''}"
+            f"| Market: {opp.market_price:.1%} "
+            f"| Implied: {opp.implied_prob:.1%}"
         )
 
         if self.dry_run:
+            console.print(f"[dim]  {opp.market.question[:80]}[/dim]")
             console.print("[dim]  (dry run — not trading)[/dim]")
             return
 
@@ -322,10 +395,11 @@ class SniperRunner:
                     f"{s.replace('usdt','').upper()}: ${p:,.2f}"
                     for s, p in prices.items()
                 )
-                n_markets = sum(len(v) for v in self.crypto_markets.values())
+                n_updown = sum(len(v) for v in self.updown_markets.values())
+                n_slow = len(self.slow_markets)
                 console.print(
                     f"[dim]{price_str} | "
-                    f"Markets: {n_markets} | "
+                    f"Markets: {n_updown} ud + {n_slow} th/bk | "
                     f"Opps: {self.opportunities_seen} | "
                     f"Trades: {self.trades_executed}[/dim]"
                 )

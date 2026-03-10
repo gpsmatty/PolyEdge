@@ -48,7 +48,7 @@ strategies:
     min_edge: 0.08                 # 8% edge minimum
     min_price_move_pct: 0.002      # 0.2% minimum crypto price move
     max_seconds_before_entry: 90   # Enter in last 90 seconds of window
-    symbols: ["btcusdt", "ethusdt", "solusdt"]
+    symbols: ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "dogeusdt"]
     max_position_per_trade: 0.05   # 5% of bankroll per snipe ($10 on $200)
     min_liquidity: 500
   weather_sniper:

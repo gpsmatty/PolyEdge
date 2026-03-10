@@ -64,8 +64,8 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | File | Purpose | Key exports |
 |------|---------|-------------|
 | `base.py` | Strategy ABC with `evaluate(market) -> Signal`. | `Strategy` |
-| `crypto_sniper.py` | Real-time crypto price feed arbitrage. Maps Binance price movement to implied probability using normal CDF with sqrt(time) volatility scaling. | `CryptoSniperStrategy`, `SniperOpportunity`, `find_crypto_markets()`, `match_market_to_symbol()` |
-| `sniper_runner.py` | Persistent async loop connecting Binance prices to Polymarket crypto markets. Evaluates on every tick, executes snipes. | `SniperRunner` |
+| `crypto_sniper.py` | All crypto market arbitrage. Handles three types: Up/Down (direction via CDF), Threshold ("above X" via log-normal), Bucket ("what price" via range CDF). Supports BTC, ETH, SOL, XRP, DOGE. | `CryptoSniperStrategy`, `CryptoMarketType`, `ParsedCryptoMarket`, `SniperOpportunity`, `find_crypto_markets()`, `match_market_to_symbol()` |
+| `sniper_runner.py` | Persistent async loop connecting Binance prices to all Polymarket crypto markets. Up/down evaluated on every tick, threshold/bucket evaluated every 30s. Fetches up to 1000 markets. | `SniperRunner` |
 | `weather_sniper.py` | Weather forecast arbitrage. Compares Open-Meteo ensemble probabilities to Polymarket weather market prices. Detects neg-risk on multi-bucket events. | `WeatherSniperStrategy`, `WeatherOpportunity`, `NegRiskOpportunity`, `find_weather_markets()`, `group_weather_events()` |
 | `weather_runner.py` | Persistent async loop for weather sniper. Refreshes markets (5 min) and forecasts (30 min), evaluates all weather markets. | `WeatherRunner` |
 | `cheap_hunter.py` | Finds underpriced tail events (<$0.15). Zero AI cost. **Disabled** — heuristic boosts generate false positives. | `CheapHunterStrategy` |
@@ -161,15 +161,16 @@ Defined in `agent.py` `_scan_cycle()`. Every 5 minutes:
 
 ## Crypto Sniper Loop (How It Works)
 
-Defined in `sniper_runner.py` `SniperRunner.run()`. Runs as a persistent async process, separate from the agent scan cycle:
+Defined in `sniper_runner.py` `SniperRunner.run()`. Runs as a persistent async process, separate from the agent scan cycle. Handles three market types:
 
-1. **Connect** — Opens WebSocket to Binance combined streams for BTC, ETH, SOL tickers.
-2. **Market refresh** — Every 60 seconds, fetches active crypto "Up or Down" markets from Polymarket Gamma API. Groups by symbol. Starts price windows for new markets.
-3. **Price callback** — On every Binance price tick (~1/sec per symbol), evaluates all tracked markets via `CryptoSniperStrategy.evaluate_with_price()`.
-4. **Probability model** — Computes implied probability from price change using normal CDF with sqrt(time) volatility scaling. Conservative tuning: 0.3% vol floor, +15s execution buffer, 0.05 min remaining fraction.
-5. **Edge check** — If `implied_prob - market_price > 8%` (min_edge) and price moved >0.2% and <90 seconds remain, generate a `SniperOpportunity`.
-6. **Execution** — Size with Kelly (max 5% of bankroll per snipe). In `--dry` mode, display only. In copilot, ask for confirmation. In `--auto`, execute immediately. Tracks `_traded_markets` set to prevent double-entry.
-7. **Status** — Prints price/stats summary every 30 seconds.
+1. **Connect** — Opens WebSocket to Binance.US combined streams for BTC, ETH, SOL, XRP, DOGE tickers.
+2. **Market refresh** — Every 60 seconds, fetches up to 1000 active markets from Polymarket Gamma API. Classifies into three types: Up/Down, Threshold ("above X"), Bucket ("what price will X hit"). Groups up/down by symbol for tick evaluation; threshold/bucket go to slow eval.
+3. **Up/Down evaluation** (every price tick) — On every Binance price tick (~1/sec per symbol), evaluates up/down markets. Computes P(direction holds) via normal CDF with sqrt(time) volatility scaling. Trades when edge > 8% in last 90 seconds of window.
+4. **Threshold evaluation** (every 30s) — For "above X" markets, computes P(price > strike at expiry) using log-normal model (zero-drift GBM). Uses per-symbol annualized volatility estimates.
+5. **Bucket evaluation** (every 30s) — For "what price" markets, computes P(price in [low, high]) = CDF(high) - CDF(low). Handles arrow-style buckets (↑ above, ↓ below) and range buckets.
+6. **Edge check** — All types: if `implied_prob - market_price > 8%` (min_edge), generate a `SniperOpportunity`.
+7. **Execution** — Size with Kelly (max 5% of bankroll per snipe). In `--dry` mode, display only. In copilot, ask for confirmation. In `--auto`, execute immediately. Tracks `_traded_markets` set to prevent double-entry.
+8. **Status** — Prints price/stats summary every 30 seconds showing up/down and threshold/bucket market counts separately.
 
 ## Weather Sniper Loop (How It Works)
 
@@ -260,7 +261,7 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 .venv/bin/pytest tests/ -v
 ```
 
-80+ tests. Pure logic tests (no DB, no API mocks needed for most). Test files:
+120+ tests. Pure logic tests (no DB, no API mocks needed for most). Test files:
 
 | File | Tests |
 |------|-------|
@@ -270,7 +271,7 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 | `test_cheap_hunter.py` | Cheap event detection, filtering, batch ranking |
 | `test_portfolio_risk.py` | Risk checks: max positions, exposure, daily limits, circuit breaker |
 | `test_book_analyzer.py` | Order book analysis: spread, imbalance, whales, walls, depth |
-| `test_crypto_sniper.py` | Normal CDF accuracy (Abramowitz & Stegun), implied probability model, crypto market regex matching, duration parsing, candidate scoring, threshold filtering |
+| `test_crypto_sniper.py` | Normal CDF accuracy, market type classification (up/down, threshold, bucket), symbol extraction (BTC/ETH/SOL/XRP/DOGE), threshold probability (log-normal), bucket probability (range CDF), direction probability, regex patterns, strike extraction, arrow/range bucket parsing |
 | `test_weather_sniper.py` | Ensemble probability (in-range, above, below, boundary), location matching, market parsing (bucket ranges, below/above, precipitation), weather identification, event grouping, evaluate with forecast, neg-risk detection, confidence scoring, config defaults, signal conversion |
 
 ## Common Modification Patterns
@@ -320,7 +321,7 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 - `min_edge` (float, default 0.08 = 8%)
 - `min_price_move_pct` (float, default 0.002 = 0.2%)
 - `max_seconds_before_entry` (float, default 90)
-- `symbols` (list[str], default ["btcusdt", "ethusdt", "solusdt"])
+- `symbols` (list[str], default ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "dogeusdt"])
 - `max_position_per_trade` (float, default 0.05 = 5% of bankroll)
 - `min_liquidity` (float, default 500)
 
