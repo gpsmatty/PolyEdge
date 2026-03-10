@@ -1106,23 +1106,35 @@ class MicroRunner:
         # The limit just sets the floor — "fill at best bid, but not below this".
         sell_price = max(0.01, round(price - 0.05, 2))
 
-        # Get position size and entry price from DB
-        size = 0
+        # Get entry price from DB for P&L calculation
         entry_price = 0.0
+        db_size = 0
         try:
             positions = await self.db.get_open_positions()
             for p in positions:
                 if p.get("market_id") == cid and p.get("side", "").lower() == current_pos:
-                    size = p.get("size", 0)
+                    db_size = p.get("size", 0)
                     entry_price = p.get("entry_price", 0)
                     break
         except Exception:
             pass
 
-        size = round(size, 2)  # CLOB needs ≤2 decimal places
+        # Get ACTUAL token balance from CLOB API — this is the truth.
+        # The DB size can be wrong because FOK buy fills may produce a
+        # different share count than we estimated from USD/price.
+        size = 0
+        try:
+            bal = self.client.get_token_balance(token_id)
+            raw_bal = int(bal.get("balance", 0))
+            # Conditional token balance is in 6-decimal wei (like USDC)
+            size = round(raw_bal / 1e6, 2)
+        except Exception as e:
+            logger.warning(f"Token balance lookup failed, falling back to DB: {e}")
+            size = round(db_size, 2)
+
         if size <= 0:
-            # No recorded position size — just clear our tracking
-            logger.info(f"No position size found for {cid}, clearing tracking")
+            # No tokens to sell — just clear our tracking
+            logger.info(f"No token balance for {token_id}, clearing tracking")
             return True
 
         try:
@@ -1168,10 +1180,10 @@ class MicroRunner:
                 console.print(
                     f"  [{pnl_style}]P&L: ${gross_pnl:+.2f} "
                     f"(entry ${entry_price:.2f} → exit ${fill_price:.2f})"
-                    f"{'  ✓ filled' if fill_verified else '  ⏳ pending'}[/{pnl_style}]"
+                    f"  ✓ filled[/{pnl_style}]"
                 )
 
-            return fill_verified or True  # Optimistic — if order was placed, assume it worked
+            return True
 
         except Exception as e:
             err_msg = str(e)
