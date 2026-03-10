@@ -220,21 +220,25 @@ class MicroRunner:
                     f"[green]Found {matches} matching markets on page {page + 1} "
                     f"({len(found)} total fetched)[/green]"
                 )
-                # Grab one more page to get upcoming windows too
-                page += 1
-                params["offset"] = page * batch_size
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, params=params) as resp:
-                            if resp.status == 200:
-                                extra = await resp.json()
-                                for item in extra:
-                                    try:
-                                        found.append(_parse_market(item))
-                                    except (KeyError, ValueError):
-                                        continue
-                except Exception:
-                    pass
+                # Grab 5 more pages to pre-load lots of upcoming windows
+                # (5-min markets = ~12 per hour, 5 pages = ~50 windows)
+                for extra_page in range(1, 6):
+                    extra_offset = (page + extra_page) * batch_size
+                    params["offset"] = extra_offset
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url, params=params) as resp:
+                                if resp.status == 200:
+                                    extra = await resp.json()
+                                    if not extra:
+                                        break
+                                    for item in extra:
+                                        try:
+                                            found.append(_parse_market(item))
+                                        except (KeyError, ValueError):
+                                            continue
+                    except Exception:
+                        break
                 break
 
             if len(data) < batch_size:
@@ -504,7 +508,8 @@ class MicroRunner:
                     )
 
                     # If we're running low on windows, fetch more from API
-                    if self._total_markets <= 1:
+                    # Trigger early (≤3) so we refetch BEFORE running out
+                    if self._total_markets <= 3:
                         try:
                             fetched = await self._quick_sync()
                             if fetched:
@@ -595,8 +600,9 @@ class MicroRunner:
             # Sort by end_date ascending — first entry is the current live window
             market_list.sort(key=lambda mp: mp[0].end_date)
 
-            # Take the nearest window (current) + next few for seamless hopping
-            selected = market_list[:3]
+            # Take the nearest window (current) + many future windows for
+            # seamless hopping — Polymarket has 40+ upcoming 5-min windows
+            selected = market_list[:10]
 
             self.updown_markets[symbol] = selected
 
@@ -934,13 +940,17 @@ class MicroRunner:
             logger.error(f"Micro execution failed: {e}", exc_info=True)
 
     async def _close_position(self, engine, opp: MicroOpportunity) -> bool:
-        """Close an existing position (sell back)."""
+        """Close an existing position by placing a SELL order.
+
+        On Polymarket CLOB, selling tokens you hold = SELL side on the token_id.
+        Uses an aggressive limit price (slightly below mid) for fast fills.
+        """
         cid = opp.market.condition_id
         current_pos = self._positions.get(cid)
         if not current_pos:
             return True  # Nothing to close
 
-        # Determine which token to sell
+        # Determine which token to sell and at what price
         if current_pos == "yes":
             token_id = opp.market.yes_token_id
             price = opp.market.yes_price
@@ -949,16 +959,55 @@ class MicroRunner:
             price = opp.market.no_price
 
         if not token_id:
+            console.print("[red]  No token ID — can't close position[/red]")
             return False
 
+        # Aggressive sell price: slightly below mid for fast fill
+        # On Polymarket, selling at a lower price makes it more likely to fill
+        sell_price = max(0.01, round(price - 0.02, 2))
+
+        # Get position size from DB, fallback to a reasonable estimate
+        size = 0
         try:
-            # TODO: Implement sell/close order via engine
-            # For now, we just track the position state
-            # In a real implementation, this would place a sell order
-            logger.info(f"Closing {current_pos} position on {cid} at {price:.2f}")
+            positions = await self.db.get_open_positions()
+            for p in positions:
+                if p.get("market_id") == cid and p.get("side", "").lower() == current_pos:
+                    size = p.get("size", 0)
+                    break
+        except Exception:
+            pass
+
+        if size <= 0:
+            # No recorded position size — just clear our tracking
+            logger.info(f"No position size found for {cid}, clearing tracking")
             return True
+
+        try:
+            result = self.client.place_limit_order(
+                token_id=token_id,
+                side="sell",
+                price=sell_price,
+                size=size,
+            )
+
+            order_id = result.get("orderID", result.get("id", ""))
+            if not self.quiet:
+                console.print(
+                    f"[yellow]  SOLD {current_pos.upper()} {size:.1f} @ ${sell_price:.2f} "
+                    f"— Order: {order_id}[/yellow]"
+                )
+
+            # Remove DB position
+            try:
+                await self.db.remove_position(cid, token_id, current_pos)
+            except Exception as e:
+                logger.warning(f"DB position update failed (non-fatal): {e}")
+
+            return True
+
         except Exception as e:
-            logger.error(f"Failed to close position: {e}")
+            console.print(f"[red]  Sell failed: {e}[/red]")
+            logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
             return False
 
     # ------------------------------------------------------------------
