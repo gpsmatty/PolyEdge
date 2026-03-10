@@ -169,92 +169,112 @@ class MicroRunner:
     async def _quick_sync(self):
         """Targeted API fetch for crypto 5-min markets.
 
-        The generic volume-sorted fetch misses short-duration crypto markets
-        because they're buried behind high-volume political markets. Instead,
-        sort by endDate ascending (soonest-ending = currently live) and page
-        through until we find matches. Typically finds them within 2-5 pages.
+        Uses Gamma API's tag filter to directly fetch only crypto up/down
+        markets instead of paging through thousands of unrelated markets.
+        Falls back to slug_contains search if tag filter returns nothing.
         """
         import aiohttp
         from polyedge.data.markets import _parse_market
 
         gamma_url = self.settings.polymarket.gamma_url
         found: list[Market] = []
-        batch_size = 100
 
-        console.print("[dim]Targeted fetch (sorting by endDate)...[/dim]")
+        console.print("[dim]Targeted fetch (crypto up/down)...[/dim]")
 
-        # Fetch markets sorted by endDate ascending — currently-live markets
-        # appear first since they expire soonest
-        for page in range(20):  # Up to 2000 markets, usually find matches in <5 pages
-            url = f"{gamma_url}/markets"
-            params = {
-                "limit": batch_size,
-                "offset": page * batch_size,
-                "active": "true",
-                "closed": "false",
-                "order": "endDate",
-                "ascending": "true",
-            }
+        # Strategy: search for "Bitcoin Up or Down" (and other crypto) directly.
+        # The Gamma API supports tag and text_query filters that are much faster
+        # than paging through all markets sorted by endDate.
+        search_terms = ["Bitcoin Up or Down", "Ethereum Up or Down", "Solana Up or Down"]
+        if self._filter_words:
+            # If user specified --market "btc 5m", narrow the search
+            word_map = {"btc": "Bitcoin", "eth": "Ethereum", "sol": "Solana",
+                        "xrp": "XRP", "doge": "Dogecoin"}
+            for w in self._filter_words:
+                mapped = word_map.get(w.lower())
+                if mapped:
+                    search_terms = [f"{mapped} Up or Down"]
+                    break
 
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params) as resp:
-                        if resp.status != 200:
-                            logger.warning(f"Gamma API error: {resp.status}")
-                            break
-                        data = await resp.json()
-            except Exception as e:
-                logger.warning(f"Quick sync page {page} failed: {e}")
-                break
+        async with aiohttp.ClientSession() as session:
+            for term in search_terms:
+                # Fetch up to 500 markets matching this search term
+                for page in range(5):
+                    url = f"{gamma_url}/markets"
+                    params = {
+                        "limit": 100,
+                        "offset": page * 100,
+                        "active": "true",
+                        "closed": "false",
+                        "order": "endDate",
+                        "ascending": "true",
+                        "tag": "crypto-prices",
+                    }
 
-            if not data:
-                break
-
-            # Parse and check for matches
-            page_markets = []
-            for item in data:
-                try:
-                    m = _parse_market(item)
-                    page_markets.append(m)
-                except (KeyError, ValueError):
-                    continue
-
-            found.extend(page_markets)
-
-            # Check if we have any matching crypto markets yet
-            matches = self._count_filter_matches(page_markets)
-            if matches > 0:
-                console.print(
-                    f"[green]Found {matches} matching markets on page {page + 1} "
-                    f"({len(found)} total fetched)[/green]"
-                )
-                # Grab 5 more pages to pre-load lots of upcoming windows
-                # (5-min markets = ~12 per hour, 5 pages = ~50 windows)
-                for extra_page in range(1, 6):
-                    extra_offset = (page + extra_page) * batch_size
-                    params["offset"] = extra_offset
                     try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url, params=params) as resp:
-                                if resp.status == 200:
-                                    extra = await resp.json()
-                                    if not extra:
-                                        break
-                                    for item in extra:
-                                        try:
-                                            found.append(_parse_market(item))
-                                        except (KeyError, ValueError):
-                                            continue
-                    except Exception:
+                        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status != 200:
+                                logger.warning(f"Gamma API error: {resp.status}")
+                                break
+                            data = await resp.json()
+                    except Exception as e:
+                        logger.warning(f"Quick sync page {page} failed: {e}")
                         break
-                break
 
-            if len(data) < batch_size:
-                break  # Last page
+                    if not data:
+                        break
+
+                    for item in data:
+                        try:
+                            m = _parse_market(item)
+                            # Only keep up/down markets that match our filter
+                            if UP_DOWN_PATTERN.search(m.question):
+                                found.append(m)
+                        except (KeyError, ValueError):
+                            continue
+
+                    if len(data) < 100:
+                        break  # Last page
+
+        # If tag filter returned nothing, try a broader text search
+        if not found:
+            console.print("[dim]Tag filter empty — trying text search...[/dim]")
+            async with aiohttp.ClientSession() as session:
+                for term in search_terms:
+                    url = f"{gamma_url}/markets"
+                    params = {
+                        "limit": 100,
+                        "active": "true",
+                        "closed": "false",
+                        "order": "endDate",
+                        "ascending": "true",
+                        "slug_contains": term.lower().replace(" ", "-"),
+                    }
+                    try:
+                        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for item in data:
+                                    try:
+                                        m = _parse_market(item)
+                                        if UP_DOWN_PATTERN.search(m.question):
+                                            found.append(m)
+                                    except (KeyError, ValueError):
+                                        continue
+                    except Exception as e:
+                        logger.warning(f"Slug search failed: {e}")
 
         if not found:
             console.print("[yellow]Targeted fetch returned 0 markets[/yellow]")
             return []
+
+        # Deduplicate by condition_id
+        seen = set()
+        unique = []
+        for m in found:
+            if m.condition_id not in seen:
+                seen.add(m.condition_id)
+                unique.append(m)
+        found = unique
 
         # Upsert to DB for persistence
         market_dicts = []
@@ -282,7 +302,8 @@ class MicroRunner:
         except Exception as e:
             logger.warning(f"DB upsert failed (non-fatal): {e}")
 
-        console.print(f"[green]Fetched {len(found)} markets[/green]")
+        matches = self._count_filter_matches(found)
+        console.print(f"[green]Fetched {len(found)} crypto markets ({matches} matching filter)[/green]")
         return found
 
     def _count_filter_matches(self, markets: list[Market]) -> int:
