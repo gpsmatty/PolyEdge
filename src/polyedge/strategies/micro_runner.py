@@ -1031,6 +1031,7 @@ class MicroRunner:
 
         On Polymarket CLOB, selling tokens you hold = SELL side on the token_id.
         Uses an aggressive limit price (slightly below mid) for fast fills.
+        Records exit price and P&L in the trades table, then verifies the fill.
         """
         cid = opp.market.condition_id
         current_pos = self._positions.get(cid)
@@ -1053,13 +1054,15 @@ class MicroRunner:
         # On Polymarket, selling at a lower price makes it more likely to fill
         sell_price = max(0.01, round(price - 0.02, 2))
 
-        # Get position size from DB, fallback to a reasonable estimate
+        # Get position size and entry price from DB
         size = 0
+        entry_price = 0.0
         try:
             positions = await self.db.get_open_positions()
             for p in positions:
                 if p.get("market_id") == cid and p.get("side", "").lower() == current_pos:
                     size = p.get("size", 0)
+                    entry_price = p.get("entry_price", 0)
                     break
         except Exception:
             pass
@@ -1084,11 +1087,59 @@ class MicroRunner:
                     f"— Order: {order_id}[/yellow]"
                 )
 
+            # Verify fill — poll up to 3 times over ~3 seconds
+            fill_verified = False
+            fill_price = sell_price  # Default to our limit price
+            for attempt in range(3):
+                await asyncio.sleep(1.0)
+                try:
+                    order_status = self.client.get_order(order_id)
+                    status = order_status.get("status", "")
+                    size_matched = float(order_status.get("size_matched", 0))
+
+                    if size_matched >= size * 0.95:  # 95% fill = good enough
+                        fill_verified = True
+                        # Use matched price if available
+                        matched_price = float(order_status.get("price", sell_price))
+                        if matched_price > 0:
+                            fill_price = matched_price
+                        break
+                    elif status in ("CANCELED", "CANCELLED"):
+                        console.print(f"[red]  Sell order was cancelled![/red]")
+                        break
+                except Exception as e:
+                    logger.warning(f"Fill check attempt {attempt+1} failed: {e}")
+
+            if not fill_verified and not self.quiet:
+                console.print(
+                    f"[yellow]  Sell fill not confirmed after 3s — "
+                    f"order {order_id} may still be pending[/yellow]"
+                )
+
+            # Record exit price + P&L in trades table
+            gross_pnl = (fill_price - entry_price) * size if entry_price > 0 else 0
+            try:
+                await self.db.close_trade_by_market(
+                    market_id=cid,
+                    exit_price=fill_price,
+                    pnl=gross_pnl,
+                )
+            except Exception as e:
+                logger.warning(f"Trade close recording failed (non-fatal): {e}")
+
             # Remove DB position
             try:
                 await self.db.remove_position(cid, token_id, current_pos)
             except Exception as e:
                 logger.warning(f"DB position update failed (non-fatal): {e}")
+
+            if not self.quiet and entry_price > 0:
+                pnl_style = "green" if gross_pnl >= 0 else "red"
+                console.print(
+                    f"  [{pnl_style}]P&L: ${gross_pnl:+.2f} "
+                    f"(entry ${entry_price:.2f} → exit ${fill_price:.2f})"
+                    f"{'  ✓ filled' if fill_verified else '  ⏳ pending'}[/{pnl_style}]"
+                )
 
             return True
 
