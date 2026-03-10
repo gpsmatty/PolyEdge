@@ -312,8 +312,7 @@ class MicroRunner:
         mode = "DRY RUN" if self.dry_run else ("AUTOPILOT" if self.auto_execute else "COPILOT")
         console.print(f"\n[bold green]Micro Sniper started in {mode} mode[/bold green]")
         console.print(
-            f"[dim]Tracking: {', '.join(s.upper() for s in self.config.symbols)} | "
-            f"Entry: momentum > {self.config.entry_threshold:.0%} | "
+            f"[dim]Entry: momentum > {self.config.entry_threshold:.0%} | "
             f"Flip: momentum > {self.config.flip_threshold:.0%} | "
             f"Max trades/window: {self.config.max_trades_per_window}[/dim]"
         )
@@ -345,6 +344,18 @@ class MicroRunner:
                 console.print(f"[green]Synced {synced} markets[/green]")
             except Exception as e:
                 console.print(f"[yellow]Sync failed ({e}) — using DB data[/yellow]")
+
+        # Narrow Binance feeds to ONLY symbols with matching markets.
+        # No point subscribing to ETH/SOL/XRP/DOGE streams when we're
+        # only trading BTC — saves bandwidth and latency.
+        active_symbols = list(self.updown_markets.keys())
+        if active_symbols and set(active_symbols) != set(self.agg_feed.symbols):
+            console.print(
+                f"[dim]Binance feeds narrowed to: "
+                f"{', '.join(s.replace('usdt','').upper() for s in active_symbols)}[/dim]"
+            )
+            self.agg_feed = BinanceAggTradeFeed(symbols=active_symbols)
+            self.ticker_feed = BinanceFeed(symbols=active_symbols)
 
         # Register aggTrade callback — this is the main eval loop
         self.agg_feed.on_any_trade(self._on_agg_trade)
