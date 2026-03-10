@@ -1068,8 +1068,14 @@ class MicroRunner:
                 console.print("[red]  Trade failed — no order ID returned[/red]")
 
         except Exception as e:
-            console.print(f"[red]  Execution error: {e}[/red]")
-            logger.error(f"Micro execution failed: {e}", exc_info=True)
+            err_msg = str(e)
+            if "fully filled" in err_msg or "FOK" in err_msg:
+                # FOK rejected — not enough liquidity at our price. Normal, just skip.
+                if not self.quiet:
+                    console.print("[dim]  FOK rejected — no liquidity, skipping[/dim]")
+            else:
+                console.print(f"[red]  Execution error: {e}[/red]")
+                logger.error(f"Micro execution failed: {e}", exc_info=True)
 
     async def _close_position(self, engine, opp: MicroOpportunity) -> bool:
         """Close an existing position by placing a FOK SELL order.
@@ -1168,8 +1174,12 @@ class MicroRunner:
             return fill_verified or True  # Optimistic — if order was placed, assume it worked
 
         except Exception as e:
-            console.print(f"[red]  Sell failed: {e}[/red]")
-            logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
+            err_msg = str(e)
+            if "fully filled" in err_msg or "FOK" in err_msg:
+                console.print(f"[yellow]  FOK sell rejected — no liquidity at ${sell_price:.2f}[/yellow]")
+            else:
+                console.print(f"[red]  Sell failed: {e}[/red]")
+                logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
             return False
 
     # ------------------------------------------------------------------
