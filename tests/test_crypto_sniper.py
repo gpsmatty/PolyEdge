@@ -122,6 +122,11 @@ THRESHOLD_BEARISH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+THRESHOLD_TOUCH_PATTERN = re.compile(
+    r"(?:reach|dip\s+to|hit)",
+    re.IGNORECASE,
+)
+
 BUCKET_RANGE_PATTERN = re.compile(
     r"between\s+[\$]?([\d,]+(?:\.\d+)?)\s+and\s+[\$]?([\d,]+(?:\.\d+)?)",
     re.IGNORECASE,
@@ -182,6 +187,64 @@ def _compute_bucket_probability(current_price, bucket_low, bucket_high, seconds_
     prob_above_low = _compute_threshold_probability(current_price, bucket_low, seconds_remaining, symbol)
     prob_above_high = _compute_threshold_probability(current_price, bucket_high, seconds_remaining, symbol)
     prob = prob_above_low - prob_above_high
+    return max(0.01, min(0.99, prob))
+
+
+def _compute_touch_probability_upper(current_price, barrier, seconds_remaining, symbol):
+    """P(max S_t >= barrier) — upper barrier touch probability."""
+    if current_price >= barrier:
+        return 0.99
+    if current_price <= 0 or barrier <= 0:
+        return 0.5
+    annual_vol = DEFAULT_ANNUAL_VOL.get(symbol, 0.70)
+    t_years = seconds_remaining / (365.25 * 24 * 3600)
+    if t_years <= 0:
+        return 0.01
+    a = math.log(barrier / current_price)
+    nu = -0.5 * annual_vol * annual_vol
+    sigma = annual_vol
+    st = sigma * math.sqrt(t_years)
+    if st <= 0:
+        return 0.01
+    d1 = (nu * t_years - a) / st
+    d2 = (-nu * t_years - a) / st
+    exp_arg = 2 * nu * a / (sigma * sigma)
+    if exp_arg > 500:
+        exp_term = float('inf')
+    elif exp_arg < -500:
+        exp_term = 0.0
+    else:
+        exp_term = math.exp(exp_arg)
+    prob = _normal_cdf(d1) + exp_term * _normal_cdf(d2)
+    return max(0.01, min(0.99, prob))
+
+
+def _compute_touch_probability_lower(current_price, barrier, seconds_remaining, symbol):
+    """P(min S_t <= barrier) — lower barrier touch probability."""
+    if current_price <= barrier:
+        return 0.99
+    if current_price <= 0 or barrier <= 0:
+        return 0.5
+    annual_vol = DEFAULT_ANNUAL_VOL.get(symbol, 0.70)
+    t_years = seconds_remaining / (365.25 * 24 * 3600)
+    if t_years <= 0:
+        return 0.01
+    a = math.log(barrier / current_price)
+    nu = -0.5 * annual_vol * annual_vol
+    sigma = annual_vol
+    st = sigma * math.sqrt(t_years)
+    if st <= 0:
+        return 0.01
+    d1 = (a - nu * t_years) / st
+    d2 = (a + nu * t_years) / st
+    exp_arg = 2 * nu * a / (sigma * sigma)
+    if exp_arg > 500:
+        exp_term = float('inf')
+    elif exp_arg < -500:
+        exp_term = 0.0
+    else:
+        exp_term = math.exp(exp_arg)
+    prob = _normal_cdf(d1) + exp_term * _normal_cdf(d2)
     return max(0.01, min(0.99, prob))
 
 
@@ -594,6 +657,136 @@ class TestThresholdProbability:
         # For a bearish market: P(YES) = 1 - prob_above = high
         p_yes_bearish = 1 - prob_above
         assert p_yes_bearish > 0.85
+
+
+class TestTouchDetection:
+    """Test that 'reach' and 'dip to' are correctly identified as touch markets."""
+
+    def test_reach_is_touch(self):
+        assert THRESHOLD_TOUCH_PATTERN.search("Will Bitcoin reach $85,000 in March?")
+
+    def test_dip_to_is_touch(self):
+        assert THRESHOLD_TOUCH_PATTERN.search("Will Bitcoin dip to $50,000 in March?")
+
+    def test_hit_is_touch(self):
+        assert THRESHOLD_TOUCH_PATTERN.search("Will Ethereum hit $3,000 this week?")
+
+    def test_above_not_touch(self):
+        assert not THRESHOLD_TOUCH_PATTERN.search(
+            "Will the price of Bitcoin be above $70,000 on March 10?"
+        )
+
+    def test_greater_than_not_touch(self):
+        assert not THRESHOLD_TOUCH_PATTERN.search(
+            "Will the price of Bitcoin be greater than $78,000 on March 10?"
+        )
+
+    def test_less_than_not_touch(self):
+        assert not THRESHOLD_TOUCH_PATTERN.search(
+            "Will the price of Bitcoin be less than $64,000 on March 11?"
+        )
+
+    def test_below_not_touch(self):
+        assert not THRESHOLD_TOUCH_PATTERN.search(
+            "Will the price of Ethereum be below $1,500 on March 12?"
+        )
+
+
+class TestTouchProbabilityUpper:
+    """Test the upper barrier (reach) touch probability model."""
+
+    def test_already_above_barrier(self):
+        # Price already above barrier — 99% touch
+        prob = _compute_touch_probability_upper(75000, 70000, 3600, "btcusdt")
+        assert prob == 0.99
+
+    def test_touch_always_gte_terminal(self):
+        """Touch probability must always be >= terminal probability."""
+        # BTC at 70k, strike 74k, 1 week
+        secs = 7 * 24 * 3600
+        p_terminal = _compute_threshold_probability(70000, 74000, secs, "btcusdt")
+        p_touch = _compute_touch_probability_upper(70000, 74000, secs, "btcusdt")
+        assert p_touch >= p_terminal
+
+    def test_touch_significantly_higher_than_terminal(self):
+        """For multi-day windows, touch should be notably higher than terminal."""
+        secs = 7 * 24 * 3600
+        p_terminal = _compute_threshold_probability(70000, 74000, secs, "btcusdt")
+        p_touch = _compute_touch_probability_upper(70000, 74000, secs, "btcusdt")
+        # Touch prob should be at least 15% higher (absolute) than terminal
+        assert p_touch - p_terminal > 0.15
+
+    def test_close_barrier_high_prob(self):
+        """BTC at $70k, barrier at $71k (1.4% away), 1 day — should be high."""
+        secs = 24 * 3600
+        prob = _compute_touch_probability_upper(70000, 71000, secs, "btcusdt")
+        assert prob > 0.60
+
+    def test_far_barrier_low_prob(self):
+        """BTC at $70k, barrier at $90k (28% away), 1 day — should be very low."""
+        secs = 24 * 3600
+        prob = _compute_touch_probability_upper(70000, 90000, secs, "btcusdt")
+        assert prob < 0.05
+
+    def test_more_time_higher_touch_prob(self):
+        """More time = higher chance of touching the barrier at some point."""
+        p_1h = _compute_touch_probability_upper(70000, 74000, 3600, "btcusdt")
+        p_1week = _compute_touch_probability_upper(70000, 74000, 7*24*3600, "btcusdt")
+        assert p_1week > p_1h
+
+    def test_expired(self):
+        prob = _compute_touch_probability_upper(70000, 74000, 0, "btcusdt")
+        assert prob == 0.01
+
+    def test_zero_price(self):
+        prob = _compute_touch_probability_upper(0, 74000, 3600, "btcusdt")
+        assert prob == 0.5
+
+
+class TestTouchProbabilityLower:
+    """Test the lower barrier (dip to) touch probability model."""
+
+    def test_already_below_barrier(self):
+        prob = _compute_touch_probability_lower(65000, 70000, 3600, "btcusdt")
+        assert prob == 0.99
+
+    def test_touch_always_gte_terminal(self):
+        """Touch probability of dipping must be >= terminal P(below)."""
+        secs = 7 * 24 * 3600
+        p_terminal_below = 1 - _compute_threshold_probability(70000, 68000, secs, "btcusdt")
+        p_touch = _compute_touch_probability_lower(70000, 68000, secs, "btcusdt")
+        assert p_touch >= p_terminal_below
+
+    def test_touch_significantly_higher_than_terminal(self):
+        """For multi-day windows, touch dip should be notably higher than terminal."""
+        secs = 7 * 24 * 3600
+        p_terminal_below = 1 - _compute_threshold_probability(70000, 68000, secs, "btcusdt")
+        p_touch = _compute_touch_probability_lower(70000, 68000, secs, "btcusdt")
+        assert p_touch - p_terminal_below > 0.15
+
+    def test_close_barrier_high_prob(self):
+        """BTC at $70k, barrier at $69k (1.4% below), 1 day — should be high."""
+        secs = 24 * 3600
+        prob = _compute_touch_probability_lower(70000, 69000, secs, "btcusdt")
+        assert prob > 0.60
+
+    def test_lower_barrier_easier_due_to_drift(self):
+        """GBM has negative log-drift, so lower barriers are slightly easier to reach."""
+        secs = 7 * 24 * 3600
+        # Same distance (5%) but upper vs lower
+        p_up = _compute_touch_probability_upper(70000, 73500, secs, "btcusdt")
+        p_down = _compute_touch_probability_lower(70000, 66500, secs, "btcusdt")
+        # Lower barrier should have equal or higher touch prob due to nu < 0
+        assert p_down >= p_up - 0.02  # Allow tiny floating point tolerance
+
+    def test_more_time_higher_touch_prob(self):
+        p_1h = _compute_touch_probability_lower(70000, 68000, 3600, "btcusdt")
+        p_1week = _compute_touch_probability_lower(70000, 68000, 7*24*3600, "btcusdt")
+        assert p_1week > p_1h
+
+    def test_expired(self):
+        prob = _compute_touch_probability_lower(70000, 68000, 0, "btcusdt")
+        assert prob == 0.01
 
 
 class TestBucketProbability:

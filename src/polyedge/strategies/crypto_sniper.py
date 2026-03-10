@@ -134,6 +134,16 @@ THRESHOLD_BEARISH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Detect touch/barrier markets ("reach", "dip to", "hit") vs terminal markets
+# ("be above", "be greater than", "be less than", "be below").
+# Touch markets resolve YES if price hits the level at ANY point during the window.
+# Terminal markets resolve based on price at expiry.
+# Polymarket resolution: touch markets use Binance 1-min candle High/Low.
+THRESHOLD_TOUCH_PATTERN = re.compile(
+    r"(?:reach|dip\s+to|hit)",
+    re.IGNORECASE,
+)
+
 # Extract "between X and Y" range from bucket markets
 BUCKET_RANGE_PATTERN = re.compile(
     r"between\s+[\$]?([\d,]+(?:\.\d+)?)\s+and\s+[\$]?([\d,]+(?:\.\d+)?)",
@@ -207,6 +217,7 @@ class ParsedCryptoMarket:
     symbol: str                           # Binance symbol e.g. "btcusdt"
     strike: Optional[float] = None        # For threshold: the price level
     is_bearish: bool = False              # True for "less than" / "dip to" thresholds
+    is_touch: bool = False                # True for "reach" / "dip to" (barrier/touch markets)
     bucket_low: Optional[float] = None    # For bucket: lower bound
     bucket_high: Optional[float] = None   # For bucket: upper bound
     bucket_direction: Optional[str] = None  # "above" or "below" for arrow buckets
@@ -297,9 +308,10 @@ class CryptoSniperStrategy(Strategy):
             if strike is None:
                 return None
             is_bearish = bool(THRESHOLD_BEARISH_PATTERN.search(market.question))
+            is_touch = bool(THRESHOLD_TOUCH_PATTERN.search(market.question))
             return ParsedCryptoMarket(
                 market_type=mtype, symbol=symbol, strike=strike,
-                is_bearish=is_bearish,
+                is_bearish=is_bearish, is_touch=is_touch,
             )
 
         if mtype == CryptoMarketType.BUCKET:
@@ -459,10 +471,16 @@ class CryptoSniperStrategy(Strategy):
     ) -> Optional[SniperOpportunity]:
         """Evaluate a threshold market.
 
+        Two resolution types:
+        - Touch/barrier ("reach", "dip to"): resolves YES if price hits the
+          level at ANY point during the window.  Uses first-passage probability.
+        - Terminal ("be above", "be greater than", "be less than"): resolves
+          based on price at expiry.  Uses log-normal terminal CDF.
+
         For bullish ("above", "greater than", "reach"):
-            YES = price > strike.  P(YES) = CDF model.
+            YES = price > strike.
         For bearish ("less than", "dip to"):
-            YES = price < strike.  P(YES) = 1 - CDF model.
+            YES = price < strike.
         """
         strike = parsed.strike
         if strike is None or strike <= 0:
@@ -472,19 +490,32 @@ class CryptoSniperStrategy(Strategy):
         if price <= 0:
             return None
 
-        # Compute P(price > strike at expiry) using log-normal model
-        prob_above = self._compute_threshold_probability(
-            current_price=price,
-            strike=strike,
-            seconds_remaining=seconds_remaining,
-            symbol=parsed.symbol,
-        )
+        t_years = seconds_remaining / (365.25 * 24 * 3600)
 
-        # For bearish markets ("less than", "dip to"), YES means price < strike
-        if parsed.is_bearish:
-            implied_yes_prob = 1 - prob_above
+        if parsed.is_touch:
+            # Touch/barrier market — use first-passage probability
+            if parsed.is_bearish:
+                # "dip to X" — YES if price touches X from above at any time
+                implied_yes_prob = self._compute_touch_probability_lower(
+                    current_price=price, barrier=strike,
+                    seconds_remaining=seconds_remaining, symbol=parsed.symbol,
+                )
+            else:
+                # "reach X" — YES if price touches X from below at any time
+                implied_yes_prob = self._compute_touch_probability_upper(
+                    current_price=price, barrier=strike,
+                    seconds_remaining=seconds_remaining, symbol=parsed.symbol,
+                )
         else:
-            implied_yes_prob = prob_above
+            # Terminal market — use log-normal terminal CDF
+            prob_above = self._compute_threshold_probability(
+                current_price=price, strike=strike,
+                seconds_remaining=seconds_remaining, symbol=parsed.symbol,
+            )
+            if parsed.is_bearish:
+                implied_yes_prob = 1 - prob_above
+            else:
+                implied_yes_prob = prob_above
 
         # Compare our implied YES probability to what market is showing
         if implied_yes_prob >= 0.5:
@@ -668,6 +699,115 @@ class CryptoSniperStrategy(Strategy):
         z = math.log(current_price / strike) / vol_t
 
         prob = _normal_cdf(z)
+        return max(0.01, min(0.99, prob))
+
+    def _compute_touch_probability_upper(
+        self,
+        current_price: float,
+        barrier: float,
+        seconds_remaining: float,
+        symbol: str,
+    ) -> float:
+        """Compute P(max S_t >= barrier) — upper barrier touch probability.
+
+        Uses the first-passage / reflection principle for GBM with zero drift.
+
+        In log-space X_t = log(S_t/S_0) is BM with drift nu = -sigma^2/2:
+          P(sup X_t >= a) = Phi((nu*T - a) / (sigma*sqrt(T)))
+                          + exp(2*nu*a / sigma^2) * Phi((-nu*T - a) / (sigma*sqrt(T)))
+
+        where a = log(barrier / current_price) > 0.
+
+        This is always >= the terminal probability P(S_T >= barrier), because
+        the price can touch the barrier during the window and then fall back.
+        """
+        if current_price >= barrier:
+            return 0.99  # Already above barrier
+        if current_price <= 0 or barrier <= 0:
+            return 0.5
+
+        annual_vol = DEFAULT_ANNUAL_VOL.get(symbol, 0.70)
+        t_years = seconds_remaining / (365.25 * 24 * 3600)
+        if t_years <= 0:
+            return 0.01
+
+        a = math.log(barrier / current_price)  # a > 0
+        nu = -0.5 * annual_vol * annual_vol
+        sigma = annual_vol
+        st = sigma * math.sqrt(t_years)
+
+        if st <= 0:
+            return 0.01
+
+        d1 = (nu * t_years - a) / st
+        d2 = (-nu * t_years - a) / st
+
+        # Guard against overflow in exp term
+        exp_arg = 2 * nu * a / (sigma * sigma)
+        if exp_arg > 500:
+            exp_term = float('inf')
+        elif exp_arg < -500:
+            exp_term = 0.0
+        else:
+            exp_term = math.exp(exp_arg)
+
+        prob = _normal_cdf(d1) + exp_term * _normal_cdf(d2)
+        return max(0.01, min(0.99, prob))
+
+    def _compute_touch_probability_lower(
+        self,
+        current_price: float,
+        barrier: float,
+        seconds_remaining: float,
+        symbol: str,
+    ) -> float:
+        """Compute P(min S_t <= barrier) — lower barrier touch probability.
+
+        Uses the first-passage / reflection principle for GBM with zero drift.
+
+        Derived via symmetry from the upper barrier formula: P(inf X_t <= a)
+        for a < 0 uses -X_t which has drift -nu.
+
+          P(inf X_t <= a) = Phi((a - nu*T) / (sigma*sqrt(T)))
+                          + exp(2*nu*a / sigma^2) * Phi((a + nu*T) / (sigma*sqrt(T)))
+
+        where a = log(barrier / current_price) < 0.
+
+        Note: for GBM with zero price drift, nu = -sigma^2/2 < 0, so the
+        log-price has a downward drift, making lower barriers slightly easier
+        to reach than upper barriers at the same distance.
+        """
+        if current_price <= barrier:
+            return 0.99  # Already below barrier
+        if current_price <= 0 or barrier <= 0:
+            return 0.5
+
+        annual_vol = DEFAULT_ANNUAL_VOL.get(symbol, 0.70)
+        t_years = seconds_remaining / (365.25 * 24 * 3600)
+        if t_years <= 0:
+            return 0.01
+
+        a = math.log(barrier / current_price)  # a < 0
+        nu = -0.5 * annual_vol * annual_vol
+        sigma = annual_vol
+        st = sigma * math.sqrt(t_years)
+
+        if st <= 0:
+            return 0.01
+
+        d1 = (a - nu * t_years) / st
+        d2 = (a + nu * t_years) / st
+
+        # Guard against overflow in exp term
+        exp_arg = 2 * nu * a / (sigma * sigma)
+        if exp_arg > 500:
+            exp_term = float('inf')
+        elif exp_arg < -500:
+            exp_term = 0.0
+        else:
+            exp_term = math.exp(exp_arg)
+
+        prob = _normal_cdf(d1) + exp_term * _normal_cdf(d2)
         return max(0.01, min(0.99, prob))
 
     def _compute_bucket_probability(

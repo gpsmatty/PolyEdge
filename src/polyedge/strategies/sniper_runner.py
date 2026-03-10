@@ -76,13 +76,21 @@ class SniperRunner:
         auto_execute: bool = False,
         dry_run: bool = False,
         verbose: bool = False,
+        quiet: bool = False,
     ):
         self.settings = settings
         self.client = client
         self.db = db
         self.auto_execute = auto_execute
         self.dry_run = dry_run
-        self.verbose = verbose or dry_run  # Always verbose in dry-run mode
+        # --quiet suppresses EVAL skip lines; --verbose forces them on.
+        # Default: verbose in dry-run, quiet in live modes.
+        if quiet:
+            self.verbose = False
+        elif verbose:
+            self.verbose = True
+        else:
+            self.verbose = dry_run  # Default: verbose only in dry-run
         self.running = False
 
         # Strategy
@@ -599,18 +607,33 @@ class SniperRunner:
 
         if parsed.market_type == CryptoMarketType.THRESHOLD:
             strike = parsed.strike or 0
-            prob_above = self.strategy._compute_threshold_probability(
-                current_price=price,
-                strike=strike,
-                seconds_remaining=remaining,
-                symbol=parsed.symbol,
-            )
-            if parsed.is_bearish:
-                implied_yes = 1 - prob_above
-                label = f"< ${strike:,.2f}"
+
+            if parsed.is_touch:
+                # Touch/barrier market — use first-passage probability
+                if parsed.is_bearish:
+                    implied_yes = self.strategy._compute_touch_probability_lower(
+                        current_price=price, barrier=strike,
+                        seconds_remaining=remaining, symbol=parsed.symbol,
+                    )
+                    label = f"DIP TO ${strike:,.2f}"
+                else:
+                    implied_yes = self.strategy._compute_touch_probability_upper(
+                        current_price=price, barrier=strike,
+                        seconds_remaining=remaining, symbol=parsed.symbol,
+                    )
+                    label = f"REACH ${strike:,.2f}"
             else:
-                implied_yes = prob_above
-                label = f"> ${strike:,.2f}"
+                # Terminal market — use log-normal terminal CDF
+                prob_above = self.strategy._compute_threshold_probability(
+                    current_price=price, strike=strike,
+                    seconds_remaining=remaining, symbol=parsed.symbol,
+                )
+                if parsed.is_bearish:
+                    implied_yes = 1 - prob_above
+                    label = f"< ${strike:,.2f}"
+                else:
+                    implied_yes = prob_above
+                    label = f"> ${strike:,.2f}"
 
             if implied_yes >= 0.5:
                 side_label, mkt_price = "YES", market.yes_price
