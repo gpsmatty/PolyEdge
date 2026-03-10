@@ -196,9 +196,9 @@ Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async pro
 1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket.
 2. **aggTrade callback** (every 5th trade tick, ~2-10 evals/sec) — On each Binance aggTrade, updates `MicroStructure` rolling flow windows (5s/15s/30s OFI, VWAP drift, trade intensity). Evaluates only the current (first) window — rest are pre-loaded for seamless hopping.
 3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 40% OFI_5s + 30% OFI_15s + 20% VWAP drift + 10% intensity surge.
-4. **Entry** — When `|momentum| > 0.40` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.15-0.80, enter a position (BUY YES if bullish, BUY NO if bearish).
+4. **Entry** — When `|momentum| > 0.40` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.20-0.70, enter a position (BUY YES if bullish, BUY NO if bearish). **30s trend filter**: if entry direction disagrees with the 30-second OFI trend, requires higher threshold of 0.55 (counter_trend_threshold) instead of 0.40. This kills counter-trend entries that are the #1 source of losses.
 5. **Exit** — When momentum reverses past exit_threshold (0.15) against our position, or momentum drops below hold_threshold (0.08) even if aligned, or force exit with <8s remaining.
-6. **Flip** — When momentum reverses past flip_threshold (0.50) with confidence > 0.50 and at least 25 trades in window, close current position and open opposite side. Flips require higher thresholds because they're expensive (close + reopen).
+6. **Flip** — Disabled by default (`enable_flips=false`). Strong reversals trigger EXIT instead. When enabled: momentum reverses past flip_threshold (0.50) with confidence > 0.50 and at least 25 trades → close + open opposite side.
 7. **Window hopping** — Pre-loads 10 upcoming windows. When current window expires, instantly promotes next window. Refetches from API when ≤3 windows remain. Uses `asyncio.Lock` to prevent concurrent API fetches.
 8. **Gap detection** — If >5 seconds pass between aggTrade ticks (WebSocket disconnect), resets all flow windows to avoid trading on stale momentum.
 9. **Trade cooldown** — 10 seconds between trades on the same market to prevent whipsaw.
@@ -209,19 +209,22 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 **Micro sniper config keys** (all under `strategies.micro_sniper.*`):
 - `enabled` (bool, default true)
 - `symbols` (list[str], default ["btcusdt"])
-- `entry_threshold` (float, default 0.40)
+- `entry_threshold` (float, default 0.40) — momentum threshold for with-trend entries
+- `counter_trend_threshold` (float, default 0.55) — higher bar for entries against the 30s trend
 - `exit_threshold` (float, default 0.15)
 - `hold_threshold` (float, default 0.08)
-- `flip_threshold` (float, default 0.50)
+- `enable_flips` (bool, default false) — disabled by default, strong reversals just EXIT
+- `flip_threshold` (float, default 0.50) — only used if enable_flips=true
 - `flip_min_confidence` (float, default 0.50)
 - `min_confidence` (float, default 0.40)
 - `min_trades_in_window` (int, default 10)
 - `min_trades_for_flip` (int, default 25)
 - `min_seconds_remaining` (float, default 15.0)
 - `force_exit_seconds` (float, default 8.0)
-- `min_entry_price` (float, default 0.15)
-- `max_entry_price` (float, default 0.80)
-- `max_position_per_trade` (float, default 0.03 = 3% of bankroll)
+- `min_entry_price` (float, default 0.20) — raised from 0.15, don't fight the market
+- `max_entry_price` (float, default 0.70) — lowered from 0.80, avoid overpaying
+- `max_position_per_trade` (float, default 0.03 = 3% of bankroll) — used if fixed_position_usd is 0
+- `fixed_position_usd` (float, default 10.0) — fixed $ per trade, 0 = use Kelly sizing
 - `max_trades_per_window` (int, default 50)
 - `min_liquidity` (float, default 500)
 
