@@ -28,7 +28,7 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger("polyedge.binance_feed")
 
-BINANCE_WS_BASE = "wss://stream.binance.com:9443"
+BINANCE_WS_BASE = "wss://stream.binance.us:9443"
 
 # Symbols we care about — these map to Polymarket crypto markets
 DEFAULT_SYMBOLS = ["btcusdt", "ethusdt", "solusdt"]
@@ -221,7 +221,13 @@ class BinanceFeed:
 
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        if self._ws is None:
+            return False
+        try:
+            return self._ws.state.name == "OPEN"
+        except AttributeError:
+            # Fallback for older websockets versions
+            return getattr(self._ws, "open", False)
 
     async def _connect_and_consume(self):
         """Single connection lifecycle."""
