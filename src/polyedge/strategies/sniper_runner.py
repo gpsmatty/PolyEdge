@@ -1,6 +1,13 @@
 """Sniper Runner — real-time loop that connects Binance prices to ALL Polymarket
 crypto markets and executes sniper trades.
 
+Both price feeds are real-time:
+- Binance WebSocket: live crypto spot prices (~100ms updates)
+- Polymarket WebSocket: live market prices (best bid/ask, trades)
+
+This ensures edges are computed against REAL current prices, not stale
+60-second-old Gamma API snapshots.
+
 Handles three market types via a unified pipeline:
 1. Up/Down — short-duration direction bets (evaluated on every price tick)
 2. Threshold — "above X" price level bets (evaluated on price ticks + periodic)
@@ -31,6 +38,7 @@ from polyedge.core.db import Database
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_feed import BinanceFeed, PriceSnapshot
 from polyedge.data.markets import fetch_active_markets, fetch_all_markets
+from polyedge.data.ws_feed import MarketFeed, EVENT_BEST_BID_ASK, EVENT_LAST_TRADE
 from polyedge.risk.sizing import calculate_position_size
 from polyedge.strategies.crypto_sniper import (
     CryptoSniperStrategy,
@@ -52,7 +60,12 @@ SLOW_EVAL_INTERVAL = 30  # seconds
 
 
 class SniperRunner:
-    """Persistent real-time loop for crypto sniper strategy."""
+    """Persistent real-time loop for crypto sniper strategy.
+
+    Uses dual WebSocket feeds:
+    - Binance: real-time crypto spot prices (the "oracle")
+    - Polymarket: real-time market prices (what we're trading against)
+    """
 
     def __init__(
         self,
@@ -73,14 +86,20 @@ class SniperRunner:
         self.strategy = CryptoSniperStrategy(settings)
         sniper_config = settings.strategies.crypto_sniper
 
-        # Binance price feed
+        # Binance price feed (crypto spot prices)
         self.binance = BinanceFeed(symbols=sniper_config.symbols)
+
+        # Polymarket price feed (market prices — YES/NO)
+        self.poly_feed = MarketFeed(settings)
 
         # Active crypto markets grouped by type
         # symbol -> list of (market, parsed) for up/down (tick-evaluated)
         self.updown_markets: dict[str, list[tuple[Market, ParsedCryptoMarket]]] = {}
         # All threshold/bucket markets (periodically evaluated)
         self.slow_markets: list[tuple[Market, ParsedCryptoMarket]] = []
+
+        # Lookup: token_id -> (Market, "yes" | "no") for WebSocket price updates
+        self._token_to_market: dict[str, tuple[Market, str]] = {}
 
         # Track which markets we've already traded to avoid double-entry
         self._traded_markets: set[str] = set()
@@ -90,6 +109,7 @@ class SniperRunner:
         self.trades_executed = 0
         self.total_edge_captured = 0.0
         self._total_markets = 0
+        self._ws_price_updates = 0
 
     async def run(self):
         """Main sniper loop."""
@@ -105,11 +125,15 @@ class SniperRunner:
         )
         console.print(
             f"[dim]Market types: Up/Down + Threshold + Bucket | "
-            f"Fetching all crypto markets from Polymarket[/dim]"
+            f"Dual WebSocket: Binance + Polymarket real-time[/dim]"
         )
 
-        # Register price callback for up/down opportunity detection
+        # Register Binance price callback for up/down opportunity detection
         self.binance.on_any_price(self._on_price_update)
+
+        # Register Polymarket WebSocket callbacks for live market prices
+        self.poly_feed.on(EVENT_BEST_BID_ASK, self._on_poly_price)
+        self.poly_feed.on(EVENT_LAST_TRADE, self._on_poly_trade)
 
         # Start tasks
         tasks = [
@@ -118,6 +142,9 @@ class SniperRunner:
             asyncio.create_task(self._slow_eval_loop()),
             asyncio.create_task(self._status_loop()),
         ]
+        # Polymarket WS starts after first market refresh (needs token IDs)
+
+        poly_task = None
 
         try:
             # Wait for Binance connection before proceeding
@@ -136,12 +163,73 @@ class SniperRunner:
         finally:
             self.running = False
             await self.binance.stop()
+            await self.poly_feed.stop()
             for t in tasks:
                 t.cancel()
 
     async def stop(self):
         self.running = False
         await self.binance.stop()
+        await self.poly_feed.stop()
+
+    # ------------------------------------------------------------------
+    # Polymarket WebSocket callbacks — update market prices in real-time
+    # ------------------------------------------------------------------
+
+    async def _on_poly_price(self, event: dict):
+        """Handle Polymarket best_bid_ask event — update market YES/NO prices."""
+        asset_id = event.get("asset_id", "")
+        entry = self._token_to_market.get(asset_id)
+        if not entry:
+            return
+
+        market, side = entry
+        best_bid = float(event.get("best_bid", 0))
+        best_ask = float(event.get("best_ask", 0))
+
+        # Use midpoint as the current price (better than stale Gamma API)
+        if best_bid > 0 and best_ask > 0:
+            mid = (best_bid + best_ask) / 2
+        elif best_bid > 0:
+            mid = best_bid
+        elif best_ask > 0:
+            mid = best_ask
+        else:
+            return
+
+        if side == "yes":
+            market.yes_price = mid
+            market.no_price = 1.0 - mid
+        else:
+            market.no_price = mid
+            market.yes_price = 1.0 - mid
+
+        self._ws_price_updates += 1
+
+    async def _on_poly_trade(self, event: dict):
+        """Handle Polymarket last_trade_price event — update on actual trades."""
+        asset_id = event.get("asset_id", "")
+        entry = self._token_to_market.get(asset_id)
+        if not entry:
+            return
+
+        market, side = entry
+        price = float(event.get("price", 0))
+        if price <= 0:
+            return
+
+        if side == "yes":
+            market.yes_price = price
+            market.no_price = 1.0 - price
+        else:
+            market.no_price = price
+            market.yes_price = 1.0 - price
+
+        self._ws_price_updates += 1
+
+    # ------------------------------------------------------------------
+    # Market refresh
+    # ------------------------------------------------------------------
 
     async def _market_refresh_loop(self):
         """Periodically fetch active crypto markets from Polymarket."""
@@ -172,6 +260,10 @@ class SniperRunner:
         self.updown_markets.clear()
         self.slow_markets.clear()
 
+        # Build token -> market lookup for WebSocket price updates
+        old_tokens = set(self._token_to_market.keys())
+        self._token_to_market.clear()
+
         for market in crypto:
             parsed = self.strategy.parse_market(market)
             if not parsed:
@@ -180,6 +272,13 @@ class SniperRunner:
             # Only track markets with symbols we're actually streaming from Binance
             if parsed.symbol not in self.settings.strategies.crypto_sniper.symbols:
                 continue
+
+            # Register token IDs for WebSocket price tracking
+            if len(market.clob_token_ids) >= 2:
+                self._token_to_market[market.clob_token_ids[0]] = (market, "yes")
+                self._token_to_market[market.clob_token_ids[1]] = (market, "no")
+            elif len(market.clob_token_ids) == 1:
+                self._token_to_market[market.clob_token_ids[0]] = (market, "yes")
 
             if parsed.market_type == CryptoMarketType.UP_DOWN:
                 if parsed.symbol not in self.updown_markets:
@@ -198,6 +297,21 @@ class SniperRunner:
         n_slow = len(self.slow_markets)
         self._total_markets = n_updown + n_slow
 
+        # Subscribe to new token IDs on the Polymarket WebSocket
+        new_tokens = set(self._token_to_market.keys())
+        if new_tokens:
+            if not self.poly_feed.is_connected:
+                # First time — start the WS with all token IDs
+                asyncio.create_task(self._start_poly_feed(list(new_tokens)))
+            else:
+                # Already connected — subscribe to new tokens, unsubscribe old
+                to_add = new_tokens - old_tokens
+                to_remove = old_tokens - new_tokens
+                if to_remove:
+                    await self.poly_feed.unsubscribe(list(to_remove))
+                if to_add:
+                    await self.poly_feed.subscribe(list(to_add))
+
         if self._total_markets > 0:
             parts = []
             if n_updown > 0:
@@ -208,7 +322,24 @@ class SniperRunner:
                 parts.append(f"Up/Down: {ud_str}")
             if n_slow > 0:
                 parts.append(f"Threshold/Bucket: {n_slow}")
-            logger.info(f"Tracking {self._total_markets} crypto markets — {' | '.join(parts)}")
+            logger.info(
+                f"Tracking {self._total_markets} crypto markets — {' | '.join(parts)} "
+                f"| {len(new_tokens)} tokens on WS"
+            )
+
+    async def _start_poly_feed(self, token_ids: list[str]):
+        """Start the Polymarket WebSocket feed."""
+        try:
+            console.print(
+                f"[dim]Polymarket WS: subscribing to {len(token_ids)} tokens[/dim]"
+            )
+            await self.poly_feed.start(token_ids)
+        except Exception as e:
+            logger.error(f"Polymarket WebSocket failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Binance price callback — evaluate up/down markets
+    # ------------------------------------------------------------------
 
     async def _on_price_update(self, snapshot: PriceSnapshot):
         """Called on every Binance price tick — evaluate up/down markets."""
@@ -397,9 +528,11 @@ class SniperRunner:
                 )
                 n_updown = sum(len(v) for v in self.updown_markets.values())
                 n_slow = len(self.slow_markets)
+                poly_status = "live" if self.poly_feed.is_connected else "off"
                 console.print(
                     f"[dim]{price_str} | "
                     f"Markets: {n_updown} ud + {n_slow} th/bk | "
+                    f"Poly WS: {poly_status} ({self._ws_price_updates} updates) | "
                     f"Opps: {self.opportunities_seen} | "
                     f"Trades: {self.trades_executed}[/dim]"
                 )

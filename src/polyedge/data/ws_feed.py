@@ -305,4 +305,9 @@ class MarketFeed:
 
     @property
     def is_connected(self) -> bool:
-        return self._ws is not None and self._ws.open
+        if self._ws is None:
+            return False
+        try:
+            return self._ws.state.name == "OPEN"
+        except AttributeError:
+            return getattr(self._ws, "open", False)
