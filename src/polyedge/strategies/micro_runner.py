@@ -149,27 +149,94 @@ class MicroRunner:
         self._trade_cooldown: float = 3.0  # seconds between trades on same market
 
     async def _quick_sync(self):
-        """Fast targeted API fetch — only grabs 5 pages (500 markets) instead of
-        the full 10,000. BTC/ETH/SOL 5-min markets have massive volume so they
-        appear in the first few pages when sorted by volume. Takes ~2-3 seconds
-        instead of 30-60 seconds for a full sync.
+        """Targeted API fetch for crypto 5-min markets.
+
+        The generic volume-sorted fetch misses short-duration crypto markets
+        because they're buried behind high-volume political markets. Instead,
+        sort by endDate ascending (soonest-ending = currently live) and page
+        through until we find matches. Typically finds them within 2-5 pages.
         """
-        from polyedge.data.markets import fetch_all_markets
+        import aiohttp
+        from polyedge.data.markets import _parse_market
 
-        console.print("[dim]Quick fetch (500 markets)...[/dim]")
-        markets = await fetch_all_markets(
-            self.settings,
-            min_liquidity=0,
-            max_pages=5,  # 500 markets max — enough for current crypto windows
-        )
+        gamma_url = self.settings.polymarket.gamma_url
+        found: list[Market] = []
+        batch_size = 100
 
-        if not markets:
-            console.print("[yellow]Quick fetch returned 0 markets[/yellow]")
+        console.print("[dim]Targeted fetch (sorting by endDate)...[/dim]")
+
+        # Fetch markets sorted by endDate ascending — currently-live markets
+        # appear first since they expire soonest
+        for page in range(20):  # Up to 2000 markets, usually find matches in <5 pages
+            url = f"{gamma_url}/markets"
+            params = {
+                "limit": batch_size,
+                "offset": page * batch_size,
+                "active": "true",
+                "closed": "false",
+                "order": "endDate",
+                "ascending": "true",
+            }
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params) as resp:
+                        if resp.status != 200:
+                            logger.warning(f"Gamma API error: {resp.status}")
+                            break
+                        data = await resp.json()
+            except Exception as e:
+                logger.warning(f"Quick sync page {page} failed: {e}")
+                break
+
+            if not data:
+                break
+
+            # Parse and check for matches
+            page_markets = []
+            for item in data:
+                try:
+                    m = _parse_market(item)
+                    page_markets.append(m)
+                except (KeyError, ValueError):
+                    continue
+
+            found.extend(page_markets)
+
+            # Check if we have any matching crypto markets yet
+            matches = self._count_filter_matches(page_markets)
+            if matches > 0:
+                console.print(
+                    f"[green]Found {matches} matching markets on page {page + 1} "
+                    f"({len(found)} total fetched)[/green]"
+                )
+                # Grab one more page to get upcoming windows too
+                page += 1
+                params["offset"] = page * batch_size
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as resp:
+                            if resp.status == 200:
+                                extra = await resp.json()
+                                for item in extra:
+                                    try:
+                                        found.append(_parse_market(item))
+                                    except (KeyError, ValueError):
+                                        continue
+                except Exception:
+                    pass
+                break
+
+            if len(data) < batch_size:
+                break  # Last page
+
+        if not found:
+            console.print("[yellow]Targeted fetch returned 0 markets[/yellow]")
             return
 
-        # Upsert just these markets to DB
+        # Upsert to DB
         market_dicts = []
-        for m in markets:
+        for m in found:
             market_dicts.append({
                 "condition_id": m.condition_id,
                 "question": m.question,
@@ -189,7 +256,23 @@ class MicroRunner:
             })
 
         await self.db.bulk_upsert_markets(market_dicts)
-        console.print(f"[green]Quick synced {len(markets)} markets[/green]")
+        console.print(f"[green]Synced {len(found)} markets to DB[/green]")
+
+    def _count_filter_matches(self, markets: list[Market]) -> int:
+        """Count how many markets match the current filter + crypto pattern."""
+        count = 0
+        now = datetime.now(timezone.utc)
+        for m in markets:
+            if not m.end_date or m.end_date <= now:
+                continue
+            if not UP_DOWN_PATTERN.search(m.question):
+                continue
+            if self._filter_words:
+                haystack = f"{m.question.lower()} {(m.slug or '').lower()}"
+                if not all(w in haystack for w in self._filter_words):
+                    continue
+            count += 1
+        return count
 
     async def run(self):
         """Main micro sniper loop."""
