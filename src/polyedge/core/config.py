@@ -160,10 +160,10 @@ class WeatherSniperConfig(BaseModel):
 class MicroSniperConfig(BaseModel):
     enabled: bool = True
     symbols: list[str] = Field(default_factory=lambda: ["btcusdt"])
-    entry_threshold: float = 0.40          # Momentum signal threshold to enter (raised from 0.25 — less noise)
-    counter_trend_threshold: float = 0.55  # Higher bar for entries against 30s trend (kills counter-trend losers)
-    exit_threshold: float = 0.15           # Reverse momentum threshold to exit
-    hold_threshold: float = 0.08           # Below this (aligned), exit for weak signal
+    entry_threshold: float = 0.55          # Momentum signal threshold to enter (raised from 0.40 — avoid sideways noise)
+    counter_trend_threshold: float = 0.70  # Higher bar for entries against 30s trend (kills counter-trend losers)
+    exit_threshold: float = 0.20           # Reverse momentum threshold to exit (raised from 0.15 — give trades room)
+    hold_threshold: float = 0.10           # Below this (aligned), exit for weak signal
     enable_flips: bool = False             # Flips disabled — marginal profitability, strong reversals just EXIT
     flip_threshold: float = 0.50           # Reverse momentum threshold to flip (only if enable_flips=True)
     flip_min_confidence: float = 0.50      # Min confidence to flip
@@ -178,7 +178,7 @@ class MicroSniperConfig(BaseModel):
     fixed_position_usd: float = 10.0       # Fixed $ per trade — simpler than Kelly for micro. 0 = use Kelly sizing
     max_trades_per_window: int = 50        # Max trades in a single 5-min window
     min_liquidity: float = 500             # Min market liquidity to trade
-    dead_market_band: float = 0.02         # Skip entry when YES is within this band of 0.50 (market not reacting)
+    dead_market_band: float = 0.06         # Skip entry when YES is within this band of 0.50 (raised from 0.02 — skip sideways markets)
 
 
 class MarketMakerConfig(BaseModel):

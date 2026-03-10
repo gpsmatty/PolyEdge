@@ -1011,7 +1011,7 @@ class MicroRunner:
         # place_fok_order takes USD amount directly — SDK handles rounding to avoid
         # the "invalid amounts" error where maker_amount has >2 decimal places.
         price = opp.market_price
-        entry_price = min(round(price + 0.05, 2), 0.99)  # Pay up to 5c more for instant fill
+        entry_price = min(round(price + 0.02, 2), 0.99)  # Pay up to 2c more for instant fill
         size = round(size_usd / entry_price, 2) if entry_price > 0 else 0
 
         signal = self.strategy.opportunity_to_signal(opp)
@@ -1112,10 +1112,11 @@ class MicroRunner:
             console.print("[red]  No token ID — can't close position[/red]")
             return False
 
-        # Aggressive FOK sell price: 5 cents below market for instant fill.
-        # FOK will fill at best available bid, not necessarily our limit price.
-        # The limit just sets the floor — "fill at best bid, but not below this".
-        sell_price = max(0.01, round(price - 0.05, 2))
+        # Sell price floor: 2c below market. FOK fills at best available bid
+        # but won't go below this floor. Keep it tight to avoid giving away
+        # profits on exit. If FOK rejects, we retry on next eval tick when
+        # the book refreshes — better than panic-selling 10c below market.
+        sell_price = max(0.01, round(price - 0.02, 2))
 
         # Get entry price from DB for P&L calculation
         entry_price = 0.0
@@ -1178,11 +1179,12 @@ class MicroRunner:
                 console.print(f"  [dim]Allowance refresh failed: {e}[/dim]")
 
         # Check order book bid depth from WebSocket to see what's available.
-        # Bids = people willing to buy our tokens. Walk the book to find
-        # how much we can sell and at what weighted-average price.
+        # Bids = people willing to buy our tokens.
         book = self.poly_feed.books.get(token_id)
+        best_bid = sell_price  # fallback to our floor
         available_at_floor = 0.0
         if book and book.bids:
+            best_bid = book.bids[0].price  # highest bid in the book
             for bid in book.bids:
                 if bid.price >= sell_price:
                     available_at_floor += bid.size
@@ -1191,65 +1193,45 @@ class MicroRunner:
                 bid_str = " | ".join(f"${b.price:.2f}×{b.size:.0f}" for b in top_bids)
                 console.print(f"  [dim]Book bids: {bid_str} — {available_at_floor:.0f} shares above ${sell_price:.2f}[/dim]")
 
-        # Sell in chunks if needed. FOK requires the full amount to fill,
-        # so if our position > book depth, split into what's available.
+        # Use best bid minus 1c as sell price if it's better than our floor.
+        # This way we sell near market instead of panic-selling at floor.
+        effective_sell = max(sell_price, round(best_bid - 0.01, 2))
+
+        # Single FOK attempt — don't halve and retry at worse prices.
+        # If rejected, we'll retry on next eval tick with a fresh book.
         remaining = size
         total_sold = 0.0
         total_proceeds = 0.0
-        sell_attempts = 0
-        max_attempts = 3  # Don't spam the API
 
-        while remaining > 0.5 and sell_attempts < max_attempts:
-            sell_attempts += 1
-            # Sell the smaller of: what we have left, or what the book shows.
-            # If we can't see the book, just try the full amount.
-            chunk = remaining
-            if available_at_floor > 0 and available_at_floor < remaining:
-                chunk = round(min(available_at_floor, remaining), 2)
-                if chunk < 0.5:
-                    break  # Not enough liquidity, stop trying
+        try:
+            chunk = int(remaining * 100) / 100  # truncate, don't round
+            result = self.client.place_fok_order(
+                token_id=token_id,
+                side="SELL",
+                amount=chunk,
+                price=effective_sell,
+            )
+            order_id = result.get("orderID", result.get("id", ""))
+            total_sold = chunk
+            total_proceeds = chunk * effective_sell
+            remaining = 0
 
-            chunk = round(chunk, 2)
-
-            try:
-                result = self.client.place_fok_order(
-                    token_id=token_id,
-                    side="SELL",
-                    amount=chunk,
-                    price=sell_price,
+            if not self.quiet:
+                console.print(
+                    f"[yellow]  SOLD {current_pos.upper()} {chunk:.1f} @ ${effective_sell:.2f} "
+                    f"— Order: {order_id}[/yellow]"
                 )
-                order_id = result.get("orderID", result.get("id", ""))
-                total_sold += chunk
-                total_proceeds += chunk * sell_price
-                remaining = round(remaining - chunk, 2)
 
+        except Exception as e:
+            err_msg = str(e)
+            if "fully filled" in err_msg or "FOK" in err_msg:
                 if not self.quiet:
-                    console.print(
-                        f"[yellow]  SOLD {current_pos.upper()} {chunk:.1f} @ ${sell_price:.2f} "
-                        f"— Order: {order_id}[/yellow]"
-                    )
-
-            except Exception as e:
-                err_msg = str(e)
-                if "fully filled" in err_msg or "FOK" in err_msg:
-                    # FOK rejected — try a smaller chunk or lower price
-                    if chunk > 2.0:
-                        # Try half the chunk
-                        available_at_floor = chunk / 2
-                        if not self.quiet:
-                            console.print(f"[yellow]  FOK rejected at {chunk:.1f} — retrying smaller[/yellow]")
-                        continue
-                    else:
-                        if not self.quiet:
-                            console.print(f"[yellow]  FOK sell rejected — no liquidity at ${sell_price:.2f}[/yellow]")
-                        break
-                elif "not enough balance" in err_msg:
-                    console.print(f"[red]  Sell failed: not enough balance/allowance[/red]")
-                    break
-                else:
-                    console.print(f"[red]  Sell failed: {e}[/red]")
-                    logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
-                    break
+                    console.print(f"[yellow]  FOK sell rejected @ ${effective_sell:.2f} — will retry next tick[/yellow]")
+            elif "not enough balance" in err_msg:
+                console.print(f"[red]  Sell failed: not enough balance/allowance[/red]")
+            else:
+                console.print(f"[red]  Sell failed: {e}[/red]")
+                logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
 
         if total_sold > 0:
             fill_price = total_proceeds / total_sold if total_sold > 0 else sell_price
