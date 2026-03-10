@@ -409,10 +409,11 @@ class WeatherRunner:
         size = size_usd / price if price > 0 else 0
 
         try:
+            # Side is always "BUY" for entry — token_id determines YES vs NO.
             order_id = await engine.place_order(
                 market=opp.market,
                 token_id=token_id,
-                side=opp.side.value,
+                side="BUY",
                 price=price,
                 size=size,
                 amount_usd=size_usd,

@@ -21,8 +21,19 @@ from polyedge.core.config import Settings
 
 
 def get_poly_side(side: str) -> str:
-    """Convert our side enum to py-clob-client side constant."""
-    return BUY if side.upper() in ("YES", "BUY") else SELL
+    """Convert side to py-clob-client BUY/SELL constant.
+
+    Accepts "BUY" or "SELL" directly. Legacy "YES"/"NO" mapping is intentionally
+    removed — callers must pass "BUY" or "SELL" explicitly to avoid the bug where
+    "NO" was silently mapped to SELL (causing BUY NO orders to fail).
+    """
+    s = side.upper()
+    if s in ("BUY", "YES"):
+        return BUY
+    elif s in ("SELL", "NO"):
+        return SELL
+    else:
+        raise ValueError(f"Invalid side '{side}', expected 'BUY' or 'SELL'")
 
 
 class PolyClient:

@@ -1004,10 +1004,12 @@ class MicroRunner:
         signal = self.strategy.opportunity_to_signal(opp)
 
         try:
+            # Side is always "BUY" for entry — the token_id determines YES vs NO.
+            # opp.side.value is "YES"/"NO" but the CLOB expects "BUY"/"SELL".
             order_id = await engine.place_order(
                 market=opp.market,
                 token_id=token_id,
-                side=opp.side.value,
+                side="BUY",
                 price=entry_price,
                 size=size,
                 amount_usd=size_usd,
