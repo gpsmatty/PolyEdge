@@ -242,9 +242,9 @@ class MicroRunner:
 
         if not found:
             console.print("[yellow]Targeted fetch returned 0 markets[/yellow]")
-            return
+            return []
 
-        # Upsert to DB
+        # Upsert to DB for persistence
         market_dicts = []
         for m in found:
             market_dicts.append({
@@ -265,8 +265,13 @@ class MicroRunner:
                 "raw": m.raw or {},
             })
 
-        await self.db.bulk_upsert_markets(market_dicts)
-        console.print(f"[green]Synced {len(found)} markets to DB[/green]")
+        try:
+            await self.db.bulk_upsert_markets(market_dicts)
+        except Exception as e:
+            logger.warning(f"DB upsert failed (non-fatal): {e}")
+
+        console.print(f"[green]Fetched {len(found)} markets[/green]")
+        return found
 
     def _count_filter_matches(self, markets: list[Market]) -> int:
         """Count how many markets match the current filter + crypto pattern."""
@@ -316,10 +321,11 @@ class MicroRunner:
             console.print("[dim]Loading markets from DB...[/dim]")
             await self._refresh_markets()
             if self._total_markets == 0:
-                console.print("[yellow]No matching markets in DB — quick API fetch...[/yellow]")
+                console.print("[yellow]No matching markets in DB — fetching from API...[/yellow]")
                 try:
-                    await self._quick_sync()
-                    await self._refresh_markets()
+                    fetched = await self._quick_sync()
+                    if fetched:
+                        await self._refresh_markets(prefetched=fetched)
                 except Exception as e:
                     console.print(f"[yellow]Quick fetch failed ({e})[/yellow]")
         else:
@@ -489,7 +495,10 @@ class MicroRunner:
                 elif self._total_markets == 0:
                     # Quick targeted fetch when filtered and out of windows
                     try:
-                        await self._quick_sync()
+                        fetched = await self._quick_sync()
+                        if fetched:
+                            await self._refresh_markets(prefetched=fetched)
+                            continue
                     except Exception as e:
                         logger.warning(f"Quick sync failed: {e}")
 
@@ -499,8 +508,11 @@ class MicroRunner:
             interval = MARKET_REFRESH_INTERVAL_FILTERED if self.market_filter else MARKET_REFRESH_INTERVAL
             await asyncio.sleep(interval)
 
-    async def _refresh_markets(self):
-        """Load up/down crypto markets from DB.
+    async def _refresh_markets(self, prefetched: list[Market] | None = None):
+        """Load up/down crypto markets.
+
+        If `prefetched` is provided, use those directly (from _quick_sync).
+        Otherwise fall back to reading from DB via the indexer.
 
         Only keeps markets that are currently live — end_date in the future.
         For each symbol, picks the NEAREST expiring window (the one that's
@@ -508,18 +520,17 @@ class MicroRunner:
         """
         now = datetime.now(timezone.utc)
 
-        # Load ALL markets from DB with no liquidity filter — 5-min crypto
-        # markets can have low reported liquidity despite massive activity.
-        # Skip find_crypto_markets() which has extra filters from the regular
-        # sniper that don't apply here.
-        try:
-            all_markets = await self.indexer.get_markets(
-                min_liquidity=0,
-                limit=5000,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to load markets: {e}")
-            return
+        if prefetched is not None:
+            all_markets = prefetched
+        else:
+            try:
+                all_markets = await self.indexer.get_markets(
+                    min_liquidity=0,
+                    limit=5000,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load markets: {e}")
+                return
 
         # Simple filter: UP_DOWN_PATTERN + user filter + live (not expired)
         candidates: dict[str, list[tuple[Market, ParsedCryptoMarket]]] = {}
@@ -678,8 +689,9 @@ class MicroRunner:
                 # DB doesn't have next window yet — quick fetch from API
                 console.print("[yellow]Fetching next window from API...[/yellow]")
                 try:
-                    await self._quick_sync()
-                    await self._refresh_markets()
+                    fetched = await self._quick_sync()
+                    if fetched:
+                        await self._refresh_markets(prefetched=fetched)
                 except Exception as e:
                     logger.warning(f"Hop sync failed: {e}")
 
