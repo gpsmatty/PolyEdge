@@ -239,9 +239,19 @@ class MicroSniperStrategy:
         # Is momentum aligned with our position?
         aligned = (holding_yes and is_bullish) or (not holding_yes and not is_bullish)
 
+        # Guard: don't act on sparse data — OFI ±1.00 with only 1-2 trades
+        # is noise, not momentum. Require minimum trade activity for flip/exit
+        # signals just like we do for entry.
+        if micro.flow_15s.total_count < self.config.min_trades_in_window:
+            return None
+
         # --- FLIP: strong reversal ---
+        # Flips are expensive (close + reopen) so require more trade activity
+        has_enough_trades_for_flip = (
+            micro.flow_15s.total_count >= self.config.min_trades_for_flip
+        )
         if not aligned and abs_momentum >= self.config.flip_threshold:
-            if confidence >= self.config.flip_min_confidence:
+            if confidence >= self.config.flip_min_confidence and has_enough_trades_for_flip:
                 if is_bullish:
                     action = MicroAction.FLIP_YES
                     side = Side.YES

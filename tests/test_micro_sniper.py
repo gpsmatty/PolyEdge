@@ -491,6 +491,7 @@ class FakeConfig:
     flip_min_confidence: float = 0.40
     min_confidence: float = 0.30
     min_trades_in_window: int = 10
+    min_trades_for_flip: int = 10
     min_seconds_remaining: float = 15.0
     force_exit_seconds: float = 8.0
     max_entry_price: float = 0.80
@@ -525,9 +526,14 @@ def evaluate_micro(market, micro, seconds_remaining, current_position=None, conf
         holding_yes = current_position == "yes"
         aligned = (holding_yes and is_bullish) or (not holding_yes and not is_bullish)
 
-        # Flip
+        # Guard: don't act on sparse data
+        if micro.flow_15s.total_count < config.min_trades_in_window:
+            return None
+
+        # Flip (requires higher trade count — flips are costly)
+        has_enough_for_flip = micro.flow_15s.total_count >= config.min_trades_for_flip
         if not aligned and abs_momentum >= config.flip_threshold:
-            if confidence >= config.flip_min_confidence:
+            if confidence >= config.flip_min_confidence and has_enough_for_flip:
                 new_side = "yes" if is_bullish else "no"
                 price = market.yes_price if is_bullish else market.no_price
                 if price <= config.max_entry_price:
@@ -744,6 +750,83 @@ class TestMicroSniperFlip:
         # With confidence < 0.95, should not flip (may exit instead)
         if result is not None:
             assert "flip" not in result["action"]
+
+
+class TestMicroSniperSparseDataGuard:
+    def test_no_flip_on_sparse_data(self):
+        """Should NOT flip when only 2-3 trades exist — OFI ±1.00 is noise."""
+        config = FakeConfig()
+        config.min_trades_in_window = 3
+        config.min_trades_for_flip = 10
+        config.flip_threshold = 0.20  # Low bar so it would flip if data was sufficient
+
+        micro = MicroStructure(symbol="btcusdt")
+        # Only 2 trades — all sells — OFI = -1.00 but it's noise
+        trades = make_trades("btcusdt", 2, buy_fraction=0.0, base_price=70000)
+        for t in trades:
+            micro.add_trade(t)
+
+        market = FakeMarket()
+        # With only 2 trades, should NOT produce any signal (below min_trades_in_window)
+        result = evaluate_micro(market, micro, 120.0, current_position="yes", config=config)
+        assert result is None, "Should not act on sparse data (2 trades)"
+
+    def test_no_exit_on_sparse_data(self):
+        """Should NOT exit when too few trades — momentum reading is unreliable."""
+        config = FakeConfig()
+        config.min_trades_in_window = 5
+
+        micro = MicroStructure(symbol="btcusdt")
+        # Only 3 sells — strong-looking reversal but unreliable
+        trades = make_trades("btcusdt", 3, buy_fraction=0.0, base_price=70000)
+        for t in trades:
+            micro.add_trade(t)
+
+        market = FakeMarket()
+        result = evaluate_micro(market, micro, 120.0, current_position="yes", config=config)
+        assert result is None, "Should not exit on sparse data (3 trades < 5 min)"
+
+    def test_no_flip_below_min_trades_for_flip(self):
+        """Should not flip even with enough trades for exit but not for flip."""
+        config = FakeConfig()
+        config.min_trades_in_window = 5
+        config.min_trades_for_flip = 20
+        config.flip_threshold = 0.20
+
+        micro = MicroStructure(symbol="btcusdt")
+        # 10 trades — enough for exit but not for flip
+        trades = make_trades("btcusdt", 10, buy_fraction=0.05, base_price=70000)
+        for t in trades:
+            micro.add_trade(t)
+
+        market = FakeMarket(yes_price=0.40, no_price=0.60)
+        result = evaluate_micro(market, micro, 120.0, current_position="yes", config=config)
+        # Should exit (reversal detected) but NOT flip (not enough trades)
+        if result is not None:
+            assert "flip" not in result["action"], "Should not flip with only 10 trades (need 20)"
+
+    def test_flip_with_sufficient_trades(self):
+        """Should flip when trade count meets the higher flip threshold."""
+        config = FakeConfig()
+        config.min_trades_in_window = 5
+        config.min_trades_for_flip = 10
+        config.flip_threshold = 0.20
+
+        micro = MicroStructure(symbol="btcusdt")
+        # 30 trades — strong sell pressure, well above flip threshold
+        trades = make_trades("btcusdt", 30, buy_fraction=0.05, base_price=70000,
+                             time_spacing=0.3)
+        for t in trades:
+            micro.add_trade(t)
+
+        market = FakeMarket(yes_price=0.40, no_price=0.60)
+        momentum = micro.momentum_signal
+        confidence = micro.confidence
+
+        result = evaluate_micro(market, micro, 120.0, current_position="yes", config=config)
+        # With 30 trades and strong sell pressure, should flip
+        if result is not None and abs(momentum) >= config.flip_threshold and confidence >= config.flip_min_confidence:
+            assert "flip" in result["action"]
 
 
 class TestMicroSniperHold:
