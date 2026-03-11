@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS polyedge.trades (
     strategy TEXT DEFAULT '',
     reasoning TEXT DEFAULT '',
     ai_probability FLOAT,
+    config_snapshot JSONB,
+    signal_data JSONB,
     opened_at TIMESTAMPTZ DEFAULT NOW(),
     closed_at TIMESTAMPTZ
 );
@@ -213,6 +215,15 @@ class Database:
     async def init_schema(self):
         async with self.pool.acquire() as conn:
             await conn.execute(SCHEMA_SQL)
+            # Migrations — safe to re-run (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS)
+            await conn.execute("""
+                ALTER TABLE polyedge.trades
+                ADD COLUMN IF NOT EXISTS config_snapshot JSONB;
+            """)
+            await conn.execute("""
+                ALTER TABLE polyedge.trades
+                ADD COLUMN IF NOT EXISTS signal_data JSONB;
+            """)
 
     # --- Markets ---
 
@@ -351,13 +362,21 @@ class Database:
 
     async def insert_trade(self, trade: dict) -> str:
         trade_id = trade.get("trade_id") or str(uuid.uuid4())
+        # Serialize JSONB fields
+        config_snapshot = trade.get("config_snapshot")
+        signal_data = trade.get("signal_data")
+        if config_snapshot and not isinstance(config_snapshot, str):
+            config_snapshot = json.dumps(config_snapshot)
+        if signal_data and not isinstance(signal_data, str):
+            signal_data = json.dumps(signal_data)
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO polyedge.trades
                     (trade_id, market_id, token_id, question, side, entry_price,
-                     size, status, strategy, reasoning, ai_probability)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                     size, status, strategy, reasoning, ai_probability,
+                     config_snapshot, signal_data)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                 """,
                 trade_id,
                 trade["market_id"],
@@ -370,6 +389,8 @@ class Database:
                 trade.get("strategy", ""),
                 trade.get("reasoning", ""),
                 trade.get("ai_probability"),
+                config_snapshot,
+                signal_data,
             )
         return trade_id
 

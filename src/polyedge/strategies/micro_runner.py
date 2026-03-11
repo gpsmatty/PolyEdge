@@ -1296,6 +1296,39 @@ class MicroRunner:
                         "status": "FILLED",
                         "strategy": "micro_sniper",
                     })
+                    # Snapshot active config + signal data for backtesting
+                    config_snap = {
+                        "entry_threshold": self.config.entry_threshold,
+                        "counter_trend_threshold": self.config.counter_trend_threshold,
+                        "exit_threshold": self.config.exit_threshold,
+                        "hold_threshold": self.config.hold_threshold,
+                        "counter_trend_exit_threshold": self.config.counter_trend_exit_threshold,
+                        "min_entry_price": self.config.min_entry_price,
+                        "max_entry_price": self.config.max_entry_price,
+                        "entry_persistence_enabled": self.config.entry_persistence_enabled,
+                        "entry_persistence_seconds": self.config.entry_persistence_seconds,
+                        "trailing_stop_enabled": self.config.trailing_stop_enabled,
+                        "trailing_stop_pct": self.config.trailing_stop_pct,
+                        "exit_slippage": self.config.exit_slippage,
+                        "entry_slippage": self.config.entry_slippage,
+                        "trade_cooldown": self.config.trade_cooldown,
+                        "weight_ofi_5s": self.config.weight_ofi_5s,
+                        "weight_ofi_15s": self.config.weight_ofi_15s,
+                        "weight_vwap_drift": self.config.weight_vwap_drift,
+                        "weight_intensity": self.config.weight_intensity,
+                    }
+                    signal_snap = {
+                        "momentum": round(opp.momentum, 4),
+                        "confidence": round(opp.confidence, 4),
+                        "ofi_5s": round(opp.ofi_5s, 4),
+                        "ofi_15s": round(opp.ofi_15s, 4),
+                        "vwap_drift": round(opp.vwap_drift, 4),
+                        "trade_intensity": round(opp.trade_intensity, 2),
+                        "binance_price": opp.binance_price,
+                        "market_price": opp.market_price,
+                        "price_change_pct": round(opp.price_change_pct, 6),
+                        "seconds_remaining": round(opp.seconds_remaining, 1),
+                    }
                     await self.db.insert_trade({
                         "trade_id": order_id,
                         "market_id": cid,
@@ -1307,6 +1340,8 @@ class MicroRunner:
                         "status": "OPEN",
                         "strategy": "micro_sniper",
                         "reasoning": signal.reasoning,
+                        "config_snapshot": config_snap,
+                        "signal_data": signal_snap,
                     })
                     await self.db.upsert_position({
                         "market_id": cid,
