@@ -1278,21 +1278,53 @@ class MicroRunner:
                 # Query REAL token balance — CLOB rounds differently than us.
                 # Our estimate (USD/price) can be higher than what we actually got,
                 # causing "not enough balance" on the fast exit path.
+                # Brief extra sleep to let CLOB settle the trade before querying balance.
+                await asyncio.sleep(0.2)
+                expected_size = actual_size  # Save our estimate for sanity check
                 try:
                     bal = self.client.get_token_balance(token_id)
                     if isinstance(bal, dict):
                         raw_bal = bal.get("balance", 0)
                     else:
                         raw_bal = bal
-                    raw_int = int(float(str(raw_bal)))
-                    if raw_int > 1_000_000:
-                        real_size = int(raw_int / 1e6 * 100) / 100  # truncate to 2dp
+
+                    raw_str = str(raw_bal)
+                    logger.info(f"Token balance raw: {raw_str} (type={type(raw_bal).__name__}, full={bal})")
+
+                    raw_float = float(raw_str)
+                    # Try interpreting as microunits (6 decimals) vs direct value
+                    as_micro = int(raw_float / 1e6 * 100) / 100  # e.g. 15625000 → 15.62
+                    as_direct = int(raw_float * 100) / 100         # e.g. 15.625 → 15.62
+
+                    # Pick interpretation closest to our expected size
+                    if expected_size > 0:
+                        diff_micro = abs(as_micro - expected_size)
+                        diff_direct = abs(as_direct - expected_size)
+                        if diff_micro < diff_direct and as_micro > 0:
+                            real_size = as_micro
+                        elif as_direct > 0:
+                            real_size = as_direct
+                        else:
+                            real_size = 0
+
+                        # Sanity check: if parsed balance is wildly off (>3x expected),
+                        # don't trust it — use a conservative estimate instead
+                        if real_size > expected_size * 3 or real_size < expected_size * 0.3:
+                            logger.warning(
+                                f"Balance sanity check failed: parsed={real_size}, "
+                                f"expected={expected_size}, raw={raw_str}. Using estimate * 0.98"
+                            )
+                            real_size = int(expected_size * 0.98 * 100) / 100  # 2% haircut
                     else:
-                        real_size = int(float(str(raw_bal)) * 100) / 100
+                        real_size = as_direct if as_direct > 0 else as_micro
+
                     if real_size > 0:
                         actual_size = real_size
-                except Exception:
-                    pass  # Use estimated size as fallback
+                        logger.info(f"Token balance parsed: {actual_size} shares (expected ~{expected_size})")
+                except Exception as e:
+                    logger.warning(f"Token balance query failed: {e}")
+                    # Safety haircut on estimated size — CLOB often gives slightly fewer shares
+                    actual_size = int(expected_size * 0.98 * 100) / 100
 
                 # Record in DB with actual fill price
                 try:
@@ -1430,11 +1462,19 @@ class MicroRunner:
                     raw_bal = bal.get("balance", 0)
                 else:
                     raw_bal = bal
-                raw_int = int(float(str(raw_bal)))
-                if raw_int > 1_000_000:
-                    size = int(raw_int / 1e6 * 100) / 100
+                raw_str = str(raw_bal)
+                logger.info(f"Slow exit balance raw: {raw_str} (type={type(raw_bal).__name__}, full={bal})")
+                raw_float = float(raw_str)
+                # Try both interpretations
+                as_micro = int(raw_float / 1e6 * 100) / 100  # e.g. 15625000 → 15.62
+                as_direct = int(raw_float * 100) / 100         # e.g. 15.625 → 15.62
+                # Pick the one that makes sense (< 10000 shares for a $5-$20 trade)
+                if as_micro > 0 and as_micro < 10000:
+                    size = as_micro
+                elif as_direct > 0 and as_direct < 10000:
+                    size = as_direct
                 else:
-                    size = int(float(str(raw_bal)) * 100) / 100
+                    size = as_direct if as_direct > 0 else as_micro
             except Exception as e:
                 logger.warning(f"Token balance lookup failed: {e}")
                 # Last resort: try DB
