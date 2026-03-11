@@ -1076,7 +1076,8 @@ def sniper(auto, dry, verbose, quiet):
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed evaluations")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress eval output, show only trades + status")
 @click.option("--market", "-m", default=None, help="Filter to specific market (e.g. 'btc', '5 minute', 'bitcoin 5')")
-def micro(auto, dry, verbose, quiet, market):
+@click.option("--no-warmup", is_flag=True, help="Skip warmup — trade the current window immediately")
+def micro(auto, dry, verbose, quiet, market, no_warmup):
     """Start the micro sniper — high-frequency momentum trading on 5-min crypto markets.
 
     \b
@@ -1127,6 +1128,7 @@ def micro(auto, dry, verbose, quiet, market):
             verbose=verbose,
             quiet=quiet,
             market_filter=market,
+            skip_warmup=no_warmup,
         )
 
         try:

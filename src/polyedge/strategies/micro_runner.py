@@ -84,6 +84,7 @@ class MicroRunner:
         verbose: bool = False,
         quiet: bool = False,
         market_filter: Optional[str] = None,
+        skip_warmup: bool = False,
     ):
         self.settings = settings
         self.client = client
@@ -186,7 +187,8 @@ class MicroRunner:
 
         # On startup, wait for the next fresh window instead of jumping into
         # a partially-elapsed one with stale microstructure data.
-        self._waiting_for_fresh_window: bool = True
+        # --no-warmup skips this and trades immediately.
+        self._waiting_for_fresh_window: bool = not skip_warmup
         self._startup_window_id: str | None = None  # condition_id of the window we're skipping
 
     async def _quick_sync(self):
