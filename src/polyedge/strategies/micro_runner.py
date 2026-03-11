@@ -640,16 +640,38 @@ class MicroRunner:
         # Simple filter: UP_DOWN_PATTERN + user filter + live (not expired)
         candidates: dict[str, list[tuple[Market, ParsedCryptoMarket]]] = {}
 
+        # DEBUG counters
+        _d_total = len(all_markets)
+        _d_updown = 0
+        _d_live = 0
+        _d_filter = 0
+
         for market in all_markets:
             q = market.question
             if not UP_DOWN_PATTERN.search(q):
                 continue
+            _d_updown += 1
 
             # Skip markets that have already ended
             if not market.end_date or market.end_date <= now:
                 continue
+            _d_live += 1
 
             # Apply user's --market filter with word-boundary matching
+            if not self._matches_filter(market):
+                continue
+            _d_filter += 1
+
+        # Print debug then re-run the actual loop
+        if not self.quiet:
+            console.print(f"[dim]  DEBUG: {_d_total} total → {_d_updown} up/down → {_d_live} live → {_d_filter} pass filter[/dim]")
+
+        for market in all_markets:
+            q = market.question
+            if not UP_DOWN_PATTERN.search(q):
+                continue
+            if not market.end_date or market.end_date <= now:
+                continue
             if not self._matches_filter(market):
                 continue
 
