@@ -1000,6 +1000,36 @@ class MicroRunner:
             except EOFError:
                 pass
 
+    def _get_fill_price(self, order_id: str, token_id: str, fallback: float) -> float:
+        """Fetch actual fill price from CLOB API after a FOK order fills.
+
+        FOK orders can fill at a BETTER price than we asked for. Using our
+        ask price as the fill price gives wrong P&L. This queries the CLOB
+        trades endpoint to get the real fill price.
+        """
+        try:
+            import time as _time
+            # Small delay to let the fill propagate in the CLOB backend
+            _time.sleep(0.3)
+            trades = self.client.get_trades(asset_id=token_id)
+            if trades:
+                # Find the trade matching our order ID
+                for t in trades:
+                    if t.get("taker_order_id") == order_id or t.get("order_id") == order_id:
+                        fill_price = float(t.get("price", fallback))
+                        if not self.quiet:
+                            console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback:.3f})[/dim]")
+                        return fill_price
+                # If no exact match, use most recent trade on this token
+                latest = trades[0]
+                fill_price = float(latest.get("price", fallback))
+                if not self.quiet:
+                    console.print(f"  [dim]Fill price (latest): ${fill_price:.3f} (asked ${fallback:.3f})[/dim]")
+                return fill_price
+        except Exception as e:
+            logger.warning(f"Could not fetch fill price: {e}")
+        return fallback
+
     async def _execute_micro_trade(
         self,
         opp: MicroOpportunity,
@@ -1060,15 +1090,19 @@ class MicroRunner:
 
             poly_order_id = result.get("orderID", result.get("id", ""))
             if poly_order_id:
-                # Record in DB
+                # Get actual fill price from CLOB API (FOK can fill better than asked)
+                actual_entry = self._get_fill_price(poly_order_id, token_id, entry_price)
+                actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
+
+                # Record in DB with actual fill price
                 try:
                     order_id = await self.db.insert_order({
                         "market_id": cid,
                         "token_id": token_id,
                         "side": "BUY",
                         "order_type": "FOK",
-                        "price": entry_price,
-                        "size": size,
+                        "price": actual_entry,
+                        "size": actual_size,
                         "amount_usd": size_usd,
                         "status": "FILLED",
                         "strategy": "micro_sniper",
@@ -1079,8 +1113,8 @@ class MicroRunner:
                         "token_id": token_id,
                         "question": opp.market.question,
                         "side": opp.side.value,
-                        "entry_price": entry_price,
-                        "size": size,
+                        "entry_price": actual_entry,
+                        "size": actual_size,
                         "status": "OPEN",
                         "strategy": "micro_sniper",
                         "reasoning": signal.reasoning,
@@ -1090,9 +1124,9 @@ class MicroRunner:
                         "token_id": token_id,
                         "question": opp.market.question,
                         "side": opp.side.value,
-                        "size": size,
-                        "entry_price": entry_price,
-                        "current_price": entry_price,
+                        "size": actual_size,
+                        "entry_price": actual_entry,
+                        "current_price": actual_entry,
                         "strategy": "micro_sniper",
                     })
                 except Exception as e:
@@ -1103,7 +1137,7 @@ class MicroRunner:
                 self._total_trades += 1
                 self._last_trade_log[cid] = time.time()
                 console.print(
-                    f"[green]Order placed: {opp.side.value} {size:.1f} @ ${entry_price:.3f} "
+                    f"[green]Order placed: {opp.side.value} {actual_size:.1f} @ ${actual_entry:.3f} "
                     f"(${size_usd:.2f}) — ID: {poly_order_id}[/green]"
                 )
                 console.print(f"[green]  MICRO SNIPED! Order: {poly_order_id}[/green]")
@@ -1245,12 +1279,15 @@ class MicroRunner:
             )
             order_id = result.get("orderID", result.get("id", ""))
             total_sold = chunk
-            total_proceeds = chunk * effective_sell
             remaining = 0
+
+            # Get actual fill price from CLOB API
+            actual_sell = self._get_fill_price(order_id, token_id, effective_sell)
+            total_proceeds = chunk * actual_sell
 
             if not self.quiet:
                 console.print(
-                    f"[yellow]  SOLD {current_pos.upper()} {chunk:.1f} @ ${effective_sell:.2f} "
+                    f"[yellow]  SOLD {current_pos.upper()} {chunk:.1f} @ ${actual_sell:.2f} "
                     f"— Order: {order_id}[/yellow]"
                 )
 
