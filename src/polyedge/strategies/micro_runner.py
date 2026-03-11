@@ -1043,7 +1043,7 @@ class MicroRunner:
             except EOFError:
                 pass
 
-    def _get_fill_price(self, order_id: str, token_id: str, fallback: float) -> float:
+    async def _get_fill_price(self, order_id: str, token_id: str, fallback: float) -> float:
         """Fetch actual fill price from CLOB API after a FOK order fills.
 
         FOK orders can fill at a BETTER price than we asked for. Using our
@@ -1054,8 +1054,7 @@ class MicroRunner:
         previous fills and gives wildly wrong P&L.
         """
         try:
-            import time as _time
-            _time.sleep(0.3)
+            await asyncio.sleep(0.3)
 
             # Try 1: get_order returns the order with its average fill price
             try:
@@ -1151,7 +1150,7 @@ class MicroRunner:
             poly_order_id = result.get("orderID", result.get("id", ""))
             if poly_order_id:
                 # Get actual fill price from CLOB API (FOK can fill better than asked)
-                actual_entry = self._get_fill_price(poly_order_id, token_id, entry_price)
+                actual_entry = await self._get_fill_price(poly_order_id, token_id, entry_price)
                 actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
 
                 # Record in DB with actual fill price
@@ -1342,7 +1341,7 @@ class MicroRunner:
             remaining = 0
 
             # Get actual fill price from CLOB API
-            actual_sell = self._get_fill_price(order_id, token_id, effective_sell)
+            actual_sell = await self._get_fill_price(order_id, token_id, effective_sell)
             total_proceeds = chunk * actual_sell
 
             if not self.quiet:
