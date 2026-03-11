@@ -1079,3 +1079,276 @@ class TestCounterTrendFilter:
             result = evaluate_micro(market, micro, 120.0, config=config)
             if result is not None:
                 assert result["side"] == "yes", "Should buy YES in bullish with-trend"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Polymarket order book exit override (uses REAL strategy class)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestBookExitOverride:
+    """Test the Polymarket order book exit override using the REAL
+    MicroSniperStrategy class, not the simplified evaluate_micro function."""
+
+    @staticmethod
+    def _make_real_strategy(poly_book_enabled=True, **overrides):
+        """Create a real MicroSniperStrategy with book settings."""
+        from polyedge.core.config import MicroSniperConfig
+        from polyedge.strategies.micro_sniper import MicroSniperStrategy
+
+        # Build config with book settings
+        cfg = MicroSniperConfig(
+            poly_book_enabled=poly_book_enabled,
+            poly_book_min_exit_depth=20.0,
+            poly_book_imbalance_veto=-0.40,
+            poly_book_exit_override_depth=25.0,
+            poly_book_exit_override_imbalance=0.15,
+            # Relax other thresholds so we can trigger exits easily
+            entry_threshold=0.40,
+            exit_threshold=0.15,
+            hold_threshold=0.08,
+            counter_trend_exit_threshold=0.65,
+            min_confidence=0.30,
+            min_trades_in_window=5,
+            min_entry_price=0.20,
+            max_entry_price=0.80,
+            dead_market_band=0.02,
+            **overrides,
+        )
+
+        # Fake Settings object with just the micro config
+        class FakeSettings:
+            class strategies:
+                micro_sniper = cfg
+        return MicroSniperStrategy(FakeSettings())
+
+    @staticmethod
+    def _make_book_intel(yes_bid_depth=50.0, yes_ask_depth=30.0,
+                         no_bid_depth=50.0, no_ask_depth=30.0,
+                         yes_imbalance=0.25, no_imbalance=-0.10):
+        """Create fake BookIntelligence dicts."""
+        from polyedge.data.book_analyzer import BookIntelligence
+        yes_book = BookIntelligence(
+            imbalance_ratio=yes_imbalance,
+            imbalance_5c=yes_imbalance,
+            imbalance_10c=yes_imbalance,
+            bid_depth_5c=yes_bid_depth,
+            ask_depth_5c=yes_ask_depth,
+            bid_depth_10c=yes_bid_depth * 2,
+            ask_depth_10c=yes_ask_depth * 2,
+            spread_bps=100.0,
+            whale_bids=[],
+            whale_asks=[],
+            bid_wall_price=None,
+            ask_wall_price=None,
+        )
+        no_book = BookIntelligence(
+            imbalance_ratio=no_imbalance,
+            imbalance_5c=no_imbalance,
+            imbalance_10c=no_imbalance,
+            bid_depth_5c=no_bid_depth,
+            ask_depth_5c=no_ask_depth,
+            bid_depth_10c=no_bid_depth * 2,
+            ask_depth_10c=no_ask_depth * 2,
+            spread_bps=100.0,
+            whale_bids=[],
+            whale_asks=[],
+            bid_wall_price=None,
+            ask_wall_price=None,
+        )
+        return {"yes": yes_book, "no": no_book}
+
+    @staticmethod
+    def _make_bearish_micro():
+        """Create a MicroStructure with strong SELL momentum (for exit testing when holding YES)."""
+        micro = MicroStructure(symbol="btcusdt")
+        trades = make_trades("btcusdt", 30, buy_fraction=0.05, base_price=70000,
+                             time_spacing=0.3)
+        for t in trades:
+            micro.add_trade(t)
+        return micro
+
+    @staticmethod
+    def _make_bullish_micro():
+        """Create a MicroStructure with strong BUY momentum (for exit testing when holding NO)."""
+        micro = MicroStructure(symbol="btcusdt")
+        trades = make_trades("btcusdt", 30, buy_fraction=0.95, base_price=70000,
+                             time_spacing=0.3)
+        for t in trades:
+            micro.add_trade(t)
+        return micro
+
+    def test_book_override_holds_when_depth_and_imbalance_ok(self):
+        """When momentum says exit but book has deep bids + favorable imbalance, HOLD."""
+        strategy = self._make_real_strategy()
+        micro = self._make_bearish_micro()
+        market = FakeMarket(yes_price=0.60, no_price=0.40)
+
+        # Strong YES book: deep bids, positive imbalance
+        book_intel = self._make_book_intel(
+            yes_bid_depth=50.0, yes_imbalance=0.30,
+        )
+
+        # Holding YES with bearish momentum → should want to exit
+        # But book override should save us
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=200.0,
+            current_position="yes", book_intel=book_intel,
+        )
+
+        momentum = micro.momentum_signal
+        # Only assert override if momentum actually triggers exit
+        if abs(momentum) >= 0.15:  # exit_threshold
+            assert result is None, (
+                f"Book should override exit — depth 50 >= 25, imbalance 0.30 >= 0.15 "
+                f"(momentum={momentum:.2f})"
+            )
+
+    def test_book_no_override_when_depth_too_low(self):
+        """When bid depth is too thin, book should NOT override — let the exit happen."""
+        strategy = self._make_real_strategy()
+        micro = self._make_bearish_micro()
+        market = FakeMarket(yes_price=0.60, no_price=0.40)
+
+        # Thin YES book: low bids
+        book_intel = self._make_book_intel(
+            yes_bid_depth=10.0, yes_imbalance=0.30,
+        )
+
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=200.0,
+            current_position="yes", book_intel=book_intel,
+        )
+
+        momentum = micro.momentum_signal
+        if abs(momentum) >= 0.15:
+            assert result is not None, (
+                f"Should exit — depth 10 < 25 threshold (momentum={momentum:.2f})"
+            )
+            assert result.action.value == "exit"
+
+    def test_book_no_override_when_imbalance_against(self):
+        """When imbalance is against our position, book should NOT override."""
+        strategy = self._make_real_strategy()
+        micro = self._make_bearish_micro()
+        market = FakeMarket(yes_price=0.60, no_price=0.40)
+
+        # YES book has depth but imbalance is negative (sellers dominate)
+        book_intel = self._make_book_intel(
+            yes_bid_depth=50.0, yes_imbalance=-0.30,
+        )
+
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=200.0,
+            current_position="yes", book_intel=book_intel,
+        )
+
+        momentum = micro.momentum_signal
+        if abs(momentum) >= 0.15:
+            assert result is not None, (
+                f"Should exit — imbalance -0.30 < 0.15 threshold (momentum={momentum:.2f})"
+            )
+            assert result.action.value == "exit"
+
+    def test_book_override_for_no_position(self):
+        """Book override should work for NO positions too (flipped imbalance)."""
+        strategy = self._make_real_strategy()
+        micro = self._make_bullish_micro()
+        market = FakeMarket(yes_price=0.40, no_price=0.60)
+
+        # Holding NO: we need YES imbalance to be NEGATIVE (= NO is favored)
+        # directional_imbalance for NO = -yes_imbalance
+        # So yes_imbalance=-0.30 → directional_imbalance=+0.30 (favors NO)
+        book_intel = self._make_book_intel(
+            no_bid_depth=50.0, yes_imbalance=-0.30,
+        )
+
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=200.0,
+            current_position="no", book_intel=book_intel,
+        )
+
+        momentum = micro.momentum_signal
+        if abs(momentum) >= 0.15:
+            assert result is None, (
+                f"Book should override exit for NO — NO depth 50 >= 25, "
+                f"directional imbalance +0.30 >= 0.15 (momentum={momentum:.2f})"
+            )
+
+    def test_no_override_when_book_disabled(self):
+        """When poly_book_enabled=False, exits should happen normally."""
+        strategy = self._make_real_strategy(poly_book_enabled=False)
+        micro = self._make_bearish_micro()
+        market = FakeMarket(yes_price=0.60, no_price=0.40)
+
+        book_intel = self._make_book_intel(
+            yes_bid_depth=50.0, yes_imbalance=0.30,
+        )
+
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=200.0,
+            current_position="yes", book_intel=book_intel,
+        )
+
+        momentum = micro.momentum_signal
+        if abs(momentum) >= 0.15:
+            assert result is not None, (
+                f"Should exit — book disabled (momentum={momentum:.2f})"
+            )
+
+    def test_no_override_when_no_book_data(self):
+        """When book_intel is None, exits should happen normally."""
+        strategy = self._make_real_strategy()
+        micro = self._make_bearish_micro()
+        market = FakeMarket(yes_price=0.60, no_price=0.40)
+
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=200.0,
+            current_position="yes", book_intel=None,
+        )
+
+        momentum = micro.momentum_signal
+        if abs(momentum) >= 0.15:
+            assert result is not None, (
+                f"Should exit — no book data (momentum={momentum:.2f})"
+            )
+
+    def test_force_exit_ignores_book_override(self):
+        """Force exit near window close should NOT be overridden by book."""
+        strategy = self._make_real_strategy()
+        micro = self._make_bearish_micro()
+        market = FakeMarket(yes_price=0.60, no_price=0.40)
+
+        book_intel = self._make_book_intel(
+            yes_bid_depth=100.0, yes_imbalance=0.50,
+        )
+
+        # 5 seconds left — below force_exit_seconds (8.0)
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=5.0,
+            current_position="yes", book_intel=book_intel,
+        )
+
+        assert result is not None, "Force exit should always fire near window close"
+        assert result.action.value == "exit"
+
+    def test_entry_blocked_when_exit_depth_thin(self):
+        """Entry should be blocked when bid depth on our token is too thin."""
+        strategy = self._make_real_strategy()
+        micro = self._make_bullish_micro()
+        market = FakeMarket(yes_price=0.55, no_price=0.45)
+
+        # YES book with thin bids — can't exit if we enter
+        book_intel = self._make_book_intel(
+            yes_bid_depth=5.0, yes_imbalance=0.30,
+        )
+
+        result = strategy.evaluate(
+            market=market, micro=micro, seconds_remaining=200.0,
+            current_position=None, book_intel=book_intel,
+        )
+
+        momentum = micro.momentum_signal
+        if momentum > 0.40:  # Would normally enter YES
+            assert result is None, (
+                f"Should block entry — YES bid depth 5 < 20 min (momentum={momentum:.2f})"
+            )
