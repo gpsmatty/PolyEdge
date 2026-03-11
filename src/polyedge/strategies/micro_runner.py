@@ -1275,56 +1275,12 @@ class MicroRunner:
                 actual_entry = await self._get_fill_price(poly_order_id, token_id, entry_price)
                 actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
 
-                # Query REAL token balance — CLOB rounds differently than us.
-                # Our estimate (USD/price) can be higher than what we actually got,
-                # causing "not enough balance" on the fast exit path.
-                # Brief extra sleep to let CLOB settle the trade before querying balance.
-                await asyncio.sleep(0.2)
-                expected_size = actual_size  # Save our estimate for sanity check
-                try:
-                    bal = self.client.get_token_balance(token_id)
-                    if isinstance(bal, dict):
-                        raw_bal = bal.get("balance", 0)
-                    else:
-                        raw_bal = bal
-
-                    raw_str = str(raw_bal)
-                    logger.info(f"Token balance raw: {raw_str} (type={type(raw_bal).__name__}, full={bal})")
-
-                    raw_float = float(raw_str)
-                    # Try interpreting as microunits (6 decimals) vs direct value
-                    as_micro = int(raw_float / 1e6 * 100) / 100  # e.g. 15625000 → 15.62
-                    as_direct = int(raw_float * 100) / 100         # e.g. 15.625 → 15.62
-
-                    # Pick interpretation closest to our expected size
-                    if expected_size > 0:
-                        diff_micro = abs(as_micro - expected_size)
-                        diff_direct = abs(as_direct - expected_size)
-                        if diff_micro < diff_direct and as_micro > 0:
-                            real_size = as_micro
-                        elif as_direct > 0:
-                            real_size = as_direct
-                        else:
-                            real_size = 0
-
-                        # Sanity check: if parsed balance is wildly off (>3x expected),
-                        # don't trust it — use a conservative estimate instead
-                        if real_size > expected_size * 3 or real_size < expected_size * 0.3:
-                            logger.warning(
-                                f"Balance sanity check failed: parsed={real_size}, "
-                                f"expected={expected_size}, raw={raw_str}. Using estimate * 0.98"
-                            )
-                            real_size = int(expected_size * 0.98 * 100) / 100  # 2% haircut
-                    else:
-                        real_size = as_direct if as_direct > 0 else as_micro
-
-                    if real_size > 0:
-                        actual_size = real_size
-                        logger.info(f"Token balance parsed: {actual_size} shares (expected ~{expected_size})")
-                except Exception as e:
-                    logger.warning(f"Token balance query failed: {e}")
-                    # Safety haircut on estimated size — CLOB often gives slightly fewer shares
-                    actual_size = int(expected_size * 0.98 * 100) / 100
+                # Use estimated size with 2% haircut instead of querying CLOB balance.
+                # The CLOB balance endpoint lags behind settlement (returns 0 even 0.5s
+                # after fill), so the query is unreliable. A 2% haircut on our estimate
+                # (USD / fill_price) is more reliable — we sell slightly fewer shares
+                # than we have, leaving dust, but the fast exit always works.
+                actual_size = int(actual_size * 0.98 * 100) / 100  # truncate to 2dp
 
                 # Record in DB with actual fill price
                 try:
