@@ -197,6 +197,23 @@ CREATE TABLE IF NOT EXISTS polyedge.reconcile_state (
 CREATE INDEX IF NOT EXISTS idx_pnl_ledger_market ON polyedge.pnl_ledger(market_id);
 CREATE INDEX IF NOT EXISTS idx_pnl_ledger_strategy ON polyedge.pnl_ledger(strategy);
 CREATE INDEX IF NOT EXISTS idx_pnl_ledger_time ON polyedge.pnl_ledger(entry_time);
+
+-- Micro sniper persistent price context.
+-- Logs a snapshot every ~30s per symbol so the bot has cross-window and
+-- cross-restart context. On startup, load the last 30 min of rows and
+-- the bot immediately knows "BTC has been trending up for 15 minutes".
+CREATE TABLE IF NOT EXISTS polyedge.micro_price_log (
+    id SERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    price DOUBLE PRECISION NOT NULL,
+    ofi_30s DOUBLE PRECISION DEFAULT 0,
+    volume_30s DOUBLE PRECISION DEFAULT 0,
+    trade_intensity DOUBLE PRECISION DEFAULT 0,
+    logged_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_micro_price_log_symbol_time
+    ON polyedge.micro_price_log(symbol, logged_at DESC);
 """
 
 
@@ -996,4 +1013,68 @@ class Database:
                 last_cursor,
                 last_fill_timestamp,
                 total_fills,
+            )
+
+    # ------------------------------------------------------------------
+    # Micro price context — persistent cross-window / cross-restart state
+    # ------------------------------------------------------------------
+
+    async def log_micro_price(
+        self,
+        symbol: str,
+        price: float,
+        ofi_30s: float = 0.0,
+        volume_30s: float = 0.0,
+        trade_intensity: float = 0.0,
+    ):
+        """Log a price snapshot for the micro sniper.
+
+        Called every ~30 seconds per symbol. Provides persistent context
+        that survives window hops and restarts.
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO polyedge.micro_price_log
+                    (symbol, price, ofi_30s, volume_30s, trade_intensity)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                symbol,
+                price,
+                ofi_30s,
+                volume_30s,
+                trade_intensity,
+            )
+
+    async def get_micro_price_context(
+        self, symbol: str, minutes: int = 30
+    ) -> list[dict]:
+        """Load recent price snapshots for a symbol.
+
+        Returns rows ordered oldest-first so callers can compute trends
+        by comparing first vs last entries.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT symbol, price, ofi_30s, volume_30s, trade_intensity, logged_at
+                FROM polyedge.micro_price_log
+                WHERE symbol = $1
+                  AND logged_at > NOW() - ($2 || ' minutes')::INTERVAL
+                ORDER BY logged_at ASC
+                """,
+                symbol,
+                str(minutes),
+            )
+            return [dict(r) for r in rows]
+
+    async def prune_micro_price_log(self, keep_minutes: int = 60):
+        """Delete old micro price log entries to prevent unbounded growth."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM polyedge.micro_price_log
+                WHERE logged_at < NOW() - ($1 || ' minutes')::INTERVAL
+                """,
+                str(keep_minutes),
             )

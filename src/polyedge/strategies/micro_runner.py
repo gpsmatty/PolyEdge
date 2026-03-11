@@ -475,6 +475,29 @@ class MicroRunner:
             self.agg_feed = BinanceAggTradeFeed(symbols=active_symbols)
             self.ticker_feed = BinanceFeed(symbols=active_symbols)
 
+        # --- Load persistent price context from DB ---
+        # On startup, load the last 30 min of price snapshots so the bot
+        # immediately knows the macro trend without waiting for 5 min of
+        # live data. This is the "persistence across restarts" feature.
+        try:
+            for sym in self.agg_feed.symbols:
+                rows = await self.db.get_micro_price_context(sym, minutes=30)
+                if rows:
+                    micro = self.agg_feed.micro.get(sym)
+                    if micro:
+                        micro.price_history = [(r["price"], r["logged_at"]) for r in rows]
+                        latest = rows[-1]
+                        oldest = rows[0]
+                        trend_pct = (latest["price"] - oldest["price"]) / oldest["price"] if oldest["price"] > 0 else 0
+                        console.print(
+                            f"[dim]Loaded {len(rows)} price snapshots for {sym.upper()} "
+                            f"(last {len(rows) * 30}s) — trend: {trend_pct:+.3%}[/dim]"
+                        )
+                else:
+                    console.print(f"[dim]No price history for {sym.upper()} — starting fresh[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]Failed to load price context: {e}[/yellow]")
+
         # Log that we're waiting for a fresh window on startup
         if self._waiting_for_fresh_window and self._total_markets > 0:
             for sym, mlist in self.updown_markets.items():
@@ -500,6 +523,7 @@ class MicroRunner:
             asyncio.create_task(self.ticker_feed.start()),
             asyncio.create_task(self._market_refresh_loop()),
             asyncio.create_task(self._status_loop()),
+            asyncio.create_task(self._price_log_loop()),
         ]
 
         try:
@@ -1170,50 +1194,77 @@ class MicroRunner:
             except EOFError:
                 pass
 
-    async def _get_fill_price(self, order_id: str, token_id: str, fallback: float) -> float:
-        """Fetch actual fill price from CLOB API after a FOK order fills.
+    async def _get_fill_info(self, order_id: str, token_id: str, fallback_price: float, fallback_size: float = 0) -> tuple[float, float]:
+        """Fetch actual fill price AND size from CLOB API after a FOK order fills.
 
-        FOK orders can fill at a BETTER price than we asked for. Using our
-        ask price as the fill price gives wrong P&L.
+        FOK orders can fill at a BETTER price than we asked for, and the actual
+        share count can differ from our USD/price estimate due to CLOB rounding
+        and multi-level fills. Using calculated shares causes "not enough balance"
+        errors on exit.
+
+        Returns (fill_price, fill_size). fill_size=0 means we couldn't get it
+        (caller should use its own estimate).
 
         Strategy: try get_order first (exact match), then search trades by
         order ID. NEVER fall back to "most recent trade" — that grabs
         previous fills and gives wildly wrong P&L.
         """
+        fill_price = fallback_price
+        fill_size = 0.0
+
         try:
             await asyncio.sleep(0.3)
 
-            # Try 1: get_order returns the order with its average fill price
+            # Try 1: get_order returns the order with its average fill price + size matched
             try:
                 order = self.client.get_order(order_id)
                 if order:
-                    # The order response may have 'price' (our ask) or 'average_price' (fill)
                     avg = order.get("average_price") or order.get("associate_trades_avg_price")
                     if avg:
                         fill_price = float(avg)
+                    # size_matched is the actual number of shares filled by the CLOB
+                    matched = order.get("size_matched") or order.get("matched_amount")
+                    if matched:
+                        fill_size = float(matched)
+                    if fill_price != fallback_price or fill_size > 0:
+                        size_str = f", {fill_size:.2f} shares" if fill_size > 0 else ""
                         if not self.quiet:
-                            console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback:.3f})[/dim]")
-                        return fill_price
+                            console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback_price:.3f}){size_str}[/dim]")
+                        if fill_size > 0:
+                            return fill_price, fill_size
+                        # Got price but not size — try trades below for size
             except Exception:
                 pass
 
-            # Try 2: search trades for exact order ID match
+            # Try 2: search trades for exact order ID match — sum sizes for total fill
             trades = self.client.get_trades(asset_id=token_id)
             if trades:
-                for t in trades:
-                    if t.get("taker_order_id") == order_id or t.get("order_id") == order_id:
-                        fill_price = float(t.get("price", fallback))
-                        if not self.quiet:
-                            console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback:.3f})[/dim]")
-                        return fill_price
+                matched_trades = [
+                    t for t in trades
+                    if t.get("taker_order_id") == order_id or t.get("order_id") == order_id
+                ]
+                if matched_trades:
+                    # Sum all fills for this order
+                    total_size = sum(float(t.get("size", 0)) for t in matched_trades)
+                    # Weighted average price across fills
+                    total_value = sum(float(t.get("size", 0)) * float(t.get("price", fallback_price)) for t in matched_trades)
+                    if total_size > 0:
+                        fill_price = total_value / total_size
+                        fill_size = total_size
+                    elif fill_price == fallback_price:
+                        # Single trade match — use its price
+                        fill_price = float(matched_trades[0].get("price", fallback_price))
+                    size_str = f", {fill_size:.2f} shares" if fill_size > 0 else ""
+                    if not self.quiet:
+                        console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback_price:.3f}){size_str}[/dim]")
+                    return fill_price, fill_size
 
-            # No match found — use our ask price. Better to be slightly wrong
-            # than grab a completely wrong trade.
+            # No match found — use fallback
             if not self.quiet:
-                console.print(f"  [dim]Fill price: ${fallback:.3f} (no CLOB match, using ask)[/dim]")
+                console.print(f"  [dim]Fill price: ${fallback_price:.3f} (no CLOB match, using ask)[/dim]")
         except Exception as e:
-            logger.warning(f"Could not fetch fill price: {e}")
-        return fallback
+            logger.warning(f"Could not fetch fill info: {e}")
+        return fill_price, fill_size
 
     async def _execute_micro_trade(
         self,
@@ -1274,17 +1325,19 @@ class MicroRunner:
 
             poly_order_id = result.get("orderID", result.get("id", ""))
             if poly_order_id:
-                # Get actual fill price from CLOB API (FOK can fill better than asked)
-                actual_entry = await self._get_fill_price(poly_order_id, token_id, entry_price)
-                actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
-
-                # Don't query CLOB balance here — it always returns 0 right after
-                # a fill (settlement lags 2-3s). Store our estimate (USD / fill_price).
-                # If the estimate is slightly high, the fast exit will get "not enough
-                # balance" and immediately re-query + retry with the real amount.
-                # This gives us: fast entry (no sleep), accurate exit (real balance),
-                # and zero dust (sells exact CLOB amount).
-                actual_size = int(actual_size * 100) / 100  # truncate to 2dp
+                # Get actual fill price AND share count from CLOB API.
+                # FOK can fill at better price than asked, and the actual share
+                # count can differ from USD/price due to CLOB rounding and
+                # multi-level fills. Using calculated shares causes "not enough
+                # balance" errors on exit.
+                actual_entry, clob_size = await self._get_fill_info(poly_order_id, token_id, entry_price, size)
+                if clob_size > 0:
+                    # CLOB told us exact share count — use it
+                    actual_size = int(clob_size * 100) / 100  # truncate to 2dp
+                else:
+                    # Fallback: estimate from USD / fill_price (can be slightly off)
+                    estimated = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
+                    actual_size = int(estimated * 100) / 100  # truncate to 2dp
 
                 # Record in DB with actual fill price
                 try:
@@ -1512,7 +1565,7 @@ class MicroRunner:
             remaining = 0
 
             # Get actual fill price — but don't block on it
-            actual_sell = await self._get_fill_price(order_id, token_id, effective_sell)
+            actual_sell, _ = await self._get_fill_info(order_id, token_id, effective_sell)
             total_proceeds = chunk * actual_sell
 
             if not self.quiet:
@@ -1552,7 +1605,7 @@ class MicroRunner:
                             price=effective_sell,
                         )
                         retry_order_id = retry_result.get("orderID", retry_result.get("id", ""))
-                        actual_sell = await self._get_fill_price(retry_order_id, token_id, effective_sell)
+                        actual_sell, _ = await self._get_fill_info(retry_order_id, token_id, effective_sell)
                         total_sold = retry_chunk
                         total_proceeds = retry_chunk * actual_sell
                         remaining = 0
@@ -1649,10 +1702,13 @@ class MicroRunner:
                 else:
                     arrow = "─"
 
+                trend = micro.trend_5m
+                trend_str = f" T5m:{trend:+.2%}" if abs(trend) > 0.0001 else ""
+
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
                     f"Mom:{momentum:+.2f} OFI:{ofi:+.2f} "
-                    f"{intensity:.0f}tps"
+                    f"{intensity:.0f}tps{trend_str}"
                 )
 
             n_pos = len(self._positions)
@@ -1670,6 +1726,47 @@ class MicroRunner:
                 f"Prices: {poly_str}[/bold dim]"
                 f"{warmup_str}"
             )
+
+    async def _price_log_loop(self):
+        """Periodically log price snapshots to DB for persistent trend context.
+
+        Runs every trend_log_interval seconds (default 30s). Also prunes
+        old entries to prevent unbounded growth.
+
+        If the standalone `polyedge price-logger` is already running, it
+        will be logging too. That's fine — extra snapshots are harmless
+        and the DB deduplicates by timestamp proximity naturally.
+        """
+        interval = self.config.trend_log_interval
+        prune_counter = 0
+
+        while self.running:
+            await asyncio.sleep(interval)
+
+            for sym in self.agg_feed.symbols:
+                micro = self.agg_feed.get_micro(sym)
+                if not micro or micro.current_price <= 0:
+                    continue
+
+                try:
+                    await self.db.log_micro_price(
+                        symbol=sym,
+                        price=micro.current_price,
+                        ofi_30s=micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0,
+                        volume_30s=micro.flow_30s.total_volume,
+                        trade_intensity=micro.flow_5s.trade_intensity,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log price for {sym}: {e}")
+
+            # Prune old entries every 10 cycles (~5 min at 30s interval)
+            prune_counter += 1
+            if prune_counter >= 10:
+                prune_counter = 0
+                try:
+                    await self.db.prune_micro_price_log(keep_minutes=60)
+                except Exception as e:
+                    logger.warning(f"Failed to prune price log: {e}")
 
     async def _get_bankroll(self) -> float:
         """Get current bankroll from actual USDC balance on chain."""

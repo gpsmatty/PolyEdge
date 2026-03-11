@@ -825,6 +825,44 @@ def pnl_strategy(name):
     run_async(_strategy())
 
 
+@pnl.command("debug-fills")
+@click.option("--limit", "-n", default=5, help="Number of fills to dump")
+def pnl_debug_fills(limit):
+    """Dump raw CLOB fill data to debug fee_rate_bps format."""
+
+    async def _debug():
+        settings = get_settings()
+        from polyedge.core.client import PolyClient
+
+        client = PolyClient(settings)
+        fills = client.get_trades()
+        console.print(f"[cyan]Total fills: {len(fills)}[/cyan]\n")
+
+        for i, f in enumerate(fills[:limit]):
+            console.print(f"[bold]Fill {i+1}:[/bold]")
+            for key in ["id", "side", "size", "price", "fee_rate_bps", "match_time", "type", "market", "asset_id", "taker_order_id", "status"]:
+                val = f.get(key, "MISSING")
+                console.print(f"  {key}: {val}")
+
+            # Compute what the reconciler would compute
+            price = float(f.get("price", 0))
+            size = float(f.get("size", 0))
+            fee_bps = float(f.get("fee_rate_bps", 0))
+            computed_fee = price * size * (fee_bps / 10000)
+            console.print(f"  [yellow]→ computed fee: ${computed_fee:.4f} (price={price} * size={size} * {fee_bps}/10000)[/yellow]")
+            console.print()
+
+        # Summary stats on fee_rate_bps values
+        bps_vals = [float(f.get("fee_rate_bps", 0)) for f in fills]
+        unique_bps = sorted(set(bps_vals))
+        console.print(f"[bold]fee_rate_bps distribution:[/bold]")
+        for v in unique_bps:
+            count = bps_vals.count(v)
+            console.print(f"  {v}: {count} fills")
+
+    run_async(_debug())
+
+
 @pnl.command("cleanup")
 @click.option("--fix", is_flag=True, help="Actually remove orphaned records (default: dry run)")
 def pnl_cleanup(fix):
@@ -1292,6 +1330,114 @@ def micro(auto, dry, verbose, quiet, market, no_warmup):
             await db.close()
 
     run_async(_micro())
+
+
+# --- Price Logger (standalone persistent context builder) ---
+
+
+@cli.command("price-logger")
+@click.option("--symbols", "-s", default="btcusdt", help="Comma-separated symbols to track")
+@click.option("--interval", default=30.0, help="Seconds between DB snapshots")
+def price_logger(symbols, interval):
+    """Standalone price logger — keeps micro_price_log DB table fresh.
+
+    \b
+    Run this in a separate terminal tab. It connects to Binance aggTrade,
+    logs price/OFI/volume snapshots to the DB every 30 seconds, and prunes
+    old entries. The micro sniper reads these on startup for instant
+    cross-restart trend context.
+
+    \b
+    The micro sniper also logs prices itself, but this standalone command
+    ensures the DB stays fresh even when you stop/restart/switch micro runs.
+    If both are running, the DB just gets more frequent snapshots (harmless).
+
+    \b
+    Examples:
+        polyedge price-logger                    # BTC only, 30s intervals
+        polyedge price-logger -s btcusdt,ethusdt # BTC + ETH
+        polyedge price-logger --interval 15      # Log every 15s
+    """
+    from polyedge.core.config import load_config
+    from polyedge.core.db import Database
+    from polyedge.data.binance_aggtrade import BinanceAggTradeFeed
+
+    async def _price_logger():
+        settings = load_config()
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        # Apply DB config overrides
+        from polyedge.core.config import apply_db_config
+        await apply_db_config(settings, db)
+
+        sym_list = [s.strip().lower() for s in symbols.split(",")]
+        feed = BinanceAggTradeFeed(symbols=sym_list)
+
+        console.print(f"[bold green]Price Logger started[/bold green]")
+        console.print(f"[dim]Symbols: {', '.join(s.upper() for s in sym_list)} | Interval: {interval}s[/dim]")
+        console.print(f"[dim]Writing to micro_price_log table...[/dim]")
+
+        async def _log_loop():
+            prune_counter = 0
+            while True:
+                await asyncio.sleep(interval)
+                for sym in sym_list:
+                    micro = feed.get_micro(sym)
+                    if not micro or micro.current_price <= 0:
+                        continue
+                    try:
+                        await db.log_micro_price(
+                            symbol=sym,
+                            price=micro.current_price,
+                            ofi_30s=micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0,
+                            volume_30s=micro.flow_30s.total_volume,
+                            trade_intensity=micro.flow_5s.trade_intensity,
+                        )
+                        trend = micro.trend_5m
+                        console.print(
+                            f"[dim]{sym.upper()}: ${micro.current_price:,.2f} | "
+                            f"OFI(30s): {micro.flow_30s.ofi:+.2f} | "
+                            f"T5m: {trend:+.3%} | "
+                            f"logged[/dim]"
+                        )
+                    except Exception as e:
+                        console.print(f"[yellow]Log failed for {sym}: {e}[/yellow]")
+
+                prune_counter += 1
+                if prune_counter >= 10:
+                    prune_counter = 0
+                    try:
+                        await db.prune_micro_price_log(keep_minutes=60)
+                    except Exception:
+                        pass
+
+        import asyncio as _asyncio
+        tasks = [
+            _asyncio.create_task(feed.start()),
+            _asyncio.create_task(_log_loop()),
+        ]
+
+        try:
+            # Wait for connection
+            for _ in range(50):
+                if feed.is_connected:
+                    break
+                await _asyncio.sleep(0.1)
+            if feed.is_connected:
+                console.print("[green]Binance connected[/green]")
+
+            await _asyncio.gather(*tasks, return_exceptions=True)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Price logger stopped[/yellow]")
+        finally:
+            await feed.stop()
+            for t in tasks:
+                t.cancel()
+            await db.close()
+
+    run_async(_price_logger())
 
 
 # --- Weather Sniper ---

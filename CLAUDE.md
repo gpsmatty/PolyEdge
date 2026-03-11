@@ -89,11 +89,13 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 |------|---------|-------------|
 | `engine.py` | Places orders via CLOB API. Runs risk checks before every trade. Requires user confirmation in copilot mode. | `ExecutionEngine` |
 | `tracker.py` | P&L tracking and display (internal, today's trades). | `PnLTracker` |
-| `reconciler.py` | P&L reconciliation against CLOB API fills. Pulls actual fill prices and fees, matches buy/sell pairs (FIFO), computes gross/net/true-net P&L. Also checks for resolved markets. | `PnLReconciler` |
+| `reconciler.py` | P&L reconciliation against CLOB API fills. Pulls actual fill prices and fees (hardcoded 2% taker fee — CLOB's `fee_rate_bps` field returns 1000/10% cap, not real fee), matches buy/sell pairs (FIFO), computes gross/net/true-net P&L. Also checks for resolved markets. | `PnLReconciler` |
 
 ### CLI (`src/polyedge/cli.py`)
 
-Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `pnl reconcile`, `pnl history`, `pnl strategy`, `status`, `autopilot`, `sniper`, `weather`, `micro`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `pnl reconcile`, `pnl history`, `pnl strategy`, `pnl cleanup`, `pnl debug-fills`, `status`, `autopilot`, `sniper`, `weather`, `micro`, `price-logger`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+
+The `pnl cleanup` command finds orphaned positions/trades (dry run by default, `--fix` to remove). The `pnl debug-fills` command dumps raw CLOB fill data including fee_rate_bps distribution — useful for verifying fee calculations.
 
 The `status` command smoke tests all CLOB connectivity: wallet balance, API creds, open orders, trade history access, and order signing.
 
@@ -121,6 +123,7 @@ All tables in the `polyedge` schema (PostgreSQL). Defined in `core/db.py` as the
 | `agent_memory` | Persistent agent memory: trade decisions, skip reasons, lessons. |
 | `pnl_ledger` | Reconciled P&L entries: each row is a completed buy/sell pair or resolution with gross P&L, fees, net P&L, gas estimate. |
 | `reconcile_state` | Tracks last CLOB API sync cursor for incremental reconciliation. |
+| `micro_price_log` | Persistent price snapshots for micro sniper trend context. Logged every ~30s per symbol. Loaded on startup for cross-restart awareness. Auto-pruned to 60 min. |
 
 ## Polymarket API Details
 
@@ -198,56 +201,68 @@ Defined in `weather_runner.py` `WeatherRunner.run()`. Runs as a persistent async
 
 Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async process, separate from the agent, crypto sniper, and weather sniper. Reads tick-level Binance aggTrade data to momentum-trade Polymarket's 5-minute crypto up/down markets.
 
-1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket. Skips the first partial window to warm up microstructure data — waits for the next fresh window before trading.
-2. **aggTrade callback** (every 5th trade tick, ~2-10 evals/sec) — On each Binance aggTrade, updates `MicroStructure` rolling flow windows (5s/15s/30s OFI, VWAP drift, trade intensity). Evaluates only the current (first) window — rest are pre-loaded for seamless hopping.
-3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 40% OFI_5s + 30% OFI_15s + 20% VWAP drift + 10% intensity surge.
-4. **Entry** — When `|momentum| > 0.40` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.20-0.70, enter a position (BUY YES if bullish, BUY NO if bearish). **30s trend filter**: if entry direction disagrees with the 30-second OFI trend, requires higher threshold of 0.55 (counter_trend_threshold) instead of 0.40. This kills counter-trend entries that are the #1 source of losses.
-5. **Exit** — When momentum reverses past exit_threshold (0.15) against our position, or momentum drops below hold_threshold (0.08) even if aligned, or force exit with <8s remaining.
+1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket. Loads persistent price context from `micro_price_log` DB table (last 30 min) so the bot immediately knows the macro trend on startup. Skips the first partial window to warm up microstructure data — waits for the next fresh window before trading.
+2. **aggTrade callback** (every 5th trade tick, ~2-10 evals/sec) — On each Binance aggTrade, updates `MicroStructure` rolling flow windows (5s/15s/30s/5m OFI, VWAP drift, trade intensity). The 5m window is persistent — does NOT reset on window hops, providing cross-window context. Evaluates only the current (first) window — rest are pre-loaded for seamless hopping.
+3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 10% OFI_5s + 50% OFI_15s + 25% VWAP drift + 15% intensity surge.
+4. **Entry** — When `|momentum| > 0.50` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.35-0.65, enter a position (BUY YES if bullish, BUY NO if bearish). **Entry persistence filter**: signal must sustain for 2 seconds in the same direction (time-based, not count-based). **5-minute trend bias**: if BTC has moved >0.15% in 5 min (from persistent 5m flow window or DB history), blocks or penalizes counter-trend entries. >0.30% = hard block, 0.15%-0.30% = boosts entry_threshold by 0.10. Survives window hops and restarts. **30s trend filter**: if entry direction disagrees with the 30-second OFI trend, requires higher threshold of 0.55 (counter_trend_threshold) instead of 0.50. This kills counter-trend entries that are the #1 source of losses.
+5. **Exit** — Three triggers: (a) momentum reverses past exit_threshold (0.20) against our position, (b) trailing stop triggers at 12% drawdown from high water mark (locks in profits on winners), (c) force exit with <8s remaining. Hold threshold is disabled (set to 0) — caused premature exits on momentum pauses.
+5a. **Exit escalation** — Each failed FOK sell attempt adds 3 cents to the floor price slippage, preventing stuck exit loops where the bot tries to sell 7+ times while the price drops.
 6. **Flip** — Disabled by default (`enable_flips=false`). Strong reversals trigger EXIT instead. When enabled: momentum reverses past flip_threshold (0.50) with confidence > 0.50 and at least 25 trades → close + open opposite side.
 7. **Window hopping** — Pre-loads 10 upcoming windows. When current window expires, instantly promotes next window. Refetches from API when ≤3 windows remain. Uses `asyncio.Lock` to prevent concurrent API fetches.
 8. **Gap detection** — If >5 seconds pass between aggTrade ticks (WebSocket disconnect), resets all flow windows to avoid trading on stale momentum.
-9. **Trade cooldown** — 10 seconds between trades on the same market to prevent whipsaw.
-10. **Status** — Prints microstructure state every 15 seconds.
+9. **Trade cooldown** — 30 seconds between trades on the same market to prevent whipsaw re-entries (sell at loss then re-buy at worse price).
+10. **Config/signal logging** — Every trade logs `config_snapshot` (all thresholds, weights, persistence settings) and `signal_data` (momentum, OFI, VWAP drift, intensity, prices, seconds remaining) as JSONB columns for backtesting.
+11. **Status** — Prints microstructure state every 15 seconds.
 
 The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "btc 5m"`. Flags: `--auto` (auto-execute), `--dry` (watch only), `--market` (filter by keyword), `-v` (verbose), `-q` (quiet).
 
 **Micro sniper config keys** (all under `strategies.micro_sniper.*`):
 - `enabled` (bool, default true)
 - `symbols` (list[str], default ["btcusdt"])
-- `entry_threshold` (float, default 0.40) — momentum threshold for with-trend entries
+- `entry_threshold` (float, default 0.50) — only enter on strong momentum; 0.40 lets in too much noise, winners consistently >0.55
 - `counter_trend_threshold` (float, default 0.55) — higher bar for entries against the 30s trend
-- `exit_threshold` (float, default 0.15)
-- `hold_threshold` (float, default 0.08)
+- `exit_threshold` (float, default 0.20) — exit when momentum reverses moderately, don't wait for full reversal
+- `hold_threshold` (float, default 0, DISABLED) — was causing premature exits on momentum pauses. Trailing stop + exit_threshold handle all exits.
+- `entry_persistence_enabled` (bool, default true) — filter out sub-second momentum spikes
+- `entry_persistence_seconds` (float, default 2.0) — signal must sustain for 2 seconds in same direction (count-based was too fast at ~450ms)
 - `enable_flips` (bool, default false) — disabled by default, strong reversals just EXIT
 - `flip_threshold` (float, default 0.50) — only used if enable_flips=true
 - `flip_min_confidence` (float, default 0.50)
 - `min_confidence` (float, default 0.40)
-- `min_trades_in_window` (int, default 10)
+- `min_trades_in_window` (int, default 10) — need enough data for OFI to be meaningful
 - `min_trades_for_flip` (int, default 25)
-- `min_seconds_remaining` (float, default 15.0)
-- `force_exit_seconds` (float, default 8.0)
-- `min_entry_price` (float, default 0.20) — raised from 0.15, don't fight the market
-- `max_entry_price` (float, default 0.70) — lowered from 0.80, avoid overpaying
+- `min_seconds_remaining` (float, default 15.0) — don't enter with <15s left
+- `force_exit_seconds` (float, default 8.0) — dump everything with <8s left in window
+- `trailing_stop_enabled` (bool, default true) — locks in profits on winners
+- `trailing_stop_pct` (float, default 0.12) — exit when price drops 12% from HWM. Was 0.25 (too loose, exited below entry)
+- `min_entry_price` (float, default 0.35) — avoid deep OTM positions with huge % swings
+- `max_entry_price` (float, default 0.65) — avoid overpaying near certainty
 - `max_position_per_trade` (float, default 0.03 = 3% of bankroll) — used if fixed_position_usd is 0
-- `fixed_position_usd` (float, default 10.0) — fixed $ per trade, 0 = use Kelly sizing
-- `max_trades_per_window` (int, default 50)
-- `min_liquidity` (float, default 500)
+- `fixed_position_usd` (float, default 5.0) — fixed $5 per trade, 0 = use Kelly sizing
+- `max_trades_per_window` (int, default 8) — cap trades per 15-min window. Was 20 — too many in chop, fee death
+- `min_liquidity` (float, default 500) — skip markets with <$500 liquidity
 - `dead_market_band` (float, default 0.02) — skip entry when YES is within this band of 0.50 (market not reacting to price moves)
-- `weight_ofi_5s` (float, default 0.20) — weight of 5s OFI in momentum composite
-- `weight_ofi_15s` (float, default 0.40) — weight of 15s OFI in momentum composite
-- `weight_vwap_drift` (float, default 0.25) — weight of VWAP drift in momentum composite
-- `weight_intensity` (float, default 0.15) — weight of trade intensity surge in momentum composite
-- `entry_slippage` (float, default 0.02) — cents above market to bid for instant FOK fill on entry
-- `exit_slippage` (float, default 0.02) — cents below market to sell for instant FOK fill on exit
-- `trade_cooldown` (float, default 10.0) — seconds between trades on same condition_id
-- `window_hop_cooldown` (float, default 30.0) — seconds to wait after hopping to a new window before trading
-- `counter_trend_exit_threshold` (float, default 0.65) — higher exit threshold when 30s trend still agrees with position
+- `weight_ofi_5s` (float, default 0.10) — 5s OFI — short burst, noisy
+- `weight_ofi_15s` (float, default 0.50) — 15s OFI — main signal, most reliable
+- `weight_vwap_drift` (float, default 0.25) — price movement weighted by volume
+- `weight_intensity` (float, default 0.15) — trade rate spike detection
+- `entry_slippage` (float, default 0.02) — 2 cents above market for instant FOK fill on entry
+- `exit_slippage` (float, default 0.05) — 5 cents below market floor for FOK. Was 0.02, caused repeated FOK rejections
+- `trade_cooldown` (float, default 30.0) — 30 seconds between trades on same market. Was 10 — too fast, caused buy-sell-rebuy at worse price
+- `window_hop_cooldown` (float, default 30.0) — 30 seconds after window hop before trading
+- `counter_trend_exit_threshold` (float, default 0.45) — when 30s trend agrees with us, tolerate more reversal before exiting
 - `poly_book_enabled` (bool, default false) — master toggle for Polymarket order book integration
 - `poly_book_min_exit_depth` (float, default 20.0) — min bid depth (contracts within 5c) to enter; ensures exit path exists
 - `poly_book_imbalance_weight` (float, default 0.10) — weight of Poly book imbalance in momentum composite
 - `poly_book_imbalance_veto` (float, default -0.40) — block entry if Poly book imbalance is this negative against our direction
 - `poly_book_exit_override_depth` (float, default 25.0) — hold instead of exit if our token's bid depth exceeds this
 - `poly_book_exit_override_imbalance` (float, default 0.15) — hold instead of exit if directional imbalance exceeds this
+- `trend_bias_enabled` (bool, default true) — uses 5-minute rolling window + DB price history to block counter-trend entries
+- `trend_bias_min_pct` (float, default 0.0015) — 0.15% move over 5 min to consider "trending" (boosts entry threshold)
+- `trend_bias_strong_pct` (float, default 0.003) — 0.30% move = strong trend, hard blocks counter-trend entries
+- `trend_bias_counter_boost` (float, default 0.10) — added to entry_threshold for moderate counter-trend entries
+- `trend_log_interval` (float, default 30.0) — seconds between DB price log snapshots
+- `trend_warmup_seconds` (float, default 60.0) — seconds of live data needed before trend is trusted
 
 ### Polymarket Order Book Integration (Micro Sniper)
 

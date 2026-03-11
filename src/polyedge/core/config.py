@@ -224,6 +224,17 @@ class MicroSniperConfig(BaseModel):
     entry_persistence_count: int = 3              # DEPRECATED: use entry_persistence_seconds
     entry_persistence_seconds: float = 2.0        # Momentum must hold for 2s before entry
 
+    # --- Persistent trend context ---
+    # Uses a 5-minute rolling window + DB price history to know the macro
+    # trend. Blocks entries against the trend (e.g., don't short into a rally).
+    # This is the "persistence" feature: cross-window, cross-restart awareness.
+    trend_bias_enabled: bool = True              # Master toggle for trend bias veto
+    trend_bias_min_pct: float = 0.0015           # 0.15% move over 5 min to consider "trending"
+    trend_bias_strong_pct: float = 0.003         # 0.30% move = strong trend, block counter-trend entirely
+    trend_bias_counter_boost: float = 0.10       # Add this to entry_threshold for counter-trend entries (when between min and strong)
+    trend_log_interval: float = 30.0             # Seconds between DB price log snapshots
+    trend_warmup_seconds: float = 60.0           # Seconds of live data needed before trend is trusted
+
     # --- Trailing stop loss ---
     # Tracks the high water mark (HWM) of our side's price since entry.
     # If price drops trailing_stop_pct from the HWM, trigger an exit.

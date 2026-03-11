@@ -198,12 +198,23 @@ class MicroStructure:
     flow_15s: TradeFlowWindow = field(default=None)
     flow_30s: TradeFlowWindow = field(default=None)
 
+    # Persistent 5-minute flow window — NEVER reset on window hops.
+    # This provides cross-window context: "BTC has been trending up for
+    # the last 5 minutes" even when we just hopped to a new Polymarket window.
+    # The short windows (5s/15s/30s) reset on hop for clean per-window signals.
+    flow_5m: TradeFlowWindow = field(default=None)
+
     # Price tracking for the current prediction market window
     window_start_price: float = 0.0
     window_start_time: float = 0.0
     current_price: float = 0.0
     tick_count: int = 0
     last_update_time: float = 0.0  # monotonic time of last aggTrade
+
+    # Persistent price context loaded from DB on startup.
+    # List of (price, timestamp) tuples from micro_price_log.
+    # Updated on startup and periodically as new snapshots are logged.
+    price_history: list = field(default_factory=list)
 
     # Configurable momentum weights (set from MicroSniperConfig)
     weight_ofi_5s: float = 0.20
@@ -218,21 +229,26 @@ class MicroStructure:
             self.flow_15s = TradeFlowWindow(symbol=self.symbol, window_seconds=15.0)
         if self.flow_30s is None:
             self.flow_30s = TradeFlowWindow(symbol=self.symbol, window_seconds=30.0)
+        if self.flow_5m is None:
+            self.flow_5m = TradeFlowWindow(symbol=self.symbol, window_seconds=300.0)
 
     def add_trade(self, trade: AggTrade):
         """Add a trade to all windows.
 
         Detects gaps (>5s since last trade) which indicate a WebSocket
-        disconnect/reconnect. After a gap, reset all windows to avoid
-        stale momentum signals from pre-disconnect data.
+        disconnect/reconnect. After a gap, reset short windows to avoid
+        stale momentum signals from pre-disconnect data. The persistent
+        5m window is NOT reset on gaps — it auto-prunes old data anyway.
         """
         now = time.monotonic()
         if self.last_update_time > 0 and (now - self.last_update_time) > 5.0:
-            # Gap detected — WS was likely disconnected. Reset windows
+            # Gap detected — WS was likely disconnected. Reset SHORT windows
             # so we don't trade on stale momentum from before the gap.
+            # The 5m persistent window is left alone — it self-prunes and
+            # provides cross-window context that survives brief disconnects.
             logger.info(
                 f"{self.symbol}: {now - self.last_update_time:.1f}s gap detected, "
-                f"resetting flow windows"
+                f"resetting short flow windows"
             )
             self.flow_5s.reset()
             self.flow_15s.reset()
@@ -242,12 +258,17 @@ class MicroStructure:
         self.flow_5s.add(trade)
         self.flow_15s.add(trade)
         self.flow_30s.add(trade)
+        self.flow_5m.add(trade)
         self.current_price = trade.price
         self.tick_count += 1
         self.last_update_time = now
 
     def start_window(self, price: float):
-        """Reset tracking for a new prediction market window."""
+        """Reset tracking for a new prediction market window.
+
+        Only resets per-window state. The persistent 5m flow window is
+        deliberately NOT reset — it provides cross-window context.
+        """
         self.window_start_price = price
         self.window_start_time = time.time()
         self.current_price = price
@@ -259,6 +280,45 @@ class MicroStructure:
         if self.window_start_price <= 0:
             return 0.0
         return (self.current_price - self.window_start_price) / self.window_start_price
+
+    @property
+    def trend_5m(self) -> float:
+        """5-minute price trend from the persistent flow window.
+
+        Returns fractional change: (current - oldest_in_5m) / oldest.
+        Positive = BTC trending up over 5 minutes.
+        Falls back to DB-loaded price_history if flow_5m has no data yet
+        (e.g., right after startup before 5 min of live data).
+        """
+        # First try live 5m window
+        if self.flow_5m.is_active and self.flow_5m._trades:
+            oldest = self.flow_5m._trades[0].price
+            newest = self.current_price
+            if oldest > 0 and newest > 0:
+                return (newest - oldest) / oldest
+
+        # Fall back to DB-loaded price history
+        if self.price_history and self.current_price > 0:
+            oldest_price = self.price_history[0][0]  # (price, timestamp)
+            if oldest_price > 0:
+                return (self.current_price - oldest_price) / oldest_price
+
+        return 0.0
+
+    @property
+    def ofi_5m(self) -> float:
+        """5-minute aggregate OFI from the persistent flow window."""
+        return self.flow_5m.ofi if self.flow_5m.is_active else 0.0
+
+    @property
+    def trend_direction(self) -> str:
+        """Human-readable trend direction: 'up', 'down', or 'flat'."""
+        t = self.trend_5m
+        if t > 0.001:  # >0.1%
+            return "up"
+        elif t < -0.001:
+            return "down"
+        return "flat"
 
     @property
     def momentum_signal(self) -> float:

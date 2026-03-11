@@ -182,11 +182,13 @@ class PnLReconciler:
             if size <= 0:
                 continue
 
-            # Fee calculation: fee_rate_bps is in basis points
-            buy_fee_bps = float(buy.get("fee_rate_bps", 0))
-            sell_fee_bps = float(sell.get("fee_rate_bps", 0))
-            buy_fee = buy_price * size * (buy_fee_bps / 10000)
-            sell_fee = sell_price * size * (sell_fee_bps / 10000)
+            # Fee calculation: CLOB fee_rate_bps returns 1000 (10%) on all
+            # fills, which is the max/cap — NOT the actual fee charged.
+            # Polymarket's real taker fee is 2% (200 bps), maker fee is 0%.
+            # Use known rates instead of the misleading API field.
+            TAKER_FEE_BPS = 200  # 2% taker fee
+            buy_fee = buy_price * size * (TAKER_FEE_BPS / 10000)
+            sell_fee = sell_price * size * (TAKER_FEE_BPS / 10000)
             total_fees = buy_fee + sell_fee
 
             gross_pnl = (sell_price - buy_price) * size

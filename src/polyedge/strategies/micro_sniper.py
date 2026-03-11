@@ -225,6 +225,47 @@ class MicroSniperStrategy:
         """Check if we should open a new position."""
         abs_momentum = abs(momentum)
 
+        # --- 5-minute persistent trend bias ---
+        # The macro trend from the 5-minute rolling window (persists across
+        # window hops and restarts via DB). If BTC has been trending up for
+        # 5 minutes, don't buy NO on a brief dip — it's a pullback, not a
+        # reversal. This is the "persistence" that was missing.
+        trend_5m = micro.trend_5m
+        if self.config.trend_bias_enabled and abs(trend_5m) > 0:
+            # Check if we have enough data to trust the trend
+            flow_age = 0.0
+            if micro.flow_5m.is_active and micro.flow_5m._trades:
+                flow_age = micro.flow_5m._trades[-1].timestamp - micro.flow_5m._trades[0].timestamp
+            has_db_context = len(micro.price_history) > 0
+            trend_trusted = flow_age >= self.config.trend_warmup_seconds or has_db_context
+
+            if trend_trusted:
+                is_counter_5m = (
+                    (is_bullish and trend_5m < -self.config.trend_bias_min_pct) or
+                    (not is_bullish and trend_5m > self.config.trend_bias_min_pct)
+                )
+
+                if is_counter_5m:
+                    # Strong trend = hard block
+                    if abs(trend_5m) >= self.config.trend_bias_strong_pct:
+                        if not hasattr(self, '_trend_block_logged') or self._trend_block_logged.get(micro.symbol) != is_bullish:
+                            if not hasattr(self, '_trend_block_logged'):
+                                self._trend_block_logged = {}
+                            self._trend_block_logged[micro.symbol] = is_bullish
+                            console.print(
+                                f"[dim red]TREND BLOCK: {'YES' if is_bullish else 'NO'} entry blocked — "
+                                f"5m trend {trend_5m:+.3%} ({'up' if trend_5m > 0 else 'down'}) "
+                                f"is too strong to fight[/dim red]"
+                            )
+                        return None
+
+                    # Moderate trend = boost threshold
+                    # (applied on top of the 30s counter-trend boost below)
+                else:
+                    # Clear the log tracker when direction aligns
+                    if hasattr(self, '_trend_block_logged'):
+                        self._trend_block_logged.pop(micro.symbol, None)
+
         # 30s trend filter — if entry direction disagrees with the dominant
         # 30-second trend, require a higher momentum threshold. This kills
         # counter-trend entries that are the #1 source of losses.
@@ -234,6 +275,16 @@ class MicroSniperStrategy:
             self.config.counter_trend_threshold if is_counter_trend
             else self.config.entry_threshold
         )
+
+        # Apply 5m trend bias boost on top of 30s filter
+        if self.config.trend_bias_enabled and abs(trend_5m) >= self.config.trend_bias_min_pct:
+            is_counter_5m = (
+                (is_bullish and trend_5m < -self.config.trend_bias_min_pct) or
+                (not is_bullish and trend_5m > self.config.trend_bias_min_pct)
+            )
+            if is_counter_5m and abs(trend_5m) < self.config.trend_bias_strong_pct:
+                # Moderate counter-trend: add boost to threshold
+                effective_threshold += self.config.trend_bias_counter_boost
 
         # Need strong enough signal
         if abs_momentum < effective_threshold:
