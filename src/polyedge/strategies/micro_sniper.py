@@ -118,6 +118,8 @@ class MicroSniperStrategy:
         seconds_remaining: float,
         current_position: Optional[str] = None,  # "yes", "no", or None
         book_intel: Optional[dict[str, BookIntelligence]] = None,  # {"yes": ..., "no": ...}
+        entry_price: Optional[float] = None,       # For trailing stop
+        high_water_mark: Optional[float] = None,   # For trailing stop
     ) -> Optional[MicroOpportunity]:
         """Evaluate a single up/down market against current microstructure.
 
@@ -127,6 +129,8 @@ class MicroSniperStrategy:
             seconds_remaining: Seconds left in the market window.
             current_position: "yes" if holding YES, "no" if holding NO, None if flat.
             book_intel: Polymarket order book intelligence for YES and NO tokens.
+            entry_price: Entry price for current position (trailing stop).
+            high_water_mark: Highest price seen since entry (trailing stop).
 
         Returns:
             MicroOpportunity if action should be taken, None otherwise.
@@ -192,6 +196,7 @@ class MicroSniperStrategy:
             return self._evaluate_with_position(
                 market, micro, seconds_remaining, current_position,
                 momentum, confidence, is_bullish, book_intel,
+                entry_price, high_water_mark,
             )
 
         # --- Check if we should enter ---
@@ -365,10 +370,55 @@ class MicroSniperStrategy:
         confidence: float,
         is_bullish: bool,
         book_intel: Optional[dict[str, BookIntelligence]] = None,
+        entry_price: Optional[float] = None,
+        high_water_mark: Optional[float] = None,
     ) -> Optional[MicroOpportunity]:
         """Evaluate when we already have a position — exit, hold, or flip."""
         abs_momentum = abs(momentum)
         holding_yes = current_position == "yes"
+
+        # --- TRAILING STOP LOSS ---
+        # When enabled: tracks the high water mark (HWM) of our position's price.
+        # Once price has risen above entry by min_profit_pct, the stop is "armed".
+        # If price drops trailing_stop_pct from HWM, trigger exit.
+        # Late in the window (last trailing_stop_late_seconds), tighten to trailing_stop_late_pct.
+        if self.config.trailing_stop_enabled and entry_price and high_water_mark:
+            our_price = market.yes_price if holding_yes else market.no_price
+            profit_from_entry = (high_water_mark - entry_price) / entry_price if entry_price > 0 else 0
+
+            # Only arm the stop after we've seen meaningful profit
+            if profit_from_entry >= self.config.trailing_stop_min_profit_pct:
+                # Time-scaled stop: tighter late in the window
+                if seconds_remaining < self.config.trailing_stop_late_seconds:
+                    stop_pct = self.config.trailing_stop_late_pct
+                else:
+                    stop_pct = self.config.trailing_stop_pct
+
+                drawdown_from_hwm = (high_water_mark - our_price) / high_water_mark if high_water_mark > 0 else 0
+
+                if drawdown_from_hwm >= stop_pct:
+                    console.print(
+                        f"[bold yellow]TRAILING STOP: {'YES' if holding_yes else 'NO'} "
+                        f"entry=${entry_price:.2f} → HWM=${high_water_mark:.2f} → "
+                        f"now=${our_price:.2f} (drawdown {drawdown_from_hwm:.0%} ≥ {stop_pct:.0%}) "
+                        f"— locking in profit[/bold yellow]"
+                    )
+                    return MicroOpportunity(
+                        market=market,
+                        symbol=micro.symbol,
+                        action=MicroAction.EXIT,
+                        side=Side.YES if holding_yes else Side.NO,
+                        momentum=momentum,
+                        confidence=confidence,
+                        ofi_5s=micro.flow_5s.ofi,
+                        ofi_15s=micro.flow_15s.ofi,
+                        vwap_drift=micro.flow_15s.vwap_drift,
+                        trade_intensity=micro.flow_5s.trade_intensity,
+                        binance_price=micro.current_price,
+                        price_change_pct=micro.price_change_pct,
+                        market_price=our_price,
+                        seconds_remaining=seconds_remaining,
+                    )
 
         # --- TIME-SCALED FLOOR EXIT ---
         # Prevents catastrophic ride-to-zero, but only when price is low AND

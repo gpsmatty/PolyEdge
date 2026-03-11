@@ -181,6 +181,10 @@ class MicroRunner:
         # Position tracking per market: condition_id -> "yes" | "no" | None
         self._positions: dict[str, str] = {}
 
+        # Trailing stop tracking: condition_id -> {"entry_price": float, "hwm": float}
+        # Maintained in parallel with _positions for minimal refactor risk.
+        self._position_info: dict[str, dict] = {}
+
         # Trade tracking
         self._trades_this_window: int = 0
         self._total_trades: int = 0
@@ -802,6 +806,7 @@ class MicroRunner:
         if expired:
             cid = expired.condition_id
             pos = self._positions.pop(cid, None)
+            self._position_info.pop(cid, None)
             if pos and not self.quiet:
                 console.print(
                     f"[yellow]Window expired — auto-closed {pos.upper()} position on "
@@ -979,6 +984,13 @@ class MicroRunner:
 
         current_pos = self._positions.get(market.condition_id)
 
+        # --- Trailing stop: update high water mark on every tick ---
+        if current_pos and market.condition_id in self._position_info:
+            info = self._position_info[market.condition_id]
+            our_price = market.yes_price if current_pos == "yes" else market.no_price
+            if our_price > info["hwm"]:
+                info["hwm"] = our_price
+
         # Check max trades per window — only block NEW entries, never exits.
         # A position must always be able to exit regardless of trade count.
         if not current_pos and self._trades_this_window >= self.config.max_trades_per_window:
@@ -1003,12 +1015,22 @@ class MicroRunner:
                     f"{market.condition_id[:8]} (poly_books={len(self.poly_feed.books)})[/dim yellow]"
                 )
 
+        # Pass trailing stop info to strategy if we have a position
+        entry_price = None
+        high_water_mark = None
+        if current_pos and market.condition_id in self._position_info:
+            info = self._position_info[market.condition_id]
+            entry_price = info["entry_price"]
+            high_water_mark = info["hwm"]
+
         opp = self.strategy.evaluate(
             market=market,
             micro=micro,
             seconds_remaining=remaining,
             current_position=current_pos,
             book_intel=book_intel,
+            entry_price=entry_price,
+            high_water_mark=high_water_mark,
         )
 
         if opp:
@@ -1077,14 +1099,19 @@ class MicroRunner:
             # Update virtual position tracking even in dry run
             if action == MicroAction.EXIT:
                 self._positions.pop(cid, None)
+                self._position_info.pop(cid, None)
             elif action == MicroAction.FLIP_YES:
                 self._positions[cid] = "yes"
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
             elif action == MicroAction.FLIP_NO:
                 self._positions[cid] = "no"
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
             elif action == MicroAction.BUY_YES:
                 self._positions[cid] = "yes"
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
             elif action == MicroAction.BUY_NO:
                 self._positions[cid] = "no"
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
 
             self._trades_this_window += 1
             self._total_trades += 1
@@ -1199,6 +1226,7 @@ class MicroRunner:
             success = await self._close_position(self.engine, opp)
             if success:
                 self._positions.pop(cid, None)
+                self._position_info.pop(cid, None)
                 self._trades_this_window += 1
                 self._total_trades += 1
                 self._last_trade_log[cid] = time.time()
@@ -1285,6 +1313,7 @@ class MicroRunner:
                     logger.warning(f"DB recording failed (non-fatal): {e}")
 
                 self._positions[cid] = "yes" if opp.side == Side.YES else "no"
+                self._position_info[cid] = {"entry_price": actual_entry, "hwm": actual_entry}
                 self._trades_this_window += 1
                 self._total_trades += 1
                 self._last_trade_log[cid] = time.time()
