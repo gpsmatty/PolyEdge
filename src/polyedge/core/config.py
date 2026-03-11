@@ -187,6 +187,10 @@ class MicroSniperConfig(BaseModel):
     weight_vwap_drift: float = 0.25        # VWAP drift signal
     weight_intensity: float = 0.15         # Trade intensity surge
 
+    # Slippage: how many cents above market to bid for instant fill
+    entry_slippage: float = 0.02           # Pay up to 2c more for entry FOK fill
+    exit_slippage: float = 0.02            # Sell up to 2c below market for exit FOK fill
+
 
 class MarketMakerConfig(BaseModel):
     enabled: bool = False

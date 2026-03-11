@@ -1100,7 +1100,8 @@ class MicroRunner:
         # place_fok_order takes USD amount directly — SDK handles rounding to avoid
         # the "invalid amounts" error where maker_amount has >2 decimal places.
         price = opp.market_price
-        entry_price = min(round(price + 0.01, 2), 0.99)  # Pay up to 1c more for instant fill
+        slippage = self.config.entry_slippage
+        entry_price = min(round(price + slippage, 2), 0.99)  # Pay up to Nc more for instant fill
         size = round(size_usd / entry_price, 2) if entry_price > 0 else 0
 
         signal = self.strategy.opportunity_to_signal(opp)
@@ -1205,11 +1206,11 @@ class MicroRunner:
             console.print("[red]  No token ID — can't close position[/red]")
             return False
 
-        # Sell price floor: 2c below market. FOK fills at best available bid
-        # but won't go below this floor. Keep it tight to avoid giving away
-        # profits on exit. If FOK rejects, we retry on next eval tick when
-        # the book refreshes — better than panic-selling 10c below market.
-        sell_price = max(0.01, round(price - 0.02, 2))
+        # Sell price floor: Nc below market (configurable). FOK fills at best
+        # available bid but won't go below this floor. If FOK rejects, we retry
+        # on next eval tick when the book refreshes.
+        exit_slip = self.config.exit_slippage
+        sell_price = max(0.01, round(price - exit_slip, 2))
 
         # Get entry price from DB for P&L calculation
         entry_price = 0.0
