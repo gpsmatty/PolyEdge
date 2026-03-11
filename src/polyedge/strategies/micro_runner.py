@@ -1275,29 +1275,45 @@ class MicroRunner:
                 actual_entry = await self._get_fill_price(poly_order_id, token_id, entry_price)
                 actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
 
-                # Try CLOB balance — if settled, use real value. If not (returns 0
-                # or garbage), fall back to estimate with 2% haircut.
+                # Query CLOB for real token balance after fill.
+                # The CLOB balance endpoint lags settlement — returns 0 immediately
+                # after fill. Wait 1.5s (on top of the ~0.5s from _get_fill_price)
+                # to give it time to settle. This doesn't affect exit speed since
+                # we can't exit until momentum reverses anyway.
                 estimated_size = actual_size
+                await asyncio.sleep(1.5)
                 try:
                     bal = self.client.get_token_balance(token_id)
                     raw_bal = bal.get("balance", 0) if isinstance(bal, dict) else bal
                     raw_float = float(str(raw_bal))
-                    # Try microunit interpretation first (raw / 1e6)
-                    as_micro = int(raw_float / 1e6 * 100) / 100
-                    # Check if microunit is close to our estimate (within 50%)
-                    if as_micro > 0 and abs(as_micro - estimated_size) < estimated_size * 0.5:
-                        actual_size = as_micro
-                        logger.info(f"CLOB balance (micro): {actual_size} shares (est={estimated_size:.2f})")
-                    elif raw_float > 0 and raw_float < estimated_size * 3:
-                        # Direct value, close to estimate
-                        actual_size = int(raw_float * 100) / 100
-                        logger.info(f"CLOB balance (direct): {actual_size} shares (est={estimated_size:.2f})")
-                    else:
-                        # CLOB not settled yet or garbage — use haircut estimate
-                        actual_size = int(estimated_size * 0.98 * 100) / 100
-                        logger.info(f"CLOB balance unusable (raw={raw_bal}), using estimate {actual_size}")
-                except Exception:
-                    actual_size = int(estimated_size * 0.98 * 100) / 100
+                    # Print raw value to console so we can see exactly what CLOB returns
+                    console.print(f"  [dim]CLOB balance: raw={raw_bal} | full_response={bal} | est={estimated_size:.2f}[/dim]")
+
+                    # Polymarket conditional tokens use 6 decimals (like USDC).
+                    # But we've seen raw=51698 for ~8.4 shares, which doesn't match
+                    # 6 decimals (51698/1e6=0.05) or direct (51698 shares).
+                    # Try multiple interpretations and pick the one closest to estimate.
+                    candidates = []
+                    for divisor, label in [(1e6, "6dec"), (1e4, "4dec"), (1e3, "3dec"), (1, "direct")]:
+                        val = int(raw_float / divisor * 100) / 100
+                        if val > 0:
+                            candidates.append((abs(val - estimated_size), val, label))
+                    candidates.sort()  # Sort by distance from estimate
+
+                    if candidates and candidates[0][1] > 0:
+                        best_val = candidates[0][1]
+                        best_label = candidates[0][2]
+                        # Accept if within 50% of estimate
+                        if abs(best_val - estimated_size) < estimated_size * 0.5:
+                            actual_size = best_val
+                            console.print(f"  [dim]Using CLOB balance: {actual_size} shares ({best_label})[/dim]")
+                        else:
+                            # No interpretation is close — use estimate
+                            actual_size = int(estimated_size * 100) / 100
+                            console.print(f"  [dim]CLOB balance unusable (best={best_val} via {best_label}), using estimate {actual_size}[/dim]")
+                except Exception as e:
+                    logger.warning(f"Token balance query failed: {e}")
+                    actual_size = int(estimated_size * 100) / 100
 
                 # Record in DB with actual fill price
                 try:
