@@ -212,8 +212,9 @@ class MicroRunner:
 
         The generic volume-sorted fetch misses short-duration crypto markets
         because they're buried behind high-volume political markets. Instead,
-        sort by endDate ascending (soonest-ending = currently live) and page
-        through until we find matches. Typically finds them within 2-5 pages.
+        sort by endDate ascending with end_date_min=now so the soonest-expiring
+        (currently live) windows come first. This guarantees we always get the
+        active window instead of accidentally skipping to a future one.
         """
         import aiohttp
         from polyedge.data.markets import _parse_market
@@ -221,13 +222,15 @@ class MicroRunner:
         gamma_url = self.settings.polymarket.gamma_url
         found: list[Market] = []
         batch_size = 100
+        now = datetime.now(timezone.utc)
 
-        console.print("[dim]Targeted fetch (newest markets first)...[/dim]")
+        console.print("[dim]Targeted fetch (soonest-expiring first)...[/dim]")
 
-        # Sort by endDate DESCENDING — newest/soonest-expiring markets first.
-        # The ascending sort returned ancient 2025 markets and never reached
-        # the March 2026 crypto markets within the page limit.
-        for page in range(20):  # Up to 2000 markets, newest first
+        # Sort by endDate ASCENDING with end_date_min=now.
+        # ASC puts the soonest-ending (currently live) windows first.
+        # end_date_min filters out expired/ancient markets that used to
+        # pollute the ascending sort with stale 2025 data.
+        for page in range(20):  # Up to 2000 markets
             url = f"{gamma_url}/markets"
             params = {
                 "limit": batch_size,
@@ -235,7 +238,8 @@ class MicroRunner:
                 "active": "true",
                 "closed": "false",
                 "order": "endDate",
-                "ascending": "false",
+                "ascending": "true",
+                "end_date_min": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
 
             try:
@@ -407,19 +411,27 @@ class MicroRunner:
             except Exception as e:
                 console.print(f"[yellow]Exchange approval check failed: {e}[/yellow]")
 
-        # Initial market load — try DB first (fast), only full sync if empty.
-        # DB has markets from prior syncs. The key fix: limit=50000 so the
-        # volume-sorted DB query doesn't cut off low-volume 5-min crypto markets.
-        console.print("[dim]Loading markets from DB...[/dim]")
-        await self._refresh_markets()
+        # Initial market load — always use _quick_sync for crypto 5-min markets.
+        # The generic indexer.sync() sorts by volume and misses low-volume
+        # short-duration markets. _quick_sync sorts by endDate ASC with
+        # end_date_min=now, so the currently-live window is always first.
+        console.print("[dim]Loading markets...[/dim]")
+        try:
+            fetched = await self._quick_sync()
+            if fetched:
+                await self._refresh_markets(prefetched=fetched)
+        except Exception as e:
+            console.print(f"[yellow]Quick sync failed ({e}), trying DB...[/yellow]")
+            await self._refresh_markets()
+
         if self._total_markets == 0:
-            console.print("[yellow]No matching markets in DB — syncing from API...[/yellow]")
+            console.print("[yellow]No matching markets found — retrying API...[/yellow]")
             try:
-                synced = await self.indexer.sync(force=True)
-                console.print(f"[green]Synced {synced} markets[/green]")
-                await self._refresh_markets()
+                fetched = await self._quick_sync()
+                if fetched:
+                    await self._refresh_markets(prefetched=fetched)
             except Exception as e:
-                console.print(f"[yellow]Sync failed ({e})[/yellow]")
+                console.print(f"[yellow]Retry failed ({e})[/yellow]")
 
         # Narrow Binance feeds to ONLY symbols with matching markets.
         # No point subscribing to ETH/SOL/XRP/DOGE streams when we're
@@ -612,21 +624,26 @@ class MicroRunner:
                         len(v) for v in self.updown_markets.values()
                     )
 
-                    # If we're running low on windows, do a full sync to refill
+                    # If we're running low on windows, quick_sync to refill
                     if self._total_markets <= 3 and not self._sync_lock.locked():
                         try:
                             async with self._sync_lock:
-                                await self.indexer.sync(force=True)
-                            await self._refresh_markets()
+                                fetched = await self._quick_sync()
+                            if fetched:
+                                await self._refresh_markets(prefetched=fetched)
                         except Exception as e:
-                            logger.warning(f"Sync failed: {e}")
+                            logger.warning(f"Quick sync failed: {e}")
                 else:
-                    # Full sync for unfiltered mode
+                    # Unfiltered mode — still use _quick_sync for accuracy
                     try:
-                        await self.indexer.sync()
+                        fetched = await self._quick_sync()
+                        if fetched:
+                            await self._refresh_markets(prefetched=fetched)
+                        else:
+                            await self._refresh_markets()
                     except Exception as e:
-                        logger.warning(f"Background sync failed: {e}")
-                    await self._refresh_markets()
+                        logger.warning(f"Sync failed: {e}")
+                        await self._refresh_markets()
 
             except Exception as e:
                 logger.error(f"Market refresh failed: {e}")
@@ -832,23 +849,25 @@ class MicroRunner:
                 f"\n[bold green]{'='*60}[/bold green]\n"
             )
         else:
-            # No next window pre-loaded — need to refresh from DB/API
+            # No next window pre-loaded — need to fetch from API
             console.print("[yellow]Window expired, no next window cached — refreshing...[/yellow]")
             self._trades_this_window = 0
             self._last_hop_time = time.time()
 
-            # Quick DB read first
-            await self._refresh_markets()
-
-            if self._total_markets == 0 and not self._sync_lock.locked():
-                # DB doesn't have next window yet — full sync from API
-                console.print("[yellow]Fetching next window from API...[/yellow]")
+            # Use _quick_sync (targeted, endDate ASC) instead of generic
+            # indexer.sync which misses low-volume 5-min crypto markets.
+            if not self._sync_lock.locked():
                 try:
                     async with self._sync_lock:
-                        await self.indexer.sync(force=True)
-                    await self._refresh_markets()
+                        fetched = await self._quick_sync()
+                    if fetched:
+                        await self._refresh_markets(prefetched=fetched)
                 except Exception as e:
                     logger.warning(f"Hop sync failed: {e}")
+
+            # Fallback to DB if quick_sync didn't produce results
+            if self._total_markets == 0:
+                await self._refresh_markets()
 
             # Clear startup wait flag after refresh too
             if self._waiting_for_fresh_window and self._total_markets > 0:
