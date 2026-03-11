@@ -216,9 +216,9 @@ class MicroStructure:
     # Updated on startup and periodically as new snapshots are logged.
     price_history: list = field(default_factory=list)
 
-    # Configurable momentum weights (set from MicroSniperConfig)
-    weight_ofi_5s: float = 0.20
-    weight_ofi_15s: float = 0.40
+    # Configurable momentum weights (set from MicroSniperConfig at init)
+    weight_ofi_5s: float = 0.10
+    weight_ofi_15s: float = 0.50
     weight_vwap_drift: float = 0.25
     weight_intensity: float = 0.15
 
