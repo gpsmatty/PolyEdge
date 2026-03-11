@@ -1275,45 +1275,13 @@ class MicroRunner:
                 actual_entry = await self._get_fill_price(poly_order_id, token_id, entry_price)
                 actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
 
-                # Query CLOB for real token balance after fill.
-                # The CLOB balance endpoint lags settlement — returns 0 immediately
-                # after fill. Wait 1.5s (on top of the ~0.5s from _get_fill_price)
-                # to give it time to settle. This doesn't affect exit speed since
-                # we can't exit until momentum reverses anyway.
-                estimated_size = actual_size
-                await asyncio.sleep(1.5)
-                try:
-                    bal = self.client.get_token_balance(token_id)
-                    raw_bal = bal.get("balance", 0) if isinstance(bal, dict) else bal
-                    raw_float = float(str(raw_bal))
-                    # Print raw value to console so we can see exactly what CLOB returns
-                    console.print(f"  [dim]CLOB balance: raw={raw_bal} | full_response={bal} | est={estimated_size:.2f}[/dim]")
-
-                    # Polymarket conditional tokens use 6 decimals (like USDC).
-                    # But we've seen raw=51698 for ~8.4 shares, which doesn't match
-                    # 6 decimals (51698/1e6=0.05) or direct (51698 shares).
-                    # Try multiple interpretations and pick the one closest to estimate.
-                    candidates = []
-                    for divisor, label in [(1e6, "6dec"), (1e4, "4dec"), (1e3, "3dec"), (1, "direct")]:
-                        val = int(raw_float / divisor * 100) / 100
-                        if val > 0:
-                            candidates.append((abs(val - estimated_size), val, label))
-                    candidates.sort()  # Sort by distance from estimate
-
-                    if candidates and candidates[0][1] > 0:
-                        best_val = candidates[0][1]
-                        best_label = candidates[0][2]
-                        # Accept if within 50% of estimate
-                        if abs(best_val - estimated_size) < estimated_size * 0.5:
-                            actual_size = best_val
-                            console.print(f"  [dim]Using CLOB balance: {actual_size} shares ({best_label})[/dim]")
-                        else:
-                            # No interpretation is close — use estimate
-                            actual_size = int(estimated_size * 100) / 100
-                            console.print(f"  [dim]CLOB balance unusable (best={best_val} via {best_label}), using estimate {actual_size}[/dim]")
-                except Exception as e:
-                    logger.warning(f"Token balance query failed: {e}")
-                    actual_size = int(estimated_size * 100) / 100
+                # Don't query CLOB balance here — it always returns 0 right after
+                # a fill (settlement lags 2-3s). Store our estimate (USD / fill_price).
+                # If the estimate is slightly high, the fast exit will get "not enough
+                # balance" and immediately re-query + retry with the real amount.
+                # This gives us: fast entry (no sleep), accurate exit (real balance),
+                # and zero dust (sells exact CLOB amount).
+                actual_size = int(actual_size * 100) / 100  # truncate to 2dp
 
                 # Record in DB with actual fill price
                 try:
@@ -1517,11 +1485,50 @@ class MicroRunner:
                 if not self.quiet:
                     console.print(f"[yellow]  FOK sell rejected @ ${effective_sell:.2f} — will retry next tick[/yellow]")
             elif "not enough balance" in err_msg:
-                # Local size was wrong — fall back to CLOB API on next attempt
-                console.print(f"[red]  Sell failed: not enough balance — will re-query next tick[/red]")
-                # Clear local size so next attempt uses slow path
-                if cid in self._position_info:
-                    self._position_info[cid]["size"] = 0
+                # Local size was wrong — re-query CLOB and retry immediately
+                # instead of waiting for next tick. The CLOB has settled by now
+                # (exit happens seconds after buy).
+                console.print(f"[yellow]  Not enough balance ({size} local) — re-querying CLOB...[/yellow]")
+                try:
+                    bal = self.client.get_token_balance(token_id)
+                    raw_bal = bal.get("balance", 0) if isinstance(bal, dict) else bal
+                    raw_float = float(str(raw_bal))
+                    # Try multiple interpretations, pick closest to our estimate
+                    best_size = 0
+                    for divisor in [1e6, 1e4, 1e3, 1]:
+                        val = int(raw_float / divisor * 100) / 100
+                        if val > 0 and (best_size == 0 or abs(val - size) < abs(best_size - size)):
+                            best_size = val
+                    if best_size > 0 and best_size < size:
+                        console.print(f"  [dim]CLOB says {best_size} shares — retrying sell...[/dim]")
+                        retry_chunk = int(best_size * 100) / 100
+                        retry_result = self.client.place_fok_order(
+                            token_id=token_id,
+                            side="SELL",
+                            amount=retry_chunk,
+                            price=effective_sell,
+                        )
+                        retry_order_id = retry_result.get("orderID", retry_result.get("id", ""))
+                        actual_sell = await self._get_fill_price(retry_order_id, token_id, effective_sell)
+                        total_sold = retry_chunk
+                        total_proceeds = retry_chunk * actual_sell
+                        remaining = 0
+                        if not self.quiet:
+                            console.print(
+                                f"[yellow]  SOLD {current_pos.upper()} {retry_chunk:.1f} @ ${actual_sell:.2f} "
+                                f"— Order: {retry_order_id}[/yellow]"
+                            )
+                        # Update local tracking with real size for future reference
+                        if cid in self._position_info:
+                            self._position_info[cid]["size"] = best_size
+                    else:
+                        console.print(f"  [dim]CLOB balance: {raw_bal} — clearing local tracking[/dim]")
+                        if cid in self._position_info:
+                            self._position_info[cid]["size"] = 0
+                except Exception as retry_err:
+                    console.print(f"[red]  Retry failed: {retry_err} — will retry next tick[/red]")
+                    if cid in self._position_info:
+                        self._position_info[cid]["size"] = 0
             else:
                 console.print(f"[red]  Sell failed: {e}[/red]")
                 logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
