@@ -1043,7 +1043,7 @@ class MicroRunner:
         # place_fok_order takes USD amount directly — SDK handles rounding to avoid
         # the "invalid amounts" error where maker_amount has >2 decimal places.
         price = opp.market_price
-        entry_price = min(round(price + 0.02, 2), 0.99)  # Pay up to 2c more for instant fill
+        entry_price = min(round(price + 0.01, 2), 0.99)  # Pay up to 1c more for instant fill
         size = round(size_usd / entry_price, 2) if entry_price > 0 else 0
 
         signal = self.strategy.opportunity_to_signal(opp)
@@ -1227,7 +1227,7 @@ class MicroRunner:
 
         # Use best bid minus 1c as sell price if it's better than our floor.
         # This way we sell near market instead of panic-selling at floor.
-        effective_sell = max(sell_price, round(best_bid - 0.01, 2))
+        effective_sell = max(sell_price, round(best_bid, 2))
 
         # Single FOK attempt — don't halve and retry at worse prices.
         # If rejected, we'll retry on next eval tick with a fresh book.
