@@ -216,6 +216,12 @@ class MicroSniperConfig(BaseModel):
     poly_book_exit_override_depth: float = 25.0   # Hold if our token's bid depth > this (strong exit liquidity = market believes in our side)
     poly_book_exit_override_imbalance: float = 0.15  # Hold if directional imbalance > this (book sentiment favors our position)
 
+    # --- Entry persistence filter ---
+    # Requires momentum to stay above entry threshold for N consecutive evals
+    # before actually entering. Kills single-spike noise entries.
+    entry_persistence_enabled: bool = False       # Master toggle — OFF by default
+    entry_persistence_count: int = 3              # Require 3 consecutive qualifying evals
+
     # --- Trailing stop loss ---
     # Tracks the high water mark (HWM) of our side's price since entry.
     # If price drops trailing_stop_pct from the HWM, trigger an exit.
