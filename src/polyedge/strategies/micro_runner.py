@@ -1004,28 +1004,44 @@ class MicroRunner:
         """Fetch actual fill price from CLOB API after a FOK order fills.
 
         FOK orders can fill at a BETTER price than we asked for. Using our
-        ask price as the fill price gives wrong P&L. This queries the CLOB
-        trades endpoint to get the real fill price.
+        ask price as the fill price gives wrong P&L.
+
+        Strategy: try get_order first (exact match), then search trades by
+        order ID. NEVER fall back to "most recent trade" — that grabs
+        previous fills and gives wildly wrong P&L.
         """
         try:
             import time as _time
-            # Small delay to let the fill propagate in the CLOB backend
             _time.sleep(0.3)
+
+            # Try 1: get_order returns the order with its average fill price
+            try:
+                order = self.client.get_order(order_id)
+                if order:
+                    # The order response may have 'price' (our ask) or 'average_price' (fill)
+                    avg = order.get("average_price") or order.get("associate_trades_avg_price")
+                    if avg:
+                        fill_price = float(avg)
+                        if not self.quiet:
+                            console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback:.3f})[/dim]")
+                        return fill_price
+            except Exception:
+                pass
+
+            # Try 2: search trades for exact order ID match
             trades = self.client.get_trades(asset_id=token_id)
             if trades:
-                # Find the trade matching our order ID
                 for t in trades:
                     if t.get("taker_order_id") == order_id or t.get("order_id") == order_id:
                         fill_price = float(t.get("price", fallback))
                         if not self.quiet:
                             console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback:.3f})[/dim]")
                         return fill_price
-                # If no exact match, use most recent trade on this token
-                latest = trades[0]
-                fill_price = float(latest.get("price", fallback))
-                if not self.quiet:
-                    console.print(f"  [dim]Fill price (latest): ${fill_price:.3f} (asked ${fallback:.3f})[/dim]")
-                return fill_price
+
+            # No match found — use our ask price. Better to be slightly wrong
+            # than grab a completely wrong trade.
+            if not self.quiet:
+                console.print(f"  [dim]Fill price: ${fallback:.3f} (no CLOB match, using ask)[/dim]")
         except Exception as e:
             logger.warning(f"Could not fetch fill price: {e}")
         return fallback
