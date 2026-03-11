@@ -190,7 +190,7 @@ class MicroSniperConfig(BaseModel):
 
     # Slippage: how many cents above market to bid for instant fill
     entry_slippage: float = 0.02           # Pay up to 2c more for entry FOK fill
-    exit_slippage: float = 0.02            # Sell up to 2c below market for exit FOK fill
+    exit_slippage: float = 0.05            # Sell up to 5c below market for exit FOK fill (wider = fills on first try)
 
     # Trade cooldown: seconds between trades on the same market.
     # Prevents whipsaw — trading the same market twice during noisy bounces.

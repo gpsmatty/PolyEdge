@@ -1097,21 +1097,22 @@ class MicroRunner:
 
         if self.dry_run:
             # Update virtual position tracking even in dry run
+            dry_token = opp.market.yes_token_id if opp.side == Side.YES else opp.market.no_token_id
             if action == MicroAction.EXIT:
                 self._positions.pop(cid, None)
                 self._position_info.pop(cid, None)
             elif action == MicroAction.FLIP_YES:
                 self._positions[cid] = "yes"
-                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price, "token_id": dry_token or "", "size": 10.0}
             elif action == MicroAction.FLIP_NO:
                 self._positions[cid] = "no"
-                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price, "token_id": dry_token or "", "size": 10.0}
             elif action == MicroAction.BUY_YES:
                 self._positions[cid] = "yes"
-                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price, "token_id": dry_token or "", "size": 10.0}
             elif action == MicroAction.BUY_NO:
                 self._positions[cid] = "no"
-                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price}
+                self._position_info[cid] = {"entry_price": opp.market_price, "hwm": opp.market_price, "token_id": dry_token or "", "size": 10.0}
 
             self._trades_this_window += 1
             self._total_trades += 1
@@ -1313,7 +1314,12 @@ class MicroRunner:
                     logger.warning(f"DB recording failed (non-fatal): {e}")
 
                 self._positions[cid] = "yes" if opp.side == Side.YES else "no"
-                self._position_info[cid] = {"entry_price": actual_entry, "hwm": actual_entry}
+                self._position_info[cid] = {
+                    "entry_price": actual_entry,
+                    "hwm": actual_entry,
+                    "token_id": token_id,
+                    "size": actual_size,
+                }
                 self._trades_this_window += 1
                 self._total_trades += 1
                 self._last_trade_log[cid] = time.time()
@@ -1340,9 +1346,12 @@ class MicroRunner:
     async def _close_position(self, engine, opp: MicroOpportunity) -> bool:
         """Close an existing position by placing a FOK SELL order.
 
-        On Polymarket CLOB, selling tokens you hold = SELL side on the token_id.
-        Uses FOK (Fill or Kill) with aggressive pricing for instant fills.
-        Records exit price and P&L in the trades table.
+        FAST PATH: Uses locally-tracked position info (token_id, size, entry_price)
+        from the buy fill instead of querying DB and CLOB API. Skips allowance
+        refresh (already approved at startup). This cuts exit latency from ~1s
+        (3 API round-trips) to ~200ms (just the sell order).
+
+        Falls back to slow path (API queries) if local tracking is missing.
         """
         cid = opp.market.condition_id
         current_pos = self._positions.get(cid)
@@ -1361,99 +1370,77 @@ class MicroRunner:
             console.print("[red]  No token ID — can't close position[/red]")
             return False
 
-        # Sell price floor: Nc below market (configurable). FOK fills at best
-        # available bid but won't go below this floor. If FOK rejects, we retry
-        # on next eval tick when the book refreshes.
+        # --- FAST EXIT: use locally-tracked data instead of API calls ---
+        info = self._position_info.get(cid, {})
+        entry_price = info.get("entry_price", 0.0)
+        local_size = info.get("size", 0)
+        local_token_id = info.get("token_id", "")
+
+        # Use wider exit slippage — price moves fast, tight slippage = FOK rejections
         exit_slip = self.config.exit_slippage
         sell_price = max(0.01, round(price - exit_slip, 2))
 
-        # Get entry price from DB for P&L calculation
-        entry_price = 0.0
-        db_size = 0
-        try:
-            positions = await self.db.get_open_positions()
-            for p in positions:
-                if p.get("market_id") == cid and p.get("side", "").lower() == current_pos:
-                    db_size = p.get("size", 0)
-                    entry_price = p.get("entry_price", 0)
-                    break
-        except Exception:
-            pass
-
-        # Get ACTUAL token balance from CLOB API — this is the truth.
-        # The DB size can be wrong because FOK buy fills may produce a
-        # different share count than we estimated from USD/price.
-        size = 0
-        try:
-            bal = self.client.get_token_balance(token_id)
-            if not self.quiet:
-                console.print(f"  [dim]CLOB response: {bal}[/dim]")
-            # Balance may be a raw string number or dict with 'balance' key
-            if isinstance(bal, dict):
-                raw_bal = bal.get("balance", 0)
-            else:
-                raw_bal = bal
-            # Convert from 6-decimal USDC-style wei to human-readable.
-            # CRITICAL: Always truncate DOWN, never round().  round() can
-            # round UP (e.g. 5.926176 → 5.93) making us try to sell more
-            # tokens than we actually own → "not enough balance" error.
-            raw_int = int(float(str(raw_bal)))
-            if raw_int > 1_000_000:
-                # Looks like wei (e.g. 15600000 = 15.6 shares)
-                size = int(raw_int / 1e6 * 100) / 100  # truncate to 2 dp
-            else:
-                # Already in human-readable units
-                size = int(float(str(raw_bal)) * 100) / 100
-        except Exception as e:
-            logger.warning(f"Token balance lookup failed, falling back to DB: {e}")
-            size = int(float(db_size) * 100) / 100
-
-        if not self.quiet:
-            console.print(f"  [dim]Token balance: {size} shares (DB: {db_size})[/dim]")
-
-        if size <= 0:
-            # No tokens to sell — just clear our tracking
-            logger.info(f"No token balance for {token_id}, clearing tracking")
-            return True
-
-        # Refresh the CLOB backend's cached balance/allowance state.
-        # The actual on-chain approval is done once at startup via
-        # ensure_exchange_approved(). This just syncs the cache.
-        try:
-            refresh = self.client.update_token_allowance(token_id)
-            if not self.quiet:
-                console.print(f"  [dim]Allowance refresh: {refresh}[/dim]")
-        except Exception as e:
-            if not self.quiet:
-                console.print(f"  [dim]Allowance refresh failed: {e}[/dim]")
-
-        # Check order book bid depth from WebSocket to see what's available.
-        # Bids = people willing to buy our tokens.
+        # Check WebSocket book for best bid (local, instant — no API call)
         book = self.poly_feed.books.get(token_id)
-        best_bid = sell_price  # fallback to our floor
-        available_at_floor = 0.0
+        best_bid = sell_price
         if book and book.bids:
-            best_bid = book.bids[0].price  # highest bid in the book
-            for bid in book.bids:
-                if bid.price >= sell_price:
-                    available_at_floor += bid.size
+            best_bid = book.bids[0].price
             if not self.quiet:
                 top_bids = book.bids[:3]
                 bid_str = " | ".join(f"${b.price:.2f}×{b.size:.0f}" for b in top_bids)
-                console.print(f"  [dim]Book bids: {bid_str} — {available_at_floor:.0f} shares above ${sell_price:.2f}[/dim]")
+                console.print(f"  [dim]Book bids: {bid_str}[/dim]")
 
-        # Use best bid minus 1c as sell price if it's better than our floor.
-        # This way we sell near market instead of panic-selling at floor.
         effective_sell = max(sell_price, round(best_bid, 2))
 
-        # Single FOK attempt — don't halve and retry at worse prices.
-        # If rejected, we'll retry on next eval tick with a fresh book.
-        remaining = size
+        # Determine share count — prefer local tracking, fall back to CLOB API
+        size = 0
+        if local_size > 0 and local_token_id == token_id:
+            # FAST: use locally-tracked size from buy fill
+            size = int(float(local_size) * 100) / 100  # truncate to 2dp
+            if not self.quiet:
+                console.print(f"  [dim]Fast exit: {size} shares (local tracking)[/dim]")
+        else:
+            # SLOW FALLBACK: query CLOB API for actual token balance
+            if not self.quiet:
+                console.print(f"  [dim]Slow exit: querying CLOB for balance...[/dim]")
+            try:
+                bal = self.client.get_token_balance(token_id)
+                if isinstance(bal, dict):
+                    raw_bal = bal.get("balance", 0)
+                else:
+                    raw_bal = bal
+                raw_int = int(float(str(raw_bal)))
+                if raw_int > 1_000_000:
+                    size = int(raw_int / 1e6 * 100) / 100
+                else:
+                    size = int(float(str(raw_bal)) * 100) / 100
+            except Exception as e:
+                logger.warning(f"Token balance lookup failed: {e}")
+                # Last resort: try DB
+                try:
+                    positions = await self.db.get_open_positions()
+                    for p in positions:
+                        if p.get("market_id") == cid and p.get("side", "").lower() == current_pos:
+                            size = int(float(p.get("size", 0)) * 100) / 100
+                            if not entry_price:
+                                entry_price = p.get("entry_price", 0)
+                            break
+                except Exception:
+                    pass
+
+        if size <= 0:
+            logger.info(f"No token balance for {token_id}, clearing tracking")
+            return True
+
+        # NO allowance refresh — already approved at startup. Skipping saves ~300ms.
+
+        # Single FOK attempt — fire immediately
         total_sold = 0.0
         total_proceeds = 0.0
+        remaining = size
 
         try:
-            chunk = int(remaining * 100) / 100  # truncate, don't round
+            chunk = int(remaining * 100) / 100
             result = self.client.place_fok_order(
                 token_id=token_id,
                 side="SELL",
@@ -1464,7 +1451,7 @@ class MicroRunner:
             total_sold = chunk
             remaining = 0
 
-            # Get actual fill price from CLOB API
+            # Get actual fill price — but don't block on it
             actual_sell = await self._get_fill_price(order_id, token_id, effective_sell)
             total_proceeds = chunk * actual_sell
 
@@ -1480,7 +1467,11 @@ class MicroRunner:
                 if not self.quiet:
                     console.print(f"[yellow]  FOK sell rejected @ ${effective_sell:.2f} — will retry next tick[/yellow]")
             elif "not enough balance" in err_msg:
-                console.print(f"[red]  Sell failed: not enough balance/allowance[/red]")
+                # Local size was wrong — fall back to CLOB API on next attempt
+                console.print(f"[red]  Sell failed: not enough balance — will re-query next tick[/red]")
+                # Clear local size so next attempt uses slow path
+                if cid in self._position_info:
+                    self._position_info[cid]["size"] = 0
             else:
                 console.print(f"[red]  Sell failed: {e}[/red]")
                 logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
@@ -1488,7 +1479,6 @@ class MicroRunner:
         if total_sold > 0:
             fill_price = total_proceeds / total_sold if total_sold > 0 else sell_price
 
-            # Record exit price + P&L in trades table
             gross_pnl = (fill_price - entry_price) * total_sold if entry_price > 0 else 0
             try:
                 await self.db.close_trade_by_market(
@@ -1499,14 +1489,12 @@ class MicroRunner:
             except Exception as e:
                 logger.warning(f"Trade close recording failed (non-fatal): {e}")
 
-            # Remove DB position (or update size if partial fill)
             if remaining <= 0.5:
                 try:
                     await self.db.remove_position(cid, token_id, current_pos)
                 except Exception as e:
                     logger.warning(f"DB position update failed (non-fatal): {e}")
             else:
-                # Partial fill — update remaining size in DB
                 logger.warning(f"Partial sell: {total_sold:.1f}/{size:.1f} filled, {remaining:.1f} remaining")
 
             if not self.quiet and entry_price > 0:
@@ -1518,11 +1506,9 @@ class MicroRunner:
                     f"  ✓ filled[/{pnl_style}]"
                 )
 
-            # If fully sold, clear position tracking
             if remaining <= 0.5:
                 return True
             else:
-                # Partial — will retry on next eval tick
                 return False
         else:
             return False
