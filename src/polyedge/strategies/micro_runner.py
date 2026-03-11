@@ -960,8 +960,10 @@ class MicroRunner:
         bankroll = await self._get_bankroll()
 
         # Fixed dollar sizing (simpler, more predictable for micro trades)
+        # Cap at bankroll (can't spend more than you have), but don't cap at 10% —
+        # if the user set a fixed size, respect it.
         if self.config.fixed_position_usd > 0:
-            size_usd = min(self.config.fixed_position_usd, bankroll * 0.10)
+            size_usd = min(self.config.fixed_position_usd, bankroll)
         else:
             # Fall back to Kelly sizing
             max_pct = min(
@@ -1416,10 +1418,10 @@ class MicroRunner:
             )
 
     async def _get_bankroll(self) -> float:
-        """Get current bankroll."""
+        """Get current bankroll from actual USDC balance on chain."""
         try:
-            positions = await self.db.get_open_positions()
-            exposure = sum(p.get("size", 0) * p.get("entry_price", 0) for p in positions)
-            return max(0, 200.0 - exposure)
+            bal = self.client.get_collateral_balance()
+            return float(bal) if bal else 50.0  # Conservative fallback
         except Exception:
-            return 200.0
+            # If balance check fails, use a conservative fallback
+            return 50.0
