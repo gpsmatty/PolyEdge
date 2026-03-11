@@ -325,12 +325,16 @@ class MicroStructure:
         """Composite momentum signal from -1 (strong sell) to +1 (strong buy).
 
         Combines (weights configurable via DB config):
-        - Short-term OFI (5s) — default 0.20 (reactive but noisy)
-        - Medium-term OFI (15s) — default 0.40 (more stable, primary signal)
+        - Short-term OFI (5s) — default 0.10 (reactive but noisy)
+        - Medium-term OFI (15s) — default 0.50 (more stable, primary signal)
         - VWAP drift (15s) — default 0.25
         - Trade intensity surge — default 0.15
 
-        This is the core signal that drives micro sniper decisions.
+        Key design: OFI tells us WHO is trading. VWAP drift tells us IF PRICE
+        MOVED. When OFI is extreme but price didn't move, the flow was absorbed
+        by the book — that's not a signal, that's noise. The flow-price
+        agreement dampener handles this by reducing the signal when OFI and
+        price action disagree.
         """
         if not self.flow_5s.is_active:
             return 0.0
@@ -340,9 +344,10 @@ class MicroStructure:
         ofi_15 = self.flow_15s.ofi
 
         # VWAP drift — scale to [-1, 1] range
-        # A 0.01% drift is a moderate signal for BTC in 15s
+        # At 2000x: need ~0.05% move ($35 on BTC) to max out the signal.
+        # Previous 5000x was too sensitive — $14 moves maxed the signal.
         drift = self.flow_15s.vwap_drift
-        drift_signal = max(-1.0, min(1.0, drift * 5000))  # ±0.02% -> ±1.0
+        drift_signal = max(-1.0, min(1.0, drift * 2000))  # ±0.05% -> ±1.0
 
         # Trade intensity surge: compare 5s rate to 30s rate
         # High intensity = something is happening, strengthens the signal
@@ -360,12 +365,40 @@ class MicroStructure:
         dominant_direction = 1.0 if ofi_5 > 0 else (-1.0 if ofi_5 < 0 else 0.0)
         intensity_component = intensity_signal * dominant_direction
 
-        signal = (
+        raw_signal = (
             self.weight_ofi_5s * ofi_5
             + self.weight_ofi_15s * ofi_15
             + self.weight_vwap_drift * drift_signal
             + self.weight_intensity * intensity_component
         )
+
+        # --- Flow-price agreement dampener ---
+        # If OFI says heavy selling but price didn't actually drop (or vice
+        # versa), the flow was absorbed by the book. That's a false signal.
+        # Dampen the composite when flow direction and price direction disagree.
+        #
+        # This is the key fix for "OFI spike → instant reversal" losses.
+        # A real move has both flow AND price moving together.
+        ofi_direction = 1.0 if ofi_15 > 0 else (-1.0 if ofi_15 < 0 else 0.0)
+        price_direction = 1.0 if drift_signal > 0.05 else (-1.0 if drift_signal < -0.05 else 0.0)
+
+        if ofi_direction != 0 and price_direction != 0:
+            if ofi_direction == price_direction:
+                # Flow and price agree — full signal (slight boost for confirmation)
+                agreement_factor = 1.0
+            else:
+                # Flow and price disagree — dampen heavily
+                # e.g., OFI says sell but price went up = absorbed selling
+                agreement_factor = 0.5
+        elif ofi_direction != 0 and price_direction == 0:
+            # Flow present but price flat — mild dampening
+            # Sells are happening but price isn't moving = book absorbing
+            agreement_factor = 0.7
+        else:
+            # No clear OFI direction — pass through
+            agreement_factor = 1.0
+
+        signal = raw_signal * agreement_factor
 
         return max(-1.0, min(1.0, signal))
 
