@@ -401,6 +401,28 @@ class MicroRunner:
             f"[dim]Feed: Binance aggTrade (~10-50 tps) + Polymarket WS{filter_str}[/dim]"
         )
 
+        # --- Diagnostic: show book override config ---
+        book_cfg = self.config
+        console.print(
+            f"[dim]Book override: enabled={book_cfg.poly_book_enabled} | "
+            f"exit_depth={book_cfg.poly_book_exit_override_depth} | "
+            f"exit_imbalance={book_cfg.poly_book_exit_override_imbalance} | "
+            f"entry_depth={book_cfg.poly_book_min_exit_depth} | "
+            f"imbalance_veto={book_cfg.poly_book_imbalance_veto}[/dim]"
+        )
+        # Also check strategy's config reference matches
+        strat_enabled = self.strategy.config.poly_book_enabled
+        if strat_enabled != book_cfg.poly_book_enabled:
+            console.print(
+                f"[bold red]CONFIG MISMATCH: runner.config.poly_book_enabled={book_cfg.poly_book_enabled} "
+                f"vs strategy.config.poly_book_enabled={strat_enabled}[/bold red]"
+            )
+        logger.info(
+            f"Book override config: poly_book_enabled={book_cfg.poly_book_enabled}, "
+            f"exit_override_depth={book_cfg.poly_book_exit_override_depth}, "
+            f"exit_override_imbalance={book_cfg.poly_book_exit_override_imbalance}"
+        )
+
         # Ensure the exchange contracts have on-chain approval to move
         # our conditional tokens. Without this, SELL orders fail with
         # "not enough balance / allowance". Only sends a tx if not yet approved.
@@ -975,6 +997,11 @@ class MicroRunner:
         book_intel = None
         if self.config.poly_book_enabled and market.clob_token_ids:
             book_intel = self._get_book_intel(market)
+            if current_pos and not book_intel:
+                console.print(
+                    f"[dim yellow]BOOK DEBUG: no book data for "
+                    f"{market.condition_id[:8]} (poly_books={len(self.poly_feed.books)})[/dim yellow]"
+                )
 
         opp = self.strategy.evaluate(
             market=market,
@@ -1032,6 +1059,9 @@ class MicroRunner:
             action_str = f"BUY {opp.side.value}"
 
         if not self.quiet:
+            book_str = ""
+            if self.config.poly_book_enabled and opp.poly_book_imbalance != 0:
+                book_str = f" | Book: {opp.poly_book_imbalance:+.2f}"
             console.print(
                 f"[bold {action_color}]MICRO [{action_str}][/bold {action_color}] "
                 f"{opp.symbol.replace('usdt','').upper()} "
@@ -1040,6 +1070,7 @@ class MicroRunner:
                 f"| Mkt: {opp.market_price:.2f} ({price_source}) "
                 f"| ${opp.binance_price:,.2f} "
                 f"| {opp.seconds_remaining:.0f}s left"
+                f"{book_str}"
             )
 
         if self.dry_run:
