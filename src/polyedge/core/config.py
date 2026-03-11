@@ -211,6 +211,11 @@ class MicroSniperConfig(BaseModel):
     poly_book_imbalance_weight: float = 0.10  # Weight of Poly book imbalance in momentum composite (steals from OFI 5s)
     poly_book_imbalance_veto: float = -0.40   # If Poly book imbalance is this negative against our direction, block entry
 
+    # Book-based exit override — when momentum says "exit" but the Poly book
+    # disagrees, hold the position. Requires BOTH depth AND imbalance to override.
+    poly_book_exit_override_depth: float = 25.0   # Hold if our token's bid depth > this (strong exit liquidity = market believes in our side)
+    poly_book_exit_override_imbalance: float = 0.15  # Hold if directional imbalance > this (book sentiment favors our position)
+
 
 class MarketMakerConfig(BaseModel):
     enabled: bool = False
@@ -386,7 +391,19 @@ async def apply_db_config(settings: Settings, db) -> Settings:
             strategy_name, strategy_field = sub_parts[0], sub_parts[1]
             strategy_obj = getattr(settings.strategies, strategy_name, None)
             if strategy_obj and hasattr(strategy_obj, strategy_field):
+                old_val = getattr(strategy_obj, strategy_field)
                 setattr(strategy_obj, strategy_field, value)
+                new_val = getattr(strategy_obj, strategy_field)
+                # Debug: detect when setattr silently fails (e.g. Pydantic frozen)
+                if "poly_book" in strategy_field or old_val != new_val:
+                    if old_val != new_val:
+                        pass  # Normal — value changed
+                    else:
+                        import logging
+                        logging.getLogger("polyedge.config").warning(
+                            f"CONFIG SETATTR FAILED: {key} = {value!r} (type={type(value).__name__}) "
+                            f"but field is still {new_val!r} (type={type(new_val).__name__})"
+                        )
             continue
 
         # Handle top-level sections (risk.*, ai.*, agent.*)

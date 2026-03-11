@@ -32,12 +32,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
+from rich.console import Console
+
 from polyedge.core.config import Settings
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_aggtrade import MicroStructure, AggTrade
 from polyedge.data.book_analyzer import BookIntelligence
 
 logger = logging.getLogger("polyedge.micro_sniper")
+console = Console()
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +293,11 @@ class MicroSniperStrategy:
                 # 1. Exit liquidity check — if the bid side of our token is
                 #    too thin, we'll get trapped. Don't enter without exit depth.
                 if our_book.bid_depth_5c < self.config.poly_book_min_exit_depth:
+                    console.print(
+                        f"[dim]BOOK ENTRY BLOCK: {our_side.upper()} bid depth "
+                        f"{our_book.bid_depth_5c:.0f} < {self.config.poly_book_min_exit_depth:.0f} "
+                        f"— no exit liquidity[/dim]"
+                    )
                     return None
 
             # 2. Book imbalance signal — use YES book imbalance as the
@@ -304,6 +312,10 @@ class MicroSniperStrategy:
 
                 # Veto: if the Poly book strongly disagrees, block entry
                 if directional_imbalance < self.config.poly_book_imbalance_veto:
+                    console.print(
+                        f"[dim]BOOK ENTRY VETO: imbalance {directional_imbalance:+.2f} "
+                        f"< {self.config.poly_book_imbalance_veto:+.2f} — book disagrees[/dim]"
+                    )
                     return None
 
         return MicroOpportunity(
@@ -403,7 +415,51 @@ class MicroSniperStrategy:
             else self.config.exit_threshold
         )
 
-        if not aligned and abs_momentum >= effective_exit_threshold:
+        should_exit_reversal = not aligned and abs_momentum >= effective_exit_threshold
+        should_exit_faded = aligned and abs_momentum < self.config.hold_threshold
+
+        # --- Polymarket book exit override ---
+        # When momentum says exit but the Poly book still shows strong support
+        # for our side (deep bids + favorable imbalance), override and hold.
+        # The book reflects what Polymarket participants believe — if they're
+        # still bidding our token, the momentum dip is likely noise.
+        if (should_exit_reversal or should_exit_faded) and self.config.poly_book_enabled:
+            if not book_intel:
+                console.print("[dim yellow]BOOK EXIT CHECK: No book data — exiting without override[/dim yellow]")
+            else:
+                our_side = "yes" if holding_yes else "no"
+                our_book = book_intel.get(our_side)
+                yes_book = book_intel.get("yes")
+
+                if our_book and yes_book:
+                    depth_ok = our_book.bid_depth_5c >= self.config.poly_book_exit_override_depth
+                    # Directional imbalance: positive = favors our position
+                    raw_imbalance = yes_book.imbalance_5c
+                    directional_imbalance = raw_imbalance if holding_yes else -raw_imbalance
+                    imbalance_ok = directional_imbalance >= self.config.poly_book_exit_override_imbalance
+
+                    result = "OVERRIDE — HOLD" if depth_ok and imbalance_ok else "EXIT"
+                    color = "bold cyan" if depth_ok and imbalance_ok else "dim yellow"
+                    console.print(
+                        f"[{color}]BOOK EXIT CHECK: {our_side.upper()} "
+                        f"depth={our_book.bid_depth_5c:.0f} "
+                        f"(need {self.config.poly_book_exit_override_depth:.0f}), "
+                        f"imbalance={directional_imbalance:+.2f} "
+                        f"(need {self.config.poly_book_exit_override_imbalance:+.2f}) "
+                        f"→ {result}[/{color}]"
+                    )
+
+                    if depth_ok and imbalance_ok:
+                        # Book says hold — override the momentum exit
+                        return None
+                else:
+                    console.print(
+                        f"[dim yellow]BOOK EXIT CHECK: Missing book data "
+                        f"(our_book={our_book is not None}, yes_book={yes_book is not None}) "
+                        f"— exiting without override[/dim yellow]"
+                    )
+
+        if should_exit_reversal:
             return MicroOpportunity(
                 market=market,
                 symbol=micro.symbol,
@@ -421,8 +477,7 @@ class MicroSniperStrategy:
                 seconds_remaining=seconds_remaining,
             )
 
-        # Also exit if momentum towards our side has evaporated
-        if aligned and abs_momentum < self.config.hold_threshold:
+        if should_exit_faded:
             return MicroOpportunity(
                 market=market,
                 symbol=micro.symbol,
