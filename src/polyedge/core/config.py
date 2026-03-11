@@ -227,7 +227,7 @@ class MicroSniperConfig(BaseModel):
     # If price drops trailing_stop_pct from the HWM, trigger an exit.
     # Time-scaled: wider early in the window, tighter late.
     trailing_stop_enabled: bool = False            # Master toggle — OFF by default
-    trailing_stop_pct: float = 0.25                # Base trailing stop: exit if price drops 25% from HWM
+    trailing_stop_pct: float = 0.12                # Base trailing stop: exit if price drops 12% from HWM
     trailing_stop_min_profit_pct: float = 0.10     # Only arm the stop after price is 10% above entry (don't stop out on noise)
     trailing_stop_late_pct: float = 0.15           # Tighter stop in last 90s of window
     trailing_stop_late_seconds: float = 90.0       # When to switch to the tighter stop
