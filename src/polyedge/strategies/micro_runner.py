@@ -795,6 +795,11 @@ class MicroRunner:
                 micro.flow_5s.reset()
                 micro.flow_15s.reset()
                 micro.flow_30s.reset()
+                # Mark the window start price so price_change_pct works.
+                # This lets the strategy know how far BTC has moved from
+                # the open — critical for the price-to-beat filter.
+                if micro.current_price > 0:
+                    micro.start_window(micro.current_price)
                 logger.info(f"Reset flow windows on hop for {binance_symbol}")
 
             # Re-subscribe Polymarket WS to new token IDs
@@ -896,6 +901,9 @@ class MicroRunner:
                 # The startup window expired and was pruned — we're on a fresh one
                 self._waiting_for_fresh_window = False
                 self._trades_this_window = 0
+                # Mark window start price for price-to-beat filter
+                if micro.current_price > 0:
+                    micro.start_window(micro.current_price)
                 next_mkt = markets[0][0]
                 remaining = (next_mkt.end_date - now).total_seconds()
                 console.print(
