@@ -222,6 +222,13 @@ class MicroStructure:
     weight_vwap_drift: float = 0.25
     weight_intensity: float = 0.15
 
+    # Score shaping params (set from MicroSniperConfig at init)
+    vwap_drift_scale: float = 2000.0
+    dampener_agree_factor: float = 1.0
+    dampener_disagree_factor: float = 0.4
+    dampener_flat_factor: float = 0.65
+    dampener_price_deadzone: float = 0.05
+
     def __post_init__(self):
         if self.flow_5s is None:
             self.flow_5s = TradeFlowWindow(symbol=self.symbol, window_seconds=5.0)
@@ -333,8 +340,9 @@ class MicroStructure:
         Key design: OFI tells us WHO is trading. VWAP drift tells us IF PRICE
         MOVED. When OFI is extreme but price didn't move, the flow was absorbed
         by the book — that's not a signal, that's noise. The flow-price
-        agreement dampener handles this by reducing the signal when OFI and
-        price action disagree.
+        agreement dampener handles this: continuous scaling from disagree_factor
+        (flow opposed price) through flat_factor (price didn't move) to
+        agree_factor (flow confirmed by price).
         """
         if not self.flow_5s.is_active:
             return 0.0
@@ -344,10 +352,9 @@ class MicroStructure:
         ofi_15 = self.flow_15s.ofi
 
         # VWAP drift — scale to [-1, 1] range
-        # At 2000x: need ~0.05% move ($35 on BTC) to max out the signal.
-        # Previous 5000x was too sensitive — $14 moves maxed the signal.
+        # vwap_drift_scale controls sensitivity: higher = reacts to smaller moves
         drift = self.flow_15s.vwap_drift
-        drift_signal = max(-1.0, min(1.0, drift * 2000))  # ±0.05% -> ±1.0
+        drift_signal = max(-1.0, min(1.0, drift * self.vwap_drift_scale))
 
         # Trade intensity surge: compare 5s rate to 30s rate
         # High intensity = something is happening, strengthens the signal
@@ -355,13 +362,11 @@ class MicroStructure:
         int_30 = self.flow_30s.trade_intensity
         if int_30 > 0:
             intensity_ratio = int_5 / int_30
-            # Ratio > 2 = surge, < 0.5 = lull
             intensity_signal = max(-1.0, min(1.0, (intensity_ratio - 1.0)))
         else:
             intensity_signal = 0.0
 
         # The intensity signal amplifies direction, not creates it
-        # Use the sign of the dominant OFI
         dominant_direction = 1.0 if ofi_5 > 0 else (-1.0 if ofi_5 < 0 else 0.0)
         intensity_component = intensity_signal * dominant_direction
 
@@ -372,31 +377,39 @@ class MicroStructure:
             + self.weight_intensity * intensity_component
         )
 
-        # --- Flow-price agreement dampener ---
-        # If OFI says heavy selling but price didn't actually drop (or vice
-        # versa), the flow was absorbed by the book. That's a false signal.
-        # Dampen the composite when flow direction and price direction disagree.
+        # --- Flow-price agreement dampener (continuous) ---
+        # Measures how well OFI direction is confirmed by actual price movement.
+        # "Aggressive flow that doesn't displace price was absorbed — not edge."
         #
-        # This is the key fix for "OFI spike → instant reversal" losses.
-        # A real move has both flow AND price moving together.
-        ofi_direction = 1.0 if ofi_15 > 0 else (-1.0 if ofi_15 < 0 else 0.0)
-        price_direction = 1.0 if drift_signal > 0.05 else (-1.0 if drift_signal < -0.05 else 0.0)
+        # Computes a continuous alignment score from -1 (fully opposed) to +1
+        # (fully aligned), then maps it smoothly to the dampener factor range.
+        abs_drift = abs(drift_signal)
 
-        if ofi_direction != 0 and price_direction != 0:
-            if ofi_direction == price_direction:
-                # Flow and price agree — full signal (slight boost for confirmation)
-                agreement_factor = 1.0
-            else:
-                # Flow and price disagree — dampen heavily
-                # e.g., OFI says sell but price went up = absorbed selling
-                agreement_factor = 0.5
-        elif ofi_direction != 0 and price_direction == 0:
-            # Flow present but price flat — mild dampening
-            # Sells are happening but price isn't moving = book absorbing
-            agreement_factor = 0.7
-        else:
-            # No clear OFI direction — pass through
+        if abs(ofi_15) < 0.05:
+            # No meaningful OFI — no dampening needed
             agreement_factor = 1.0
+        elif abs_drift < self.dampener_price_deadzone:
+            # OFI present but price flat — use flat factor
+            # Interpolate between flat and agree based on how much OFI there is
+            # Strong OFI + flat price = more suspicious
+            agreement_factor = self.dampener_flat_factor
+        else:
+            # Both OFI and price have direction — measure alignment
+            # alignment: +1 = same direction, -1 = opposite direction
+            ofi_sign = 1.0 if ofi_15 > 0 else -1.0
+            price_sign = 1.0 if drift_signal > 0 else -1.0
+            alignment = ofi_sign * price_sign  # +1 or -1
+
+            # Scale by price strength (stronger price confirmation = more extreme factor)
+            # price_strength: 0 at deadzone edge, 1 at full saturation
+            price_strength = min(1.0, (abs_drift - self.dampener_price_deadzone) / (1.0 - self.dampener_price_deadzone))
+
+            if alignment > 0:
+                # Agree: interpolate flat_factor → agree_factor as price strengthens
+                agreement_factor = self.dampener_flat_factor + (self.dampener_agree_factor - self.dampener_flat_factor) * price_strength
+            else:
+                # Disagree: interpolate flat_factor → disagree_factor as price strengthens
+                agreement_factor = self.dampener_flat_factor + (self.dampener_disagree_factor - self.dampener_flat_factor) * price_strength
 
         signal = raw_signal * agreement_factor
 

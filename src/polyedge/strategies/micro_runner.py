@@ -156,12 +156,17 @@ class MicroRunner:
         # Binance aggTrade feed (the core data source)
         self.agg_feed = BinanceAggTradeFeed(symbols=self.config.symbols)
 
-        # Apply configurable momentum weights to each MicroStructure
+        # Apply configurable momentum weights + score shaping to each MicroStructure
         for micro in self.agg_feed.micro.values():
             micro.weight_ofi_5s = self.config.weight_ofi_5s
             micro.weight_ofi_15s = self.config.weight_ofi_15s
             micro.weight_vwap_drift = self.config.weight_vwap_drift
             micro.weight_intensity = self.config.weight_intensity
+            micro.vwap_drift_scale = self.config.vwap_drift_scale
+            micro.dampener_agree_factor = self.config.dampener_agree_factor
+            micro.dampener_disagree_factor = self.config.dampener_disagree_factor
+            micro.dampener_flat_factor = self.config.dampener_flat_factor
+            micro.dampener_price_deadzone = self.config.dampener_price_deadzone
 
         # Also keep the regular ticker feed for price reference
         self.ticker_feed = BinanceFeed(symbols=self.config.symbols)
@@ -1396,6 +1401,11 @@ class MicroRunner:
                         "weight_ofi_15s": self.config.weight_ofi_15s,
                         "weight_vwap_drift": self.config.weight_vwap_drift,
                         "weight_intensity": self.config.weight_intensity,
+                        "vwap_drift_scale": self.config.vwap_drift_scale,
+                        "dampener_agree_factor": self.config.dampener_agree_factor,
+                        "dampener_disagree_factor": self.config.dampener_disagree_factor,
+                        "dampener_flat_factor": self.config.dampener_flat_factor,
+                        "dampener_price_deadzone": self.config.dampener_price_deadzone,
                     }
                     signal_snap = {
                         "momentum": round(opp.momentum, 4),

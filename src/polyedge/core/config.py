@@ -188,6 +188,22 @@ class MicroSniperConfig(BaseModel):
     weight_vwap_drift: float = 0.25        # VWAP drift signal
     weight_intensity: float = 0.15         # Trade intensity surge
 
+    # --- Score shaping (previously hardcoded) ---
+    # VWAP drift scaling: raw drift is tiny (0.0001 = $7 on BTC). This multiplier
+    # maps it to [-1, 1]. Higher = more sensitive to small moves.
+    # At 2000: ~$35 BTC move maxes the signal. At 5000: ~$14 maxes it (too noisy).
+    vwap_drift_scale: float = 2000.0
+
+    # Flow-price agreement dampener: penalizes the momentum score when OFI
+    # direction and actual price movement don't align. "Aggressive flow that
+    # doesn't move price was absorbed by the book — not a real signal."
+    # Continuous: factor = disagree + (agree - disagree) * alignment^2
+    # where alignment is 0 (fully opposed) to 1 (fully aligned).
+    dampener_agree_factor: float = 1.0     # Max factor when flow and price fully agree
+    dampener_disagree_factor: float = 0.4  # Min factor when flow and price fully oppose
+    dampener_flat_factor: float = 0.65     # Factor when OFI present but price flat (no drift)
+    dampener_price_deadzone: float = 0.05  # Scaled drift_signal below this = "price flat"
+
     # Slippage: how many cents above market to bid for instant fill
     entry_slippage: float = 0.02           # Pay up to 2c more for entry FOK fill
     exit_slippage: float = 0.05            # Sell up to 5c below market for exit FOK fill (wider = fills on first try)
