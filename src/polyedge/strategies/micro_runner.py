@@ -245,15 +245,6 @@ class MicroRunner:
 
             found.extend(page_markets)
 
-            # DEBUG: Show first few questions + slugs on page 0 so we can see
-            # what the API actually returns and why the filter might not match.
-            if page == 0 and page_markets:
-                console.print(f"[dim]  DEBUG: {len(page_markets)} markets on page 1. First 5:[/dim]")
-                for dm in page_markets[:5]:
-                    console.print(f"[dim]    Q: {dm.question[:80]}[/dim]")
-                    console.print(f"[dim]    Slug: {dm.slug[:60]}  End: {dm.end_date}[/dim]")
-                    console.print(f"[dim]    Filter match: {self._matches_filter(dm)}  UP_DOWN: {bool(UP_DOWN_PATTERN.search(dm.question))}[/dim]")
-
             # Check if we have any matching crypto markets yet
             matches = self._count_filter_matches(page_markets)
             if matches > 0:
@@ -398,29 +389,17 @@ class MicroRunner:
             except Exception as e:
                 console.print(f"[yellow]Exchange approval check failed: {e}[/yellow]")
 
-        # Initial market load — try DB first when --market filter is set,
-        # only hit the API if DB comes back empty (stale data / first run)
-        if self.market_filter:
-            console.print("[dim]Loading markets from DB...[/dim]")
-            await self._refresh_markets()
-            if self._total_markets <= 3:
-                if self._total_markets == 0:
-                    console.print("[yellow]No matching markets in DB — fetching from API...[/yellow]")
-                else:
-                    console.print(f"[yellow]Only {self._total_markets} window(s) from DB — fetching more from API...[/yellow]")
-                try:
-                    fetched = await self._quick_sync()
-                    if fetched:
-                        await self._refresh_markets(prefetched=fetched)
-                except Exception as e:
-                    console.print(f"[yellow]Quick fetch failed ({e})[/yellow]")
-        else:
-            console.print("[dim]Syncing markets from API...[/dim]")
-            try:
-                synced = await self.indexer.sync(force=True)
-                console.print(f"[green]Synced {synced} markets[/green]")
-            except Exception as e:
-                console.print(f"[yellow]Sync failed ({e}) — using DB data[/yellow]")
+        # Initial market load — always do a full indexer sync to get ALL
+        # markets into DB, then filter locally. The _quick_sync targeted
+        # fetch doesn't work reliably because 5-min crypto markets are
+        # buried in the middle of 8000+ markets sorted by endDate.
+        console.print("[dim]Syncing all markets from API...[/dim]")
+        try:
+            synced = await self.indexer.sync(force=True)
+            console.print(f"[green]Synced {synced} markets[/green]")
+        except Exception as e:
+            console.print(f"[yellow]Sync failed ({e}) — using DB data[/yellow]")
+        await self._refresh_markets()
 
         # Narrow Binance feeds to ONLY symbols with matching markets.
         # No point subscribing to ETH/SOL/XRP/DOGE streams when we're
@@ -613,16 +592,14 @@ class MicroRunner:
                         len(v) for v in self.updown_markets.values()
                     )
 
-                    # If we're running low on windows, fetch more from API
-                    # Trigger early (≤3) so we refetch BEFORE running out
+                    # If we're running low on windows, do a full sync to refill
                     if self._total_markets <= 3 and not self._sync_lock.locked():
                         try:
                             async with self._sync_lock:
-                                fetched = await self._quick_sync()
-                            if fetched:
-                                await self._refresh_markets(prefetched=fetched)
+                                await self.indexer.sync(force=True)
+                            await self._refresh_markets()
                         except Exception as e:
-                            logger.warning(f"Quick sync failed: {e}")
+                            logger.warning(f"Sync failed: {e}")
                 else:
                     # Full sync for unfiltered mode
                     try:
@@ -823,13 +800,12 @@ class MicroRunner:
             await self._refresh_markets()
 
             if self._total_markets == 0 and not self._sync_lock.locked():
-                # DB doesn't have next window yet — quick fetch from API
+                # DB doesn't have next window yet — full sync from API
                 console.print("[yellow]Fetching next window from API...[/yellow]")
                 try:
                     async with self._sync_lock:
-                        fetched = await self._quick_sync()
-                    if fetched:
-                        await self._refresh_markets(prefetched=fetched)
+                        await self.indexer.sync(force=True)
+                    await self._refresh_markets()
                 except Exception as e:
                     logger.warning(f"Hop sync failed: {e}")
 
