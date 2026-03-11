@@ -186,6 +186,7 @@ class MicroRunner:
         self._total_markets = 0
         self._ws_price_updates = 0
         self._eval_count = 0
+        self._eval_count_per_symbol: dict[str, int] = {}  # per-symbol tick counter
         self._last_status_time = 0.0
         self._last_trade_log: dict[str, float] = {}  # condition_id -> timestamp
 
@@ -863,10 +864,11 @@ class MicroRunner:
 
         self._eval_count += 1
 
-        # Don't evaluate faster than needed — batch evals per symbol
-        # (aggTrade can fire 10-50/sec, we don't need to eval every single one)
-        # Eval every 5th trade or every 0.5 seconds, whichever comes first
-        if self._eval_count % 5 != 0:
+        # Don't evaluate faster than needed — batch evals per symbol.
+        # Per-symbol counter so adding ETH doesn't starve BTC evals.
+        sym_count = self._eval_count_per_symbol.get(symbol, 0) + 1
+        self._eval_count_per_symbol[symbol] = sym_count
+        if sym_count % 5 != 0:
             return
 
         now = datetime.now(timezone.utc)
