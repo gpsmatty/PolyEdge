@@ -151,6 +151,13 @@ class MicroRunner:
         # Binance aggTrade feed (the core data source)
         self.agg_feed = BinanceAggTradeFeed(symbols=self.config.symbols)
 
+        # Apply configurable momentum weights to each MicroStructure
+        for micro in self.agg_feed.micro.values():
+            micro.weight_ofi_5s = self.config.weight_ofi_5s
+            micro.weight_ofi_15s = self.config.weight_ofi_15s
+            micro.weight_vwap_drift = self.config.weight_vwap_drift
+            micro.weight_intensity = self.config.weight_intensity
+
         # Also keep the regular ticker feed for price reference
         self.ticker_feed = BinanceFeed(symbols=self.config.symbols)
 

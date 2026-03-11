@@ -198,6 +198,12 @@ class MicroStructure:
     tick_count: int = 0
     last_update_time: float = 0.0  # monotonic time of last aggTrade
 
+    # Configurable momentum weights (set from MicroSniperConfig)
+    weight_ofi_5s: float = 0.20
+    weight_ofi_15s: float = 0.40
+    weight_vwap_drift: float = 0.25
+    weight_intensity: float = 0.15
+
     def __post_init__(self):
         if self.flow_5s is None:
             self.flow_5s = TradeFlowWindow(symbol=self.symbol, window_seconds=5.0)
@@ -251,11 +257,11 @@ class MicroStructure:
     def momentum_signal(self) -> float:
         """Composite momentum signal from -1 (strong sell) to +1 (strong buy).
 
-        Combines:
-        - Short-term OFI (5s) — weight 0.4 (most reactive)
-        - Medium-term OFI (15s) — weight 0.3
-        - VWAP drift (15s) — weight 0.2
-        - Trade intensity surge — weight 0.1
+        Combines (weights configurable via DB config):
+        - Short-term OFI (5s) — default 0.20 (reactive but noisy)
+        - Medium-term OFI (15s) — default 0.40 (more stable, primary signal)
+        - VWAP drift (15s) — default 0.25
+        - Trade intensity surge — default 0.15
 
         This is the core signal that drives micro sniper decisions.
         """
@@ -288,10 +294,10 @@ class MicroStructure:
         intensity_component = intensity_signal * dominant_direction
 
         signal = (
-            0.40 * ofi_5
-            + 0.30 * ofi_15
-            + 0.20 * drift_signal
-            + 0.10 * intensity_component
+            self.weight_ofi_5s * ofi_5
+            + self.weight_ofi_15s * ofi_15
+            + self.weight_vwap_drift * drift_signal
+            + self.weight_intensity * intensity_component
         )
 
         return max(-1.0, min(1.0, signal))
