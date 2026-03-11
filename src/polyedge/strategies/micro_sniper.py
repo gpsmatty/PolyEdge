@@ -142,6 +142,25 @@ class MicroSniperStrategy:
 
         momentum = micro.momentum_signal
         confidence = micro.confidence
+
+        # --- Blend Polymarket book sentiment into momentum ---
+        # The Binance momentum is pure order flow. The Poly book tells us
+        # what Polymarket participants are actually betting. When they agree,
+        # the signal is stronger. When they disagree, it's weaker.
+        # Applied here so it affects EVERY downstream decision (entry/exit/flip).
+        poly_adj = 0.0
+        if self.config.poly_book_enabled and book_intel:
+            yes_book = book_intel.get("yes")
+            if yes_book:
+                # imbalance_5c ranges [-1, +1]. Positive = more YES bids = bullish.
+                # For a bullish momentum signal, positive imbalance confirms it.
+                # For a bearish signal, negative imbalance confirms it.
+                # So we just add weight * imbalance directly — it naturally
+                # aligns: bullish momentum + bullish book = stronger signal,
+                # bullish momentum + bearish book = weaker signal.
+                poly_adj = self.config.poly_book_imbalance_weight * yes_book.imbalance_5c
+                momentum = max(-1.0, min(1.0, momentum + poly_adj))
+
         abs_momentum = abs(momentum)
         is_bullish = momentum > 0
 
