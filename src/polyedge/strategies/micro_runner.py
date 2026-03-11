@@ -1210,8 +1210,10 @@ class MicroRunner:
             err_msg = str(e)
             if "fully filled" in err_msg or "FOK" in err_msg:
                 # FOK rejected — not enough liquidity at our price. Normal, just skip.
+                # Apply trade cooldown so we don't spam retries on an empty book.
+                self._last_trade_log[cid] = time.time()
                 if not self.quiet:
-                    console.print(f"[dim]  FOK rejected @ ${entry_price:.2f} (mkt ${price:.2f}) — no liquidity[/dim]")
+                    console.print(f"[dim]  FOK rejected @ ${entry_price:.2f} (mkt ${price:.2f}) — no liquidity, cooling down[/dim]")
             else:
                 console.print(f"[red]  Execution error: {e}[/red]")
                 logger.error(f"Micro execution failed: {e}", exc_info=True)
