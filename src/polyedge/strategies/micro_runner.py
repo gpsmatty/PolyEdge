@@ -185,6 +185,9 @@ class MicroRunner:
         # Maintained in parallel with _positions for minimal refactor risk.
         self._position_info: dict[str, dict] = {}
 
+        # Exit attempt tracking: condition_id -> count of failed FOK sells
+        self._exit_attempts: dict[str, int] = {}
+
         # Trade tracking
         self._trades_this_window: int = 0
         self._total_trades: int = 0
@@ -1419,8 +1422,12 @@ class MicroRunner:
         local_size = info.get("size", 0)
         local_token_id = info.get("token_id", "")
 
-        # Use wider exit slippage — price moves fast, tight slippage = FOK rejections
-        exit_slip = self.config.exit_slippage
+        # Use wider exit slippage — price moves fast, tight slippage = FOK rejections.
+        # ESCALATION: each failed FOK attempt adds 3 cents to slippage so we don't
+        # loop forever while the price drops. After 3 failures the floor is 14 cents
+        # below market, which practically guarantees a fill.
+        attempts = self._exit_attempts.get(cid, 0)
+        exit_slip = self.config.exit_slippage + (attempts * 0.03)
         sell_price = max(0.01, round(price - exit_slip, 2))
 
         # Log book for visibility but ALWAYS use floor price for the FOK.
@@ -1517,8 +1524,9 @@ class MicroRunner:
         except Exception as e:
             err_msg = str(e)
             if "fully filled" in err_msg or "FOK" in err_msg:
+                self._exit_attempts[cid] = self._exit_attempts.get(cid, 0) + 1
                 if not self.quiet:
-                    console.print(f"[yellow]  FOK sell rejected @ ${effective_sell:.2f} — will retry next tick[/yellow]")
+                    console.print(f"[yellow]  FOK sell rejected @ ${effective_sell:.2f} (attempt {self._exit_attempts[cid]}) — will retry next tick[/yellow]")
             elif "not enough balance" in err_msg:
                 # Local size was wrong — re-query CLOB and retry immediately
                 # instead of waiting for next tick. The CLOB has settled by now
@@ -1562,14 +1570,17 @@ class MicroRunner:
                             self._position_info[cid]["size"] = 0
                 except Exception as retry_err:
                     console.print(f"[red]  Retry failed: {retry_err} — will retry next tick[/red]")
-                    if cid in self._position_info:
-                        self._position_info[cid]["size"] = 0
+                    # DON'T zero out size — keep the CLOB-reported size so next
+                    # attempt uses fast path instead of slow path (+400ms latency).
+                    if cid in self._position_info and best_size > 0:
+                        self._position_info[cid]["size"] = best_size
             else:
                 console.print(f"[red]  Sell failed: {e}[/red]")
                 logger.error(f"Failed to close {current_pos} position on {cid}: {e}")
 
         if total_sold > 0:
             fill_price = total_proceeds / total_sold if total_sold > 0 else sell_price
+            self._exit_attempts.pop(cid, None)  # Reset escalation on success
 
             gross_pnl = (fill_price - entry_price) * total_sold if entry_price > 0 else 0
             try:
