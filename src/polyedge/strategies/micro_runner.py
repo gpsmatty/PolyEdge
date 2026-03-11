@@ -1275,6 +1275,25 @@ class MicroRunner:
                 actual_entry = await self._get_fill_price(poly_order_id, token_id, entry_price)
                 actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
 
+                # Query REAL token balance — CLOB rounds differently than us.
+                # Our estimate (USD/price) can be higher than what we actually got,
+                # causing "not enough balance" on the fast exit path.
+                try:
+                    bal = self.client.get_token_balance(token_id)
+                    if isinstance(bal, dict):
+                        raw_bal = bal.get("balance", 0)
+                    else:
+                        raw_bal = bal
+                    raw_int = int(float(str(raw_bal)))
+                    if raw_int > 1_000_000:
+                        real_size = int(raw_int / 1e6 * 100) / 100  # truncate to 2dp
+                    else:
+                        real_size = int(float(str(raw_bal)) * 100) / 100
+                    if real_size > 0:
+                        actual_size = real_size
+                except Exception:
+                    pass  # Use estimated size as fallback
+
                 # Record in DB with actual fill price
                 try:
                     order_id = await self.db.insert_order({
