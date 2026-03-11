@@ -1423,7 +1423,13 @@ class MicroRunner:
         """Get current bankroll from actual USDC balance on chain."""
         try:
             bal = self.client.get_collateral_balance()
-            return float(bal) if bal else 50.0  # Conservative fallback
-        except Exception:
-            # If balance check fails, use a conservative fallback
+            # Returns dict like {'balance': '130123456', 'allowances': {...}}
+            # Balance is in raw units (USDC has 6 decimals)
+            raw = int(float(str(bal.get("balance", 0))))
+            usdc = raw / 1e6
+            if not self.quiet:
+                logger.debug(f"Bankroll: ${usdc:.2f} (raw: {raw})")
+            return usdc if usdc > 0 else 50.0
+        except Exception as e:
+            logger.warning(f"Balance check failed: {e}")
             return 50.0
