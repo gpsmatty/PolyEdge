@@ -436,7 +436,8 @@ class Database:
                      current_price, unrealized_pnl, strategy)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                 ON CONFLICT (market_id, token_id, side) DO UPDATE SET
-                    size=EXCLUDED.size, current_price=EXCLUDED.current_price,
+                    size=EXCLUDED.size, entry_price=EXCLUDED.entry_price,
+                    current_price=EXCLUDED.current_price,
                     unrealized_pnl=EXCLUDED.unrealized_pnl
                 """,
                 position["market_id"],
