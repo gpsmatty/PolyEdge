@@ -1,8 +1,10 @@
 # PolyEdge
 
+> **Copyright (c) 2025-2026 Matthew LeBrun. All rights reserved.** See [LICENSE](LICENSE).
+
 AI-powered trading bot for [Polymarket](https://polymarket.com) prediction markets.
 
-Scans thousands of markets, estimates true probabilities with LLMs, detects mispricings, sizes positions with Kelly criterion, and executes trades on the CLOB — all from a single Python process. Includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, and a high-frequency micro sniper that reads Binance aggTrade order flow to momentum-trade 5-minute crypto windows.
+Scans thousands of markets, estimates true probabilities with LLMs, detects mispricings, sizes positions with Kelly criterion, and executes trades on the CLOB — all from a single Python process. Includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, and a high-frequency micro sniper that reads Binance aggTrade order flow to momentum-trade short-duration (5m/15m) crypto up/down markets. The micro sniper is the primary active strategy.
 
 ## Quick Start
 
@@ -36,10 +38,10 @@ polyedge weather --dry   # Watch mode
 polyedge weather         # Copilot
 polyedge weather --auto  # Autopilot
 
-# Micro sniper — high-frequency momentum trading on 5-min crypto markets
-polyedge micro --dry --market "btc 5m"   # Watch BTC 5-min only
-polyedge micro --market "btc 5m"         # Copilot — confirm each trade
-polyedge micro --auto --market "btc 5m"  # Autopilot — auto-execute
+# Micro sniper — high-frequency momentum trading on short-duration crypto markets
+polyedge micro --dry --market "btc 15m"   # Watch BTC 15-min only
+polyedge micro --market "btc 15m"         # Copilot — confirm each trade
+polyedge micro --auto --market "btc 15m"  # Autopilot — auto-execute
 
 # Start the general agent
 polyedge autopilot --mode signals    # Display-only mode
@@ -112,16 +114,18 @@ The probability model uses a normal CDF (Abramowitz & Stegun approximation) with
 
 Run via `polyedge sniper` with `--dry`, copilot (default), or `--auto` modes.
 
-### Micro Sniper (High-Frequency Momentum — Real-Time)
-Reads Binance aggTrade order flow at tick level (~10-50 trades/sec for BTC) and momentum-trades Polymarket's 5-minute crypto "Up or Down" markets. Unlike the crypto sniper which waits for a clear directional move in the final 90 seconds, the micro sniper trades every momentum swing throughout the entire 5-minute window.
+### Micro Sniper (Primary — High-Frequency Momentum)
+Reads Binance aggTrade order flow at tick level (~10-50 trades/sec for BTC) and momentum-trades Polymarket's short-duration (5m/15m) crypto "Up or Down" markets. Unlike the crypto sniper which waits for a clear directional move in the final 90 seconds, the micro sniper trades momentum swings throughout the window.
 
-The strategy computes a composite momentum signal from -1 (strong sell) to +1 (strong buy) using: short-term order flow imbalance (5s window, 40% weight), medium-term OFI (15s, 30%), VWAP drift (20%), and trade intensity surge (10%). When momentum exceeds the entry threshold (0.40) with sufficient trade activity (10+ trades in 15s window), it enters a position. It exits when momentum dies or reverses, and can flip (close + reopen opposite side) on strong reversals above 0.50 with 25+ confirming trades.
+The strategy computes a composite momentum signal from -1 (strong sell) to +1 (strong buy) using: short-term order flow imbalance (5s, 10% weight), medium-term OFI (15s, 50%), VWAP drift (25%), and trade intensity surge (15%). The raw signal is then multiplied by a **flow-price agreement dampener** — a continuous factor that scales from 0.4 (flow opposed price) through 0.65 (price flat despite flow) to 1.0 (flow confirmed by price). This kills false signals where aggressive order flow gets absorbed by the book without displacing price.
 
-Safety rails prevent buying nearly-dead sides (min price 0.15) or heavily-priced sides (max price 0.80). Gap detection resets stale data on WebSocket reconnect. Window hopping pre-loads 10 upcoming windows for seamless transitions. Binance feeds are narrowed to only matched symbols for minimal latency.
+Entry requires momentum > 0.50, sustained for 2 seconds, with 10+ trades confirming. A 30-second trend filter blocks counter-trend entries, and a 5-minute trend bias penalizes or hard-blocks entries against the macro direction. Exit triggers on momentum reversal, trailing stop (12% drawdown from HWM), or force exit with <8s remaining. All thresholds, weights, and dampener params are hot-reloadable from the database every 30 seconds — no restart needed.
 
-Can produce 10-20+ round-trip trades per 5-minute window. No AI needed — pure microstructure math and speed. Zero API cost.
+Safety rails include price band guards (0.35-0.65), dead market detection, trade cooldowns, FOK order rejection as a natural liquidity filter, and exit escalation on stuck sells. Gap detection resets stale data on WebSocket reconnect. Window hopping pre-loads 10 upcoming windows for seamless transitions.
 
-Run via `polyedge micro --dry --market "btc 5m"` (watch mode), `polyedge micro --market "btc 5m"` (copilot), or `polyedge micro --auto --market "btc 5m"` (autopilot).
+No AI needed — pure microstructure math and speed. Zero API cost.
+
+Run via `polyedge micro --dry --market "btc 15m"` (watch mode), `polyedge micro --market "btc 15m"` (copilot), or `polyedge micro --auto --market "btc 15m"` (autopilot).
 
 ### AI Edge Finder
 Uses LLMs to estimate true probabilities independent of market price. When `AI_probability - market_price > 10%`, generates a trade signal. The AI analyst operates with a strong market-efficiency prior — it defaults to agreeing with market price and requires concrete evidence to diverge. Two-tier model system:
