@@ -1399,17 +1399,19 @@ class MicroRunner:
         exit_slip = self.config.exit_slippage
         sell_price = max(0.01, round(price - exit_slip, 2))
 
-        # Check WebSocket book for best bid (local, instant — no API call)
+        # Log book for visibility but ALWAYS use floor price for the FOK.
+        # FOK fills at the best available bid anyway — if bids are at $0.40
+        # and we ask for $0.36, we get $0.40. But if those $0.40 bids get
+        # pulled (which happened 9x in a row), asking $0.36 still fills at
+        # $0.39/$0.38 instead of rejecting. Never try to be clever with the
+        # sell price — just set the floor and let the CLOB give us the best fill.
         book = self.poly_feed.books.get(token_id)
-        best_bid = sell_price
-        if book and book.bids:
-            best_bid = book.bids[0].price
-            if not self.quiet:
-                top_bids = book.bids[:3]
-                bid_str = " | ".join(f"${b.price:.2f}×{b.size:.0f}" for b in top_bids)
-                console.print(f"  [dim]Book bids: {bid_str}[/dim]")
+        if book and book.bids and not self.quiet:
+            top_bids = book.bids[:3]
+            bid_str = " | ".join(f"${b.price:.2f}×{b.size:.0f}" for b in top_bids)
+            console.print(f"  [dim]Book bids: {bid_str}[/dim]")
 
-        effective_sell = max(sell_price, round(best_bid, 2))
+        effective_sell = sell_price  # Always use floor — FOK fills at best available
 
         # Determine share count — prefer local tracking, fall back to CLOB API
         size = 0
