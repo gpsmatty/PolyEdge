@@ -145,6 +145,10 @@ class MicroRunner:
         # Strategy
         self.strategy = MicroSniperStrategy(settings)
 
+        # Execution engine — instantiate once, not per-trade
+        from polyedge.execution.engine import ExecutionEngine
+        self.engine = ExecutionEngine(client, db, settings)
+
         # Market indexer
         self.indexer = MarketIndexer(settings, db)
 
@@ -1096,16 +1100,13 @@ class MicroRunner:
         size_usd: float,
     ):
         """Execute a micro trade."""
-        from polyedge.execution.engine import ExecutionEngine
-
-        engine = ExecutionEngine(self.client, self.db, self.settings)
         cid = opp.market.condition_id
         action = opp.action
 
         # For EXIT and FLIP, we'd need to sell the existing position first
         if action == MicroAction.EXIT:
             # Sell existing position
-            success = await self._close_position(engine, opp)
+            success = await self._close_position(self.engine, opp)
             if success:
                 self._positions.pop(cid, None)
                 self._trades_this_window += 1
@@ -1115,7 +1116,7 @@ class MicroRunner:
 
         if action in (MicroAction.FLIP_YES, MicroAction.FLIP_NO):
             # Close existing position first
-            await self._close_position(engine, opp)
+            await self._close_position(self.engine, opp)
             self._total_flips += 1
             # Then fall through to open new position
 
