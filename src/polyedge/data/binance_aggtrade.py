@@ -110,6 +110,13 @@ class TradeFlowWindow:
             self.vwap_numerator -= old.price * old.quantity
             self.total_quantity -= old.quantity
 
+        # Guard against floating point drift from thousands of subtractions.
+        # Negative volumes flip OFI sign — a phantom signal.
+        self.buy_volume = max(0.0, self.buy_volume)
+        self.sell_volume = max(0.0, self.sell_volume)
+        self.vwap_numerator = max(0.0, self.vwap_numerator)
+        self.total_quantity = max(0.0, self.total_quantity)
+
     @property
     def total_volume(self) -> float:
         return self.buy_volume + self.sell_volume
