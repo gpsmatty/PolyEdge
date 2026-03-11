@@ -102,6 +102,9 @@ class MicroSniperStrategy:
 
     def __init__(self, settings: Settings):
         self.config = settings.strategies.micro_sniper
+        # Track previous momentum per symbol for acceleration filter.
+        # Only enter when momentum is still rising, not fading.
+        self._prev_momentum: dict[str, float] = {}
 
     def evaluate(
         self,
@@ -195,15 +198,52 @@ class MicroSniperStrategy:
 
         # Need strong enough signal
         if abs_momentum < effective_threshold:
+            # Even if we don't enter, track momentum for acceleration filter
+            self._prev_momentum[micro.symbol] = momentum
             return None
 
         # Need enough confidence
         if confidence < self.config.min_confidence:
+            self._prev_momentum[micro.symbol] = momentum
             return None
 
         # Need enough trade activity
         if micro.flow_15s.total_count < self.config.min_trades_in_window:
+            self._prev_momentum[micro.symbol] = momentum
             return None
+
+        # --- Acceleration filter ---
+        # Don't chase fading signals. Only enter when momentum is still
+        # building (accelerating), not when it's already rolling over.
+        # This prevents buying at the top of an OFI spike.
+        prev = self._prev_momentum.get(micro.symbol, 0.0)
+        self._prev_momentum[micro.symbol] = momentum
+        if is_bullish:
+            # Bullish: current momentum should be >= previous (still rising)
+            if momentum < prev - 0.05:  # Allow tiny dips (noise tolerance)
+                return None
+        else:
+            # Bearish: current momentum should be <= previous (still falling)
+            if momentum > prev + 0.05:
+                return None
+
+        # --- Price-to-beat filter ---
+        # Don't buy the wrong side of a decided market. If BTC has moved
+        # significantly from the window open, don't bet on a reversal.
+        # A 5-second OFI spike doesn't override 3 minutes of price action.
+        price_change = micro.price_change_pct
+        if micro.window_start_price > 0 and seconds_remaining < 180:
+            # Scale threshold: stricter as time runs out.
+            # With 180s left, need 0.10% move to block. With 30s left, 0.03%.
+            time_factor = max(0.3, seconds_remaining / 180.0)
+            block_threshold = 0.001 * time_factor  # 0.03%-0.10%
+
+            if is_bullish and price_change < -block_threshold:
+                # Buying YES but BTC is below the open — fighting the window
+                return None
+            if not is_bullish and price_change > block_threshold:
+                # Buying NO but BTC is above the open — fighting the window
+                return None
 
         if is_bullish:
             action = MicroAction.BUY_YES
