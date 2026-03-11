@@ -39,7 +39,8 @@ from polyedge.data.binance_aggtrade import (
     MicroStructure,
 )
 from polyedge.data.binance_feed import BinanceFeed
-from polyedge.data.ws_feed import MarketFeed, EVENT_BEST_BID_ASK, EVENT_LAST_TRADE
+from polyedge.data.ws_feed import MarketFeed, EVENT_BEST_BID_ASK, EVENT_LAST_TRADE, EVENT_BOOK
+from polyedge.data.book_analyzer import analyze_book, BookIntelligence
 from polyedge.data.indexer import MarketIndexer
 from polyedge.risk.sizing import calculate_position_size
 from polyedge.strategies.micro_sniper import (
@@ -968,15 +969,46 @@ class MicroRunner:
         if not current_pos and self._last_hop_time > 0 and hop_elapsed < self.config.window_hop_cooldown:
             return  # Still in cooldown — skip entry evaluation
 
+        # Look up Polymarket order book intelligence if enabled.
+        # The poly_feed already maintains live book snapshots via WS —
+        # we just need to run analyze_book() on the relevant token.
+        book_intel = None
+        if self.config.poly_book_enabled and market.clob_token_ids:
+            book_intel = self._get_book_intel(market)
+
         opp = self.strategy.evaluate(
             market=market,
             micro=micro,
             seconds_remaining=remaining,
             current_position=current_pos,
+            book_intel=book_intel,
         )
 
         if opp:
             await self._handle_opportunity(opp)
+
+    def _get_book_intel(self, market: Market) -> Optional[dict[str, BookIntelligence]]:
+        """Get BookIntelligence for both YES and NO tokens of a market.
+
+        Uses the live order book maintained by the Polymarket WebSocket.
+        Returns None if no book data is available yet.
+
+        Returns dict with "yes" and/or "no" keys.
+        """
+        if not market.clob_token_ids or len(market.clob_token_ids) < 2:
+            return None
+
+        result: dict[str, BookIntelligence] = {}
+        for idx, side in enumerate(["yes", "no"]):
+            token_id = market.clob_token_ids[idx]
+            book = self.poly_feed.get_book(token_id)
+            if book and (book.bids or book.asks):
+                try:
+                    result[side] = analyze_book(book)
+                except Exception as e:
+                    logger.debug(f"Book analysis failed for {side} {token_id}: {e}")
+
+        return result if result else None
 
     # ------------------------------------------------------------------
     # Opportunity handling

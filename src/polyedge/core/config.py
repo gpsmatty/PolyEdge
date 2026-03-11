@@ -201,6 +201,16 @@ class MicroSniperConfig(BaseModel):
     # and fresh OFI data build up for the new window.
     window_hop_cooldown: float = 30.0      # Wait 30s after hop before trading
 
+    # --- Polymarket order book integration ---
+    # When enabled, reads the live Polymarket order book via WebSocket
+    # for two features:
+    # 1. Exit liquidity check — blocks entry if bid depth is too thin to exit
+    # 2. Book imbalance signal — Polymarket bid/ask imbalance as a tiebreaker
+    poly_book_enabled: bool = False         # Master toggle — OFF by default
+    poly_book_min_exit_depth: float = 20.0  # Min bid depth (contracts within 5c) to enter — ensures we can exit
+    poly_book_imbalance_weight: float = 0.10  # Weight of Poly book imbalance in momentum composite (steals from OFI 5s)
+    poly_book_imbalance_veto: float = -0.40   # If Poly book imbalance is this negative against our direction, block entry
+
 
 class MarketMakerConfig(BaseModel):
     enabled: bool = False

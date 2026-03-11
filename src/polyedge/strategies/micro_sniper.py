@@ -35,6 +35,7 @@ from typing import Optional
 from polyedge.core.config import Settings
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_aggtrade import MicroStructure, AggTrade
+from polyedge.data.book_analyzer import BookIntelligence
 
 logger = logging.getLogger("polyedge.micro_sniper")
 
@@ -71,6 +72,7 @@ class MicroOpportunity:
     market_price: float         # Polymarket price for our side
     seconds_remaining: float    # Time left in the window
     is_flip: bool = False       # True if this is a position flip
+    poly_book_imbalance: float = 0.0  # Polymarket order book imbalance (if enabled)
 
 
 class MicroSniperStrategy:
@@ -112,6 +114,7 @@ class MicroSniperStrategy:
         micro: MicroStructure,
         seconds_remaining: float,
         current_position: Optional[str] = None,  # "yes", "no", or None
+        book_intel: Optional[dict[str, BookIntelligence]] = None,  # {"yes": ..., "no": ...}
     ) -> Optional[MicroOpportunity]:
         """Evaluate a single up/down market against current microstructure.
 
@@ -120,6 +123,7 @@ class MicroSniperStrategy:
             micro: Current microstructure state from aggTrade feed.
             seconds_remaining: Seconds left in the market window.
             current_position: "yes" if holding YES, "no" if holding NO, None if flat.
+            book_intel: Polymarket order book intelligence for YES and NO tokens.
 
         Returns:
             MicroOpportunity if action should be taken, None otherwise.
@@ -165,13 +169,13 @@ class MicroSniperStrategy:
         if current_position:
             return self._evaluate_with_position(
                 market, micro, seconds_remaining, current_position,
-                momentum, confidence, is_bullish,
+                momentum, confidence, is_bullish, book_intel,
             )
 
         # --- Check if we should enter ---
         return self._evaluate_entry(
             market, micro, seconds_remaining,
-            momentum, confidence, is_bullish,
+            momentum, confidence, is_bullish, book_intel,
         )
 
     def _evaluate_entry(
@@ -182,6 +186,7 @@ class MicroSniperStrategy:
         momentum: float,
         confidence: float,
         is_bullish: bool,
+        book_intel: Optional[dict[str, BookIntelligence]] = None,
     ) -> Optional[MicroOpportunity]:
         """Check if we should open a new position."""
         abs_momentum = abs(momentum)
@@ -272,6 +277,35 @@ class MicroSniperStrategy:
         if abs(yes_price - 0.50) < band:
             return None
 
+        # --- Polymarket order book checks (when poly_book_enabled) ---
+        poly_imbalance = 0.0
+        if self.config.poly_book_enabled and book_intel:
+            # Pick the book for the token we're buying.
+            # Buying YES → need YES book (bids = exit path)
+            # Buying NO → need NO book (bids = exit path)
+            our_side = "yes" if is_bullish else "no"
+            our_book = book_intel.get(our_side)
+
+            if our_book:
+                # 1. Exit liquidity check — if the bid side of our token is
+                #    too thin, we'll get trapped. Don't enter without exit depth.
+                if our_book.bid_depth_5c < self.config.poly_book_min_exit_depth:
+                    return None
+
+            # 2. Book imbalance signal — use YES book imbalance as the
+            #    sentiment indicator (it's the primary side on Polymarket).
+            #    imbalance_5c > 0 = more bids = bullish market sentiment.
+            yes_book = book_intel.get("yes")
+            if yes_book:
+                poly_imbalance = yes_book.imbalance_5c
+                # For YES buys, positive imbalance is aligned.
+                # For NO buys, flip the sign.
+                directional_imbalance = poly_imbalance if is_bullish else -poly_imbalance
+
+                # Veto: if the Poly book strongly disagrees, block entry
+                if directional_imbalance < self.config.poly_book_imbalance_veto:
+                    return None
+
         return MicroOpportunity(
             market=market,
             symbol=micro.symbol,
@@ -287,6 +321,7 @@ class MicroSniperStrategy:
             price_change_pct=micro.price_change_pct,
             market_price=market_price,
             seconds_remaining=seconds_remaining,
+            poly_book_imbalance=poly_imbalance,
         )
 
     def _evaluate_with_position(
@@ -298,6 +333,7 @@ class MicroSniperStrategy:
         momentum: float,
         confidence: float,
         is_bullish: bool,
+        book_intel: Optional[dict[str, BookIntelligence]] = None,
     ) -> Optional[MicroOpportunity]:
         """Evaluate when we already have a position — exit, hold, or flip."""
         abs_momentum = abs(momentum)
@@ -410,6 +446,7 @@ class MicroSniperStrategy:
     def opportunity_to_signal(self, opp: MicroOpportunity) -> Signal:
         """Convert a MicroOpportunity to a tradeable Signal."""
         action_label = opp.action.value.upper().replace("_", " ")
+        book_str = f" | PolyBook: {opp.poly_book_imbalance:+.2f}" if opp.poly_book_imbalance != 0 else ""
         reasoning = (
             f"Micro Sniper [{action_label}]: {opp.symbol.upper()} "
             f"Momentum: {opp.momentum:+.2f} | "
@@ -417,7 +454,7 @@ class MicroSniperStrategy:
             f"VWAP drift: {opp.vwap_drift:+.6f} | "
             f"Intensity: {opp.trade_intensity:.1f} tps | "
             f"BTC: ${opp.binance_price:,.2f} ({opp.price_change_pct:+.4%}) | "
-            f"Mkt: {opp.market_price:.2f} | "
+            f"Mkt: {opp.market_price:.2f}{book_str} | "
             f"{opp.seconds_remaining:.0f}s left"
         )
 
