@@ -192,6 +192,10 @@ class MicroSniperConfig(BaseModel):
     entry_slippage: float = 0.02           # Pay up to 2c more for entry FOK fill
     exit_slippage: float = 0.02            # Sell up to 2c below market for exit FOK fill
 
+    # Trade cooldown: seconds between trades on the same market.
+    # Prevents whipsaw — trading the same market twice during noisy bounces.
+    trade_cooldown: float = 10.0           # 10s between trades on same condition_id
+
     # Window hop cooldown: seconds to wait after hopping to a new window
     # before allowing entries. Lets stale cross-window momentum flush out
     # and fresh OFI data build up for the new window.

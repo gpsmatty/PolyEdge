@@ -195,7 +195,7 @@ class MicroRunner:
         self._last_trade_log: dict[str, float] = {}  # condition_id -> timestamp
 
         # Rate limiting: don't trade the same market more than once per N seconds
-        self._trade_cooldown: float = 10.0  # seconds between trades on same market
+        self._trade_cooldown: float = self.config.trade_cooldown
 
         # On startup, wait for the next fresh window instead of jumping into
         # a partially-elapsed one with stale microstructure data.
