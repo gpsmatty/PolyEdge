@@ -351,6 +351,47 @@ class MicroSniperStrategy:
         abs_momentum = abs(momentum)
         holding_yes = current_position == "yes"
 
+        # --- TIME-SCALED FLOOR EXIT ---
+        # Prevents catastrophic ride-to-zero, but only when price is low AND
+        # there's not enough time left to recover.  Winners routinely dip to
+        # $0.25 mid-window and rip back — a hard floor kills those.  Instead,
+        # the floor tightens as time runs out:
+        #   >120s left → no floor (plenty of time to recover)
+        #   60-120s    → floor at 0.15 (extreme — market has given up)
+        #   30-60s     → floor at 0.20 (running out of time)
+        #   <30s       → floor at min_entry_price (force_exit handles the rest)
+        our_price = market.yes_price if holding_yes else market.no_price
+        if seconds_remaining < 120:
+            if seconds_remaining < 30:
+                floor = self.config.min_entry_price
+            elif seconds_remaining < 60:
+                floor = 0.20
+            else:
+                floor = 0.15
+
+            if our_price < floor:
+                console.print(
+                    f"[bold red]FLOOR EXIT: {'YES' if holding_yes else 'NO'} price "
+                    f"${our_price:.2f} < floor ${floor:.2f} "
+                    f"({seconds_remaining:.0f}s left) — emergency bail[/bold red]"
+                )
+                return MicroOpportunity(
+                    market=market,
+                    symbol=micro.symbol,
+                    action=MicroAction.EXIT,
+                    side=Side.YES if holding_yes else Side.NO,
+                    momentum=momentum,
+                    confidence=confidence,
+                    ofi_5s=micro.flow_5s.ofi,
+                    ofi_15s=micro.flow_15s.ofi,
+                    vwap_drift=micro.flow_15s.vwap_drift,
+                    trade_intensity=micro.flow_5s.trade_intensity,
+                    binance_price=micro.current_price,
+                    price_change_pct=micro.price_change_pct,
+                    market_price=our_price,
+                    seconds_remaining=seconds_remaining,
+                )
+
         # Is momentum aligned with our position?
         aligned = (holding_yes and is_bullish) or (not holding_yes and not is_bullish)
 
