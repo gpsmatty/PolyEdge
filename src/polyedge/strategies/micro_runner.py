@@ -921,14 +921,16 @@ class MicroRunner:
         if time.time() - last_trade_time < self._trade_cooldown:
             return
 
-        # Check max trades per window
-        if self._trades_this_window >= self.config.max_trades_per_window:
+        current_pos = self._positions.get(market.condition_id)
+
+        # Check max trades per window — only block NEW entries, never exits.
+        # A position must always be able to exit regardless of trade count.
+        if not current_pos and self._trades_this_window >= self.config.max_trades_per_window:
             return
 
         # Window hop cooldown — don't enter new positions while stale
         # cross-window momentum is still in the flow windows. Exits are
-        # still allowed (force_exit, etc.) so we only block entries.
-        current_pos = self._positions.get(market.condition_id)
+        # still allowed so we're never trapped in a position.
         hop_elapsed = time.time() - self._last_hop_time
         if not current_pos and self._last_hop_time > 0 and hop_elapsed < self.config.window_hop_cooldown:
             return  # Still in cooldown — skip entry evaluation
