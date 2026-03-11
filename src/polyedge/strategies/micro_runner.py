@@ -529,6 +529,7 @@ class MicroRunner:
             asyncio.create_task(self._market_refresh_loop()),
             asyncio.create_task(self._status_loop()),
             asyncio.create_task(self._price_log_loop()),
+            asyncio.create_task(self._config_refresh_loop()),
         ]
 
         try:
@@ -1802,6 +1803,57 @@ class MicroRunner:
                     await self.db.prune_micro_price_log(keep_minutes=60)
                 except Exception as e:
                     logger.warning(f"Failed to prune price log: {e}")
+
+    async def _config_refresh_loop(self):
+        """Hot-reload config from DB every 30 seconds.
+
+        Reads polyedge.risk_config and pushes updated values into:
+        1. self.settings (the Settings object)
+        2. self.config (shortcut to settings.strategies.micro_sniper)
+        3. self.strategy.config (same reference)
+        4. MicroStructure instances (weights, dampener params)
+
+        This means `polyedge config set ...` takes effect within 30s
+        without restarting the bot.
+        """
+        from polyedge.core.config import apply_db_config
+
+        while self.running:
+            await asyncio.sleep(30)
+            try:
+                old_config = {
+                    "entry_threshold": self.config.entry_threshold,
+                    "fixed_position_usd": self.config.fixed_position_usd,
+                    "vwap_drift_scale": self.config.vwap_drift_scale,
+                    "dampener_flat_factor": self.config.dampener_flat_factor,
+                    "min_seconds_remaining": self.config.min_seconds_remaining,
+                    "trend_bias_min_pct": self.config.trend_bias_min_pct,
+                }
+
+                await apply_db_config(self.settings, self.db)
+
+                # Push updated score-shaping params to MicroStructure instances
+                for micro in self.agg_feed.micro.values():
+                    micro.weight_ofi_5s = self.config.weight_ofi_5s
+                    micro.weight_ofi_15s = self.config.weight_ofi_15s
+                    micro.weight_vwap_drift = self.config.weight_vwap_drift
+                    micro.weight_intensity = self.config.weight_intensity
+                    micro.vwap_drift_scale = self.config.vwap_drift_scale
+                    micro.dampener_agree_factor = self.config.dampener_agree_factor
+                    micro.dampener_disagree_factor = self.config.dampener_disagree_factor
+                    micro.dampener_flat_factor = self.config.dampener_flat_factor
+                    micro.dampener_price_deadzone = self.config.dampener_price_deadzone
+
+                # Log any changes
+                changes = []
+                for key, old_val in old_config.items():
+                    new_val = getattr(self.config, key, None)
+                    if new_val is not None and new_val != old_val:
+                        changes.append(f"{key}: {old_val} → {new_val}")
+                if changes:
+                    console.print(f"[bold cyan]CONFIG RELOADED: {', '.join(changes)}[/bold cyan]")
+            except Exception as e:
+                logger.warning(f"Config refresh failed: {e}")
 
     async def _get_bankroll(self) -> float:
         """Get current bankroll from actual USDC balance on chain."""
