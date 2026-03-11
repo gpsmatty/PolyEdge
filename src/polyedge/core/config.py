@@ -183,8 +183,8 @@ class MicroSniperConfig(BaseModel):
 
     # Momentum signal weights — must sum to 1.0
     # Default shifts weight from noisy 5s OFI to more stable 15s/30s windows
-    weight_ofi_5s: float = 0.20            # Short-term OFI (most reactive, most noisy)
-    weight_ofi_15s: float = 0.40           # Medium-term OFI (more stable)
+    weight_ofi_5s: float = 0.10            # Short-term OFI (most reactive, most noisy)
+    weight_ofi_15s: float = 0.50           # Medium-term OFI (most reliable signal)
     weight_vwap_drift: float = 0.25        # VWAP drift signal
     weight_intensity: float = 0.15         # Trade intensity surge
 
