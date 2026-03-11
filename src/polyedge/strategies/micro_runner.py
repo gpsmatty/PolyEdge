@@ -389,17 +389,19 @@ class MicroRunner:
             except Exception as e:
                 console.print(f"[yellow]Exchange approval check failed: {e}[/yellow]")
 
-        # Initial market load — always do a full indexer sync to get ALL
-        # markets into DB, then filter locally. The _quick_sync targeted
-        # fetch doesn't work reliably because 5-min crypto markets are
-        # buried in the middle of 8000+ markets sorted by endDate.
-        console.print("[dim]Syncing all markets from API...[/dim]")
-        try:
-            synced = await self.indexer.sync(force=True)
-            console.print(f"[green]Synced {synced} markets[/green]")
-        except Exception as e:
-            console.print(f"[yellow]Sync failed ({e}) — using DB data[/yellow]")
+        # Initial market load — try DB first (fast), only full sync if empty.
+        # DB has markets from prior syncs. The key fix: limit=50000 so the
+        # volume-sorted DB query doesn't cut off low-volume 5-min crypto markets.
+        console.print("[dim]Loading markets from DB...[/dim]")
         await self._refresh_markets()
+        if self._total_markets == 0:
+            console.print("[yellow]No matching markets in DB — syncing from API...[/yellow]")
+            try:
+                synced = await self.indexer.sync(force=True)
+                console.print(f"[green]Synced {synced} markets[/green]")
+                await self._refresh_markets()
+            except Exception as e:
+                console.print(f"[yellow]Sync failed ({e})[/yellow]")
 
         # Narrow Binance feeds to ONLY symbols with matching markets.
         # No point subscribing to ETH/SOL/XRP/DOGE streams when we're
@@ -631,7 +633,7 @@ class MicroRunner:
             try:
                 all_markets = await self.indexer.get_markets(
                     min_liquidity=0,
-                    limit=5000,
+                    limit=50000,  # Need ALL — 5-min crypto markets have very low volume
                 )
             except Exception as e:
                 logger.warning(f"Failed to load markets: {e}")
@@ -639,32 +641,6 @@ class MicroRunner:
 
         # Simple filter: UP_DOWN_PATTERN + user filter + live (not expired)
         candidates: dict[str, list[tuple[Market, ParsedCryptoMarket]]] = {}
-
-        # DEBUG counters
-        _d_total = len(all_markets)
-        _d_updown = 0
-        _d_live = 0
-        _d_filter = 0
-
-        for market in all_markets:
-            q = market.question
-            if not UP_DOWN_PATTERN.search(q):
-                continue
-            _d_updown += 1
-
-            # Skip markets that have already ended
-            if not market.end_date or market.end_date <= now:
-                continue
-            _d_live += 1
-
-            # Apply user's --market filter with word-boundary matching
-            if not self._matches_filter(market):
-                continue
-            _d_filter += 1
-
-        # Print debug then re-run the actual loop
-        if not self.quiet:
-            console.print(f"[dim]  DEBUG: {_d_total} total → {_d_updown} up/down → {_d_live} live → {_d_filter} pass filter[/dim]")
 
         for market in all_markets:
             q = market.question
