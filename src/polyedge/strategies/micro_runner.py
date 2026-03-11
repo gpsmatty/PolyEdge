@@ -1275,12 +1275,29 @@ class MicroRunner:
                 actual_entry = await self._get_fill_price(poly_order_id, token_id, entry_price)
                 actual_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
 
-                # Use estimated size with 2% haircut instead of querying CLOB balance.
-                # The CLOB balance endpoint lags behind settlement (returns 0 even 0.5s
-                # after fill), so the query is unreliable. A 2% haircut on our estimate
-                # (USD / fill_price) is more reliable — we sell slightly fewer shares
-                # than we have, leaving dust, but the fast exit always works.
-                actual_size = int(actual_size * 0.98 * 100) / 100  # truncate to 2dp
+                # Try CLOB balance — if settled, use real value. If not (returns 0
+                # or garbage), fall back to estimate with 2% haircut.
+                estimated_size = actual_size
+                try:
+                    bal = self.client.get_token_balance(token_id)
+                    raw_bal = bal.get("balance", 0) if isinstance(bal, dict) else bal
+                    raw_float = float(str(raw_bal))
+                    # Try microunit interpretation first (raw / 1e6)
+                    as_micro = int(raw_float / 1e6 * 100) / 100
+                    # Check if microunit is close to our estimate (within 50%)
+                    if as_micro > 0 and abs(as_micro - estimated_size) < estimated_size * 0.5:
+                        actual_size = as_micro
+                        logger.info(f"CLOB balance (micro): {actual_size} shares (est={estimated_size:.2f})")
+                    elif raw_float > 0 and raw_float < estimated_size * 3:
+                        # Direct value, close to estimate
+                        actual_size = int(raw_float * 100) / 100
+                        logger.info(f"CLOB balance (direct): {actual_size} shares (est={estimated_size:.2f})")
+                    else:
+                        # CLOB not settled yet or garbage — use haircut estimate
+                        actual_size = int(estimated_size * 0.98 * 100) / 100
+                        logger.info(f"CLOB balance unusable (raw={raw_bal}), using estimate {actual_size}")
+                except Exception:
+                    actual_size = int(estimated_size * 0.98 * 100) / 100
 
                 # Record in DB with actual fill price
                 try:
