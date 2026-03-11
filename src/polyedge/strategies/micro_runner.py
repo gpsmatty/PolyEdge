@@ -1018,6 +1018,16 @@ class MicroRunner:
             if our_price > info["hwm"]:
                 info["hwm"] = our_price
 
+        # --- Min hold time: don't exit within 5s of entry ---
+        # The CLOB needs time to settle the token balance after a buy.
+        # Exiting too soon causes stale balance reads (e.g., 0.2 instead of 8.2).
+        # Force exit (<8s remaining) bypasses this check.
+        if current_pos and market.condition_id in self._position_info:
+            entry_t = self._position_info[market.condition_id].get("entry_time", 0)
+            hold_secs = time.time() - entry_t
+            if hold_secs < 5.0 and remaining > self.config.force_exit_seconds:
+                return  # Too soon after entry — let CLOB settle
+
         # Check max trades per window — only block NEW entries, never exits.
         # A position must always be able to exit regardless of trade count.
         if not current_pos and self._trades_this_window >= self.config.max_trades_per_window:
@@ -1205,38 +1215,29 @@ class MicroRunner:
         Returns (fill_price, fill_size). fill_size=0 means we couldn't get it
         (caller should use its own estimate).
 
-        Strategy: try get_order first (exact match), then search trades by
-        order ID. NEVER fall back to "most recent trade" — that grabs
-        previous fills and gives wildly wrong P&L.
+        Strategy: ALWAYS prefer trade-level fill data for prices (most accurate).
+        The order-level `average_price` field often returns the limit/floor price
+        rather than the actual execution price. Use order-level only for size
+        as a fallback.
         """
         fill_price = fallback_price
         fill_size = 0.0
+        order_size = 0.0  # size from order-level data (fallback)
 
         try:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)  # Give CLOB time to settle fills
 
-            # Try 1: get_order returns the order with its average fill price + size matched
+            # Step 1: get_order for size_matched (reliable for size, NOT for price)
             try:
                 order = self.client.get_order(order_id)
                 if order:
-                    avg = order.get("average_price") or order.get("associate_trades_avg_price")
-                    if avg:
-                        fill_price = float(avg)
-                    # size_matched is the actual number of shares filled by the CLOB
                     matched = order.get("size_matched") or order.get("matched_amount")
                     if matched:
-                        fill_size = float(matched)
-                    if fill_price != fallback_price or fill_size > 0:
-                        size_str = f", {fill_size:.2f} shares" if fill_size > 0 else ""
-                        if not self.quiet:
-                            console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback_price:.3f}){size_str}[/dim]")
-                        if fill_size > 0:
-                            return fill_price, fill_size
-                        # Got price but not size — try trades below for size
+                        order_size = float(matched)
             except Exception:
                 pass
 
-            # Try 2: search trades for exact order ID match — sum sizes for total fill
+            # Step 2: search trades for exact order ID match — this has REAL fill prices
             trades = self.client.get_trades(asset_id=token_id)
             if trades:
                 matched_trades = [
@@ -1251,13 +1252,32 @@ class MicroRunner:
                     if total_size > 0:
                         fill_price = total_value / total_size
                         fill_size = total_size
-                    elif fill_price == fallback_price:
+                    else:
                         # Single trade match — use its price
                         fill_price = float(matched_trades[0].get("price", fallback_price))
+                        fill_size = order_size  # fall back to order-level size
                     size_str = f", {fill_size:.2f} shares" if fill_size > 0 else ""
                     if not self.quiet:
                         console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback_price:.3f}){size_str}[/dim]")
                     return fill_price, fill_size
+
+            # No trade matches found — fall back to order-level data
+            if order_size > 0:
+                # We have size from get_order but no trade-level price.
+                # Use order's average_price if available, but flag it as uncertain.
+                try:
+                    order = self.client.get_order(order_id)
+                    if order:
+                        avg = order.get("average_price") or order.get("associate_trades_avg_price")
+                        if avg:
+                            fill_price = float(avg)
+                except Exception:
+                    pass
+                fill_size = order_size
+                if not self.quiet:
+                    marker = " (order-level)" if fill_price == fallback_price else ""
+                    console.print(f"  [dim]Actual fill price: ${fill_price:.3f} (asked ${fallback_price:.3f}), {fill_size:.2f} shares{marker}[/dim]")
+                return fill_price, fill_size
 
             # No match found — use fallback
             if not self.quiet:
@@ -1422,6 +1442,7 @@ class MicroRunner:
                     "hwm": actual_entry,
                     "token_id": token_id,
                     "size": actual_size,
+                    "entry_time": time.time(),  # Track when we entered for min-hold
                 }
                 self._trades_this_window += 1
                 self._total_trades += 1
