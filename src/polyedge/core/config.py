@@ -436,19 +436,7 @@ async def apply_db_config(settings: Settings, db) -> Settings:
             strategy_name, strategy_field = sub_parts[0], sub_parts[1]
             strategy_obj = getattr(settings.strategies, strategy_name, None)
             if strategy_obj and hasattr(strategy_obj, strategy_field):
-                old_val = getattr(strategy_obj, strategy_field)
                 setattr(strategy_obj, strategy_field, value)
-                new_val = getattr(strategy_obj, strategy_field)
-                # Debug: detect when setattr silently fails (e.g. Pydantic frozen)
-                if "poly_book" in strategy_field or old_val != new_val:
-                    if old_val != new_val:
-                        pass  # Normal — value changed
-                    else:
-                        import logging
-                        logging.getLogger("polyedge.config").warning(
-                            f"CONFIG SETATTR FAILED: {key} = {value!r} (type={type(value).__name__}) "
-                            f"but field is still {new_val!r} (type={type(new_val).__name__})"
-                        )
             continue
 
         # Handle top-level sections (risk.*, ai.*, agent.*)

@@ -4,7 +4,7 @@ This document is for AI assistants working on this codebase. It contains everyth
 
 ## What This Project Is
 
-PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a monolith Python application that scans markets, uses LLMs to estimate true probabilities, detects mispricings, sizes positions with Kelly criterion, and executes real trades via the Polymarket CLOB API. It includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, a weather sniper that compares ensemble weather forecasts against Polymarket weather market prices, and a high-frequency micro sniper that reads Binance aggTrade order flow to momentum-trade 5-minute crypto up/down markets. Starting bankroll is $200 USD.
+PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a monolith Python application that scans markets, uses LLMs to estimate true probabilities, detects mispricings, sizes positions with Kelly criterion, and executes real trades via the Polymarket CLOB API. It includes a real-time crypto sniper that exploits latency between Binance spot prices and Polymarket's short-duration crypto markets, a weather sniper that compares ensemble weather forecasts against Polymarket weather market prices, and a high-frequency micro sniper that reads Binance aggTrade order flow to momentum-trade short-duration (5m/15m) crypto up/down markets. The micro sniper is the primary active strategy and the main focus of ongoing development. Starting bankroll is $200 USD.
 
 ## Project Root
 
@@ -55,7 +55,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | `orderbook.py` | Fetches raw order book from CLOB API. | `get_order_book()`, `get_prices()` |
 | `book_analyzer.py` | Order book microstructure analysis. Computes imbalance, depth, whale detection, wall detection. | `analyze_book()`, `get_book_intelligence()`, `format_book_for_ai()`, `BookIntelligence` |
 | `binance_feed.py` | Binance WebSocket feed for real-time crypto prices (BTC, ETH, SOL). No auth needed. Combined streams, auto-reconnect. | `BinanceFeed`, `PriceSnapshot`, `PriceWindow` |
-| `binance_aggtrade.py` | Binance aggTrade WebSocket feed — tick-level trade data with buy/sell classification (~10-50 tps for BTC). Maintains rolling flow windows (5s/15s/30s) for OFI, VWAP drift, trade intensity. Gap detection resets stale data on reconnect. | `BinanceAggTradeFeed`, `AggTrade`, `MicroStructure`, `TradeFlowWindow` |
+| `binance_aggtrade.py` | Binance aggTrade WebSocket feed — tick-level trade data with buy/sell classification (~10-50 tps for BTC). Maintains rolling flow windows (5s/15s/30s/5m) for OFI, VWAP drift, trade intensity. Flow-price agreement dampener with configurable score-shaping params. Gap detection resets stale data on reconnect. | `BinanceAggTradeFeed`, `AggTrade`, `MicroStructure`, `TradeFlowWindow` |
 | `weather_feed.py` | Weather forecast feed from Open-Meteo (ensemble) and NOAA (official). Caches forecasts, supports multiple locations. No API key needed. | `WeatherFeed`, `EnsembleForecast`, `NOAAForecast`, `LOCATIONS`, `find_location()` |
 | `ws_feed.py` | WebSocket feed for real-time Polymarket data. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. No auth needed. Must send `PING` every 10s. | `MarketFeed` |
 | `signals.py` | External data sources (stub). | — |
@@ -69,11 +69,17 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | `sniper_runner.py` | Persistent async loop connecting Binance prices to all Polymarket crypto markets. Up/down evaluated on every tick, threshold/bucket evaluated every 30s. Fetches up to 1000 markets. | `SniperRunner` |
 | `weather_sniper.py` | Weather forecast arbitrage. Compares Open-Meteo ensemble probabilities to Polymarket weather market prices. Detects neg-risk on multi-bucket events. | `WeatherSniperStrategy`, `WeatherOpportunity`, `NegRiskOpportunity`, `find_weather_markets()`, `group_weather_events()` |
 | `weather_runner.py` | Persistent async loop for weather sniper. Refreshes markets (5 min) and forecasts (30 min), evaluates all weather markets. | `WeatherRunner` |
-| `micro_sniper.py` | High-frequency momentum strategy for 5-min crypto up/down markets. Reads Binance aggTrade order flow (OFI, VWAP drift, intensity) and trades momentum on every swing. Entry/exit/flip logic with configurable thresholds. Zero AI cost. | `MicroSniperStrategy`, `MicroAction`, `MicroOpportunity` |
-| `micro_runner.py` | Persistent async loop for micro sniper. Connects Binance aggTrade + Polymarket WS. Evaluates on every 5th trade tick. Handles window hopping (pre-loads 10 windows), position tracking, sell orders. Narrows Binance feeds to only matched symbols. | `MicroRunner` |
+| `micro_sniper.py` | High-frequency momentum strategy for short-duration (5m/15m) crypto up/down markets. Reads Binance aggTrade order flow (OFI, VWAP drift, intensity) with flow-price agreement dampener. Entry/exit/flip logic with configurable thresholds. Zero AI cost. | `MicroSniperStrategy`, `MicroAction`, `MicroOpportunity` |
+| `micro_runner.py` | Persistent async loop for micro sniper. Connects Binance aggTrade + Polymarket WS. Evaluates on every 5th trade tick. Handles window hopping (pre-loads 10 windows), position tracking, sell orders. Narrows Binance feeds to only matched symbols. Hot-reload config from DB every 30s. | `MicroRunner` |
 | `cheap_hunter.py` | Finds underpriced tail events (<$0.15). Zero AI cost. **Disabled** — heuristic boosts generate false positives. | `CheapHunterStrategy` |
 | `edge_finder.py` | Converts AI analysis into trade signals when edge > 10% threshold. | `EdgeFinderStrategy` |
 | `market_maker.py` | Spread capture strategy (WIP, not fully implemented). | `MarketMakerStrategy` |
+
+### Scripts (`scripts/`)
+
+| File | Purpose | Key exports |
+|------|---------|-------------|
+| `trade_analysis.py` | Comprehensive post-trade attribution analysis. Breaks down performance by entry quality, direction, trend alignment, time remaining, exit reason, signal components, FOK rejections, and execution quality. Usage: `python scripts/trade_analysis.py --hours 4` | — |
 
 ### Risk (`src/polyedge/risk/`)
 
@@ -199,11 +205,11 @@ Defined in `weather_runner.py` `WeatherRunner.run()`. Runs as a persistent async
 
 ## Micro Sniper Loop (How It Works)
 
-Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async process, separate from the agent, crypto sniper, and weather sniper. Reads tick-level Binance aggTrade data to momentum-trade Polymarket's 5-minute crypto up/down markets.
+Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async process, separate from the agent, crypto sniper, and weather sniper. Reads tick-level Binance aggTrade data to momentum-trade Polymarket's short-duration (5m/15m) crypto up/down markets.
 
 1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket. Loads persistent price context from `micro_price_log` DB table (last 30 min) so the bot immediately knows the macro trend on startup. Skips the first partial window to warm up microstructure data — waits for the next fresh window before trading.
 2. **aggTrade callback** (every 5th trade tick, ~2-10 evals/sec) — On each Binance aggTrade, updates `MicroStructure` rolling flow windows (5s/15s/30s/5m OFI, VWAP drift, trade intensity). The 5m window is persistent — does NOT reset on window hops, providing cross-window context. Evaluates only the current (first) window — rest are pre-loaded for seamless hopping.
-3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 10% OFI_5s + 50% OFI_15s + 25% VWAP drift + 15% intensity surge.
+3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 10% OFI_5s + 50% OFI_15s + 25% VWAP drift + 15% intensity surge. The raw composite is then multiplied by a **flow-price agreement dampener** — a continuous factor from 0.4 (flow opposed price movement) through 0.65 (price flat despite flow) to 1.0 (flow confirmed by price). This kills false signals where aggressive order flow gets absorbed by the book without displacing price. VWAP drift is scaled by `vwap_drift_scale` (default 2000) to normalize BTC dollar moves into the [-1, 1] signal range.
 4. **Entry** — When `|momentum| > 0.50` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.35-0.65, enter a position (BUY YES if bullish, BUY NO if bearish). **Entry persistence filter**: signal must sustain for 2 seconds in the same direction (time-based, not count-based). **5-minute trend bias**: if BTC has moved >0.15% in 5 min (from persistent 5m flow window or DB history), blocks or penalizes counter-trend entries. >0.30% = hard block, 0.15%-0.30% = boosts entry_threshold by 0.10. Survives window hops and restarts. **30s trend filter**: if entry direction disagrees with the 30-second OFI trend, requires higher threshold of 0.55 (counter_trend_threshold) instead of 0.50. This kills counter-trend entries that are the #1 source of losses.
 5. **Exit** — Three triggers: (a) momentum reverses past exit_threshold (0.20) against our position, (b) trailing stop triggers at 12% drawdown from high water mark (locks in profits on winners), (c) force exit with <8s remaining. Hold threshold is disabled (set to 0) — caused premature exits on momentum pauses.
 5a. **Exit escalation** — Each failed FOK sell attempt adds 3 cents to the floor price slippage, preventing stuck exit loops where the bot tries to sell 7+ times while the price drops.
@@ -212,7 +218,9 @@ Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async pro
 8. **Gap detection** — If >5 seconds pass between aggTrade ticks (WebSocket disconnect), resets all flow windows to avoid trading on stale momentum.
 9. **Trade cooldown** — 30 seconds between trades on the same market to prevent whipsaw re-entries (sell at loss then re-buy at worse price).
 10. **Config/signal logging** — Every trade logs `config_snapshot` (all thresholds, weights, persistence settings) and `signal_data` (momentum, OFI, VWAP drift, intensity, prices, seconds remaining) as JSONB columns for backtesting.
-11. **Status** — Prints microstructure state every 15 seconds.
+11. **Hot-reload config** — `_config_refresh_loop` reads DB every 30 seconds, pushes updated values to Settings, MicroSniperConfig, and all MicroStructure instances (weights + dampener params). `polyedge config set` takes effect within 30s without restart. Logs detected changes as `CONFIG RELOADED: key: old → new`.
+12. **Fill price accuracy** — `_get_fill_info()` fetches actual fill price from CLOB trade history (prefers trade-level fills over order-level). After entry, waits 5 seconds for CLOB balance to settle before allowing exit attempts.
+13. **Status** — Prints microstructure state every 15 seconds.
 
 The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "btc 5m"`. Flags: `--auto` (auto-execute), `--dry` (watch only), `--market` (filter by keyword), `-v` (verbose), `-q` (quiet).
 
@@ -231,7 +239,7 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `min_confidence` (float, default 0.40)
 - `min_trades_in_window` (int, default 10) — need enough data for OFI to be meaningful
 - `min_trades_for_flip` (int, default 25)
-- `min_seconds_remaining` (float, default 15.0) — don't enter with <15s left
+- `min_seconds_remaining` (float, default 15.0) — don't enter with <15s left. Typically set to 120 via DB for 15m windows to avoid late entries
 - `force_exit_seconds` (float, default 8.0) — dump everything with <8s left in window
 - `trailing_stop_enabled` (bool, default true) — locks in profits on winners
 - `trailing_stop_pct` (float, default 0.12) — exit when price drops 12% from HWM. Was 0.25 (too loose, exited below entry)
@@ -246,6 +254,11 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `weight_ofi_15s` (float, default 0.50) — 15s OFI — main signal, most reliable
 - `weight_vwap_drift` (float, default 0.25) — price movement weighted by volume
 - `weight_intensity` (float, default 0.15) — trade rate spike detection
+- `vwap_drift_scale` (float, default 2000.0) — normalizes BTC dollar moves to [-1,1] signal range. At 2000, ~$35 BTC move maxes drift. Was 5000 (too sensitive, $14 maxed it)
+- `dampener_agree_factor` (float, default 1.0) — dampener multiplier when OFI and price move in same direction (no penalty)
+- `dampener_disagree_factor` (float, default 0.4) — dampener multiplier when OFI and price move in opposite directions (heavy penalty)
+- `dampener_flat_factor` (float, default 0.65) — dampener multiplier when price is flat despite OFI (moderate penalty)
+- `dampener_price_deadzone` (float, default 0.05) — abs(drift_signal) below this is considered "flat price" for dampener
 - `entry_slippage` (float, default 0.02) — 2 cents above market for instant FOK fill on entry
 - `exit_slippage` (float, default 0.05) — 5 cents below market floor for FOK. Was 0.02, caused repeated FOK rejections
 - `trade_cooldown` (float, default 30.0) — 30 seconds between trades on same market. Was 10 — too fast, caused buy-sell-rebuy at worse price
@@ -347,6 +360,10 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 - **Market indexer** — Don't hit the Gamma API every scan cycle. Sync to DB periodically, read from DB always.
 - **Keychain over .env** — Secrets encrypted at rest by macOS. No plaintext keys in the repo directory.
 - **Config in DB** — Trading config stored in PostgreSQL, not local YAML files. Portable across Mac, VPS, App Platform, etc.
+- **Hot-reload config** — Micro sniper polls DB every 30 seconds for config changes. No restart needed to tune thresholds, weights, or dampener params during live trading.
+- **Flow-price agreement dampener** — Core signal quality innovation. Aggressive order flow that doesn't displace price was absorbed by the book — not tradeable edge. Continuous dampener scales momentum by how well OFI direction is confirmed by actual VWAP movement. Biggest single improvement to signal quality.
+- **FOK as natural filter** — Fill-or-Kill orders on thin Polymarket liquidity act as an accidental risk filter. When the market moves fast, FOK rejections prevent entries into adverse conditions.
+- **Micro sniper focus** — Project started broader (AI agent, crypto sniper, weather sniper, cheap hunter) but the micro sniper is now the primary active strategy and main development focus.
 
 ## Testing
 
@@ -394,7 +411,8 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 
 **Changing risk params at runtime:**
 - `polyedge config set risk.kelly_fraction 0.5`
-- Takes effect on next scan cycle (no restart needed)
+- Agent: takes effect on next scan cycle (no restart needed)
+- Micro sniper: hot-reload every 30s via `_config_refresh_loop` (no restart needed)
 
 **Adding a new data source to AI analysis:**
 1. Build the data fetcher in `data/`
