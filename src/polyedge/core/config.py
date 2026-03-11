@@ -163,6 +163,7 @@ class MicroSniperConfig(BaseModel):
     entry_threshold: float = 0.55          # Momentum signal threshold to enter (raised from 0.40 — avoid sideways noise)
     counter_trend_threshold: float = 0.70  # Higher bar for entries against 30s trend (kills counter-trend losers)
     exit_threshold: float = 0.20           # Reverse momentum threshold to exit (raised from 0.15 — give trades room)
+    counter_trend_exit_threshold: float = 0.65  # Higher bar for exits when 30s trend still agrees with position
     hold_threshold: float = 0.10           # Below this (aligned), exit for weak signal
     enable_flips: bool = False             # Flips disabled — marginal profitability, strong reversals just EXIT
     flip_threshold: float = 0.50           # Reverse momentum threshold to flip (only if enable_flips=True)
@@ -190,6 +191,11 @@ class MicroSniperConfig(BaseModel):
     # Slippage: how many cents above market to bid for instant fill
     entry_slippage: float = 0.02           # Pay up to 2c more for entry FOK fill
     exit_slippage: float = 0.02            # Sell up to 2c below market for exit FOK fill
+
+    # Window hop cooldown: seconds to wait after hopping to a new window
+    # before allowing entries. Lets stale cross-window momentum flush out
+    # and fresh OFI data build up for the new window.
+    window_hop_cooldown: float = 30.0      # Wait 30s after hop before trading
 
 
 class MarketMakerConfig(BaseModel):

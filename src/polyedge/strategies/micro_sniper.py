@@ -312,8 +312,22 @@ class MicroSniperStrategy:
                             is_flip=True,
                         )
 
-        # --- EXIT: momentum died or reversed weakly ---
-        if not aligned and abs_momentum >= self.config.exit_threshold:
+        # --- EXIT: momentum reversed ---
+        # 30s trend filter for exits — mirrors entry logic. If the 30s trend
+        # still agrees with our position, require a higher exit threshold.
+        # This prevents brief 5s/15s spikes from ejecting us when the broader
+        # move still favours our side.
+        trend_ofi = micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0
+        trend_agrees_with_position = (
+            (holding_yes and trend_ofi > 0.05) or
+            (not holding_yes and trend_ofi < -0.05)
+        )
+        effective_exit_threshold = (
+            self.config.counter_trend_exit_threshold if trend_agrees_with_position
+            else self.config.exit_threshold
+        )
+
+        if not aligned and abs_momentum >= effective_exit_threshold:
             return MicroOpportunity(
                 market=market,
                 symbol=micro.symbol,

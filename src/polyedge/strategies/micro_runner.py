@@ -198,6 +198,10 @@ class MicroRunner:
         self._waiting_for_fresh_window: bool = not skip_warmup
         self._startup_window_id: str | None = None  # condition_id of the window we're skipping
 
+        # Window hop cooldown — seconds since last hop before allowing entries.
+        # Lets stale cross-window momentum flush out of the 15s/30s OFI windows.
+        self._last_hop_time: float = 0.0  # time.time() of most recent hop
+
     async def _quick_sync(self):
         """Targeted API fetch for crypto 5-min markets.
 
@@ -769,6 +773,25 @@ class MicroRunner:
             remaining = (next_mkt.end_date - now).total_seconds()
             self._trades_this_window = 0
 
+            # Record hop time for cooldown enforcement
+            self._last_hop_time = time.time()
+
+            # Reset flow windows so stale cross-window momentum doesn't
+            # trigger entries in the new window. Fresh data builds in ~5-15s.
+            binance_symbol = symbol if symbol in self.agg_feed.micro else None
+            if not binance_symbol:
+                # Try common mappings
+                for sym in self.agg_feed.micro:
+                    if sym.startswith(symbol.replace("usdt", "")):
+                        binance_symbol = sym
+                        break
+            if binance_symbol and binance_symbol in self.agg_feed.micro:
+                micro = self.agg_feed.micro[binance_symbol]
+                micro.flow_5s.reset()
+                micro.flow_15s.reset()
+                micro.flow_30s.reset()
+                logger.info(f"Reset flow windows on hop for {binance_symbol}")
+
             # Re-subscribe Polymarket WS to new token IDs
             new_tokens: list[str] = []
             self._token_to_market.clear()
@@ -802,6 +825,7 @@ class MicroRunner:
             # No next window pre-loaded — need to refresh from DB/API
             console.print("[yellow]Window expired, no next window cached — refreshing...[/yellow]")
             self._trades_this_window = 0
+            self._last_hop_time = time.time()
 
             # Quick DB read first
             await self._refresh_markets()
@@ -901,7 +925,13 @@ class MicroRunner:
         if self._trades_this_window >= self.config.max_trades_per_window:
             return
 
+        # Window hop cooldown — don't enter new positions while stale
+        # cross-window momentum is still in the flow windows. Exits are
+        # still allowed (force_exit, etc.) so we only block entries.
         current_pos = self._positions.get(market.condition_id)
+        hop_elapsed = time.time() - self._last_hop_time
+        if not current_pos and self._last_hop_time > 0 and hop_elapsed < self.config.window_hop_cooldown:
+            return  # Still in cooldown — skip entry evaluation
 
         opp = self.strategy.evaluate(
             market=market,
