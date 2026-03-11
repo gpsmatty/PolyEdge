@@ -233,6 +233,34 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `max_trades_per_window` (int, default 50)
 - `min_liquidity` (float, default 500)
 - `dead_market_band` (float, default 0.02) — skip entry when YES is within this band of 0.50 (market not reacting to price moves)
+- `weight_ofi_5s` (float, default 0.20) — weight of 5s OFI in momentum composite
+- `weight_ofi_15s` (float, default 0.40) — weight of 15s OFI in momentum composite
+- `weight_vwap_drift` (float, default 0.25) — weight of VWAP drift in momentum composite
+- `weight_intensity` (float, default 0.15) — weight of trade intensity surge in momentum composite
+- `entry_slippage` (float, default 0.02) — cents above market to bid for instant FOK fill on entry
+- `exit_slippage` (float, default 0.02) — cents below market to sell for instant FOK fill on exit
+- `trade_cooldown` (float, default 10.0) — seconds between trades on same condition_id
+- `window_hop_cooldown` (float, default 30.0) — seconds to wait after hopping to a new window before trading
+- `counter_trend_exit_threshold` (float, default 0.65) — higher exit threshold when 30s trend still agrees with position
+- `poly_book_enabled` (bool, default false) — master toggle for Polymarket order book integration
+- `poly_book_min_exit_depth` (float, default 20.0) — min bid depth (contracts within 5c) to enter; ensures exit path exists
+- `poly_book_imbalance_weight` (float, default 0.10) — weight of Poly book imbalance in momentum composite
+- `poly_book_imbalance_veto` (float, default -0.40) — block entry if Poly book imbalance is this negative against our direction
+- `poly_book_exit_override_depth` (float, default 25.0) — hold instead of exit if our token's bid depth exceeds this
+- `poly_book_exit_override_imbalance` (float, default 0.15) — hold instead of exit if directional imbalance exceeds this
+
+### Polymarket Order Book Integration (Micro Sniper)
+
+Behind the `poly_book_enabled` toggle. Reads live Polymarket order book via WebSocket (`ws_feed.py`) and runs `analyze_book()` from `book_analyzer.py` to produce `BookIntelligence` for both YES and NO tokens.
+
+**Entry-side features:**
+1. **Exit liquidity check** — Before entering, checks bid depth on the token we're about to buy (bids = our exit path). If bid depth within 5 cents < `poly_book_min_exit_depth`, blocks entry entirely. Prevents entering positions we can't cleanly exit.
+2. **Book imbalance veto** — Uses YES token's near-touch imbalance as market sentiment. If imbalance is strongly against our direction (< `poly_book_imbalance_veto`), blocks entry. Polymarket participants are voting against us.
+
+**Exit-side features:**
+3. **Book exit override** — When momentum triggers an exit (reversal or fade), checks if the Poly book disagrees. If our token's bid depth > `poly_book_exit_override_depth` AND directional imbalance > `poly_book_exit_override_imbalance`, overrides the exit and holds. Both conditions must be true. Prevents momentum noise from dumping a position that the Polymarket book still supports. Logs `BOOK OVERRIDE: Holding {side}` when it kicks in.
+
+**Data flow:** `MicroRunner._get_book_intel(market)` → calls `analyze_book()` on each token's WebSocket book snapshot → passes `dict[str, BookIntelligence]` to `MicroSniperStrategy.evaluate()` → used in `_evaluate_entry()` for veto checks and `_evaluate_with_position()` for exit override.
 
 ## Tiered AI Model System
 
