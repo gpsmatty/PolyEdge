@@ -1332,12 +1332,16 @@ class MicroRunner:
                 # balance" errors on exit.
                 actual_entry, clob_size = await self._get_fill_info(poly_order_id, token_id, entry_price, size)
                 if clob_size > 0:
-                    # CLOB told us exact share count — use it
-                    actual_size = int(clob_size * 100) / 100  # truncate to 2dp
+                    raw_size = clob_size
                 else:
-                    # Fallback: estimate from USD / fill_price (can be slightly off)
-                    estimated = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
-                    actual_size = int(estimated * 100) / 100  # truncate to 2dp
+                    raw_size = round(size_usd / actual_entry, 2) if actual_entry > 0 else size
+
+                # Apply 2% taker fee haircut — Polymarket deducts fees from
+                # token balance, so we receive ~98% of the filled shares.
+                # Without this, local tracking is always inflated and the sell
+                # hits "not enough balance" every time.
+                fee_adjusted = raw_size * 0.98
+                actual_size = int(fee_adjusted * 100) / 100  # truncate to 2dp
 
                 # Record in DB with actual fill price
                 try:
