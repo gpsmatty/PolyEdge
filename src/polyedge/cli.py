@@ -825,6 +825,161 @@ def pnl_strategy(name):
     run_async(_strategy())
 
 
+@pnl.command("cleanup")
+@click.option("--fix", is_flag=True, help="Actually remove orphaned records (default: dry run)")
+def pnl_cleanup(fix):
+    """Find and clean up orphaned positions/trades.
+
+    Checks every DB position against CLOB token balance. If the CLOB says
+    balance is 0 but DB says we have a position, it's orphaned (dust from
+    wrong balance tracking, manual sells, or resolved markets).
+
+    Also finds trades stuck in OPEN status that should be closed.
+    """
+
+    async def _cleanup():
+        settings = get_settings()
+        from polyedge.core.db import Database
+        from polyedge.core.client import PolyClient
+
+        db = Database(settings.database_url)
+        await db.connect()
+        await db.init_schema()
+
+        client = PolyClient(settings)
+
+        console.print("\n[bold]Orphaned Position/Trade Cleanup[/bold]")
+        if not fix:
+            console.print("[yellow]DRY RUN — use --fix to actually remove orphans[/yellow]\n")
+
+        # --- 1. Check DB positions against CLOB balances ---
+        console.print("[dim]Checking open positions against CLOB...[/dim]")
+        positions = await db.get_open_positions()
+        console.print(f"  Found {len(positions)} open positions in DB\n")
+
+        orphaned_positions = []
+        real_positions = []
+
+        for pos in positions:
+            token_id = pos.get("token_id", "")
+            market_id = pos.get("market_id", "")
+            side = pos.get("side", "")
+            db_size = pos.get("size", 0)
+            entry_price = pos.get("entry_price", 0)
+            question = pos.get("question", "")[:60]
+
+            clob_balance = 0
+            raw_val = "?"
+            try:
+                bal = client.get_token_balance(token_id)
+                raw_bal = bal.get("balance", 0) if isinstance(bal, dict) else bal
+                raw_val = str(raw_bal)
+                raw_float = float(raw_val)
+                # Try multiple interpretations
+                for divisor in [1e6, 1e4, 1e3, 1]:
+                    val = raw_float / divisor
+                    if 0 < val < db_size * 3 and val > 0.01:
+                        clob_balance = round(val, 2)
+                        break
+            except Exception as e:
+                raw_val = f"ERROR: {e}"
+
+            is_orphan = clob_balance < 0.01
+
+            if is_orphan:
+                orphaned_positions.append(pos)
+                console.print(
+                    f"  [red]ORPHAN[/red] {side.upper()} {db_size:.1f} @ ${entry_price:.3f} "
+                    f"| CLOB: {clob_balance} (raw={raw_val}) | {question}"
+                )
+            else:
+                real_positions.append(pos)
+                console.print(
+                    f"  [green]OK[/green]     {side.upper()} {db_size:.1f} @ ${entry_price:.3f} "
+                    f"| CLOB: {clob_balance} (raw={raw_val}) | {question}"
+                )
+
+        # --- 2. Check for stuck OPEN trades ---
+        console.print(f"\n[dim]Checking for stuck OPEN trades...[/dim]")
+        async with db.pool.acquire() as conn:
+            stuck_trades = await conn.fetch(
+                """
+                SELECT trade_id, market_id, token_id, side, entry_price, size, question,
+                       opened_at, status
+                FROM polyedge.trades
+                WHERE status = 'OPEN'
+                ORDER BY opened_at
+                """
+            )
+        stuck_trades = [dict(r) for r in stuck_trades]
+        console.print(f"  Found {len(stuck_trades)} OPEN trades in DB\n")
+
+        # An OPEN trade is orphaned if there's no matching open position
+        open_market_ids = {p.get("market_id") for p in positions}
+        orphaned_trades = []
+        for t in stuck_trades:
+            mid = t.get("market_id", "")
+            if mid not in open_market_ids:
+                orphaned_trades.append(t)
+                question = t.get("question", "")[:50]
+                console.print(
+                    f"  [red]ORPHAN[/red] {t['side']} {t['size']:.1f} @ ${t['entry_price']:.3f} "
+                    f"| opened {t.get('opened_at', '')} | {question}"
+                )
+
+        # --- 3. Summary ---
+        console.print(f"\n[bold]Summary:[/bold]")
+        console.print(f"  Positions: {len(real_positions)} real, {len(orphaned_positions)} orphaned")
+        console.print(f"  Trades:    {len(stuck_trades) - len(orphaned_trades)} with positions, {len(orphaned_trades)} orphaned")
+
+        # --- 4. Fix if requested ---
+        if fix and (orphaned_positions or orphaned_trades):
+            console.print(f"\n[bold yellow]Cleaning up...[/bold yellow]")
+
+            for pos in orphaned_positions:
+                try:
+                    await db.remove_position(
+                        pos["market_id"], pos["token_id"], pos["side"]
+                    )
+                    console.print(f"  [green]Removed position[/green]: {pos['side']} on {pos.get('question', '')[:40]}")
+                except Exception as e:
+                    console.print(f"  [red]Failed to remove position: {e}[/red]")
+
+            for t in orphaned_trades:
+                try:
+                    # Close the trade with $0 exit (lost/expired)
+                    await db.close_trade(
+                        t["trade_id"],
+                        exit_price=0.0,
+                        pnl=-(t.get("entry_price", 0) * t.get("size", 0)),
+                        status="ORPHANED",
+                    )
+                    console.print(f"  [green]Closed trade[/green]: {t['trade_id'][:12]}... as ORPHANED")
+                except Exception as e:
+                    console.print(f"  [red]Failed to close trade: {e}[/red]")
+
+            console.print(f"\n[green]Cleanup complete![/green]")
+        elif not fix and (orphaned_positions or orphaned_trades):
+            console.print(f"\n[yellow]Run 'polyedge pnl cleanup --fix' to remove these orphans[/yellow]")
+        else:
+            console.print(f"\n[green]No orphans found — everything looks clean![/green]")
+
+        # --- 5. Show current USDC balance for reference ---
+        try:
+            usdc_bal = client.get_collateral_balance()
+            raw_usdc = usdc_bal.get("balance", 0) if isinstance(usdc_bal, dict) else usdc_bal
+            usdc_float = float(str(raw_usdc))
+            # USDC uses 6 decimals
+            usdc_amount = usdc_float / 1e6 if usdc_float > 1000 else usdc_float
+            console.print(f"\n  USDC balance: ${usdc_amount:.2f}")
+        except Exception:
+            pass
+
+        await db.close()
+
+    run_async(_cleanup())
+
+
 @cli.command()
 def status():
     """Smoke test CLOB connectivity, wallet balance, and open orders."""
