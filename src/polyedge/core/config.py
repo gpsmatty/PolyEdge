@@ -217,10 +217,12 @@ class MicroSniperConfig(BaseModel):
     poly_book_exit_override_imbalance: float = 0.15  # Hold if directional imbalance > this (book sentiment favors our position)
 
     # --- Entry persistence filter ---
-    # Requires momentum to stay above entry threshold for N consecutive evals
+    # Requires momentum to stay above entry threshold for a continuous duration
     # before actually entering. Kills single-spike noise entries.
+    # Time-based: momentum must persist for N seconds (not just N evals).
     entry_persistence_enabled: bool = False       # Master toggle — OFF by default
-    entry_persistence_count: int = 3              # Require 3 consecutive qualifying evals
+    entry_persistence_count: int = 3              # DEPRECATED: use entry_persistence_seconds
+    entry_persistence_seconds: float = 2.0        # Momentum must hold for 2s before entry
 
     # --- Trailing stop loss ---
     # Tracks the high water mark (HWM) of our side's price since entry.

@@ -110,10 +110,13 @@ class MicroSniperStrategy:
         # Track previous momentum per symbol for acceleration filter.
         # Only enter when momentum is still rising, not fading.
         self._prev_momentum: dict[str, float] = {}
-        # Entry persistence: count consecutive qualifying evals per symbol.
-        # Resets when momentum drops below threshold or direction flips.
-        self._entry_streak: dict[str, int] = {}       # symbol -> consecutive count
+        # Entry persistence: time-based. Tracks when momentum first crossed
+        # the entry threshold in a given direction. Resets when momentum drops
+        # below threshold or direction flips. Entry only allowed after the
+        # signal has persisted for entry_persistence_seconds.
+        self._entry_streak: dict[str, int] = {}       # symbol -> consecutive count (deprecated)
         self._entry_streak_dir: dict[str, bool] = {}  # symbol -> was_bullish
+        self._entry_signal_start: dict[str, float] = {}  # symbol -> time.time() when signal started
 
     def evaluate(
         self,
@@ -237,18 +240,21 @@ class MicroSniperStrategy:
             # Even if we don't enter, track momentum for acceleration filter
             self._prev_momentum[micro.symbol] = momentum
             self._entry_streak[micro.symbol] = 0  # Reset persistence
+            self._entry_signal_start.pop(micro.symbol, None)  # Reset time-based persistence
             return None
 
         # Need enough confidence
         if confidence < self.config.min_confidence:
             self._prev_momentum[micro.symbol] = momentum
             self._entry_streak[micro.symbol] = 0  # Reset persistence
+            self._entry_signal_start.pop(micro.symbol, None)
             return None
 
         # Need enough trade activity
         if micro.flow_15s.total_count < self.config.min_trades_in_window:
             self._prev_momentum[micro.symbol] = momentum
             self._entry_streak[micro.symbol] = 0  # Reset persistence
+            self._entry_signal_start.pop(micro.symbol, None)
             return None
 
         # --- Acceleration filter ---
@@ -349,22 +355,28 @@ class MicroSniperStrategy:
                     )
                     return None
 
-        # --- Entry persistence filter ---
-        # Require momentum to stay above threshold for N consecutive evals.
+        # --- Entry persistence filter (time-based) ---
+        # Require momentum to stay above threshold for N seconds continuously.
         # Kills single-spike noise entries. A real move persists; a spike doesn't.
+        # At 30 tps, count-based (3 evals) = ~450ms — way too fast to filter noise.
+        # Time-based (2s) gives a real confirmation window regardless of tick rate.
         if self.config.entry_persistence_enabled:
             sym = micro.symbol
+            now = time.time()
             prev_dir = self._entry_streak_dir.get(sym)
-            # Reset streak if direction flipped
+
+            # Reset timer if direction flipped
             if prev_dir is not None and prev_dir != is_bullish:
-                self._entry_streak[sym] = 0
+                self._entry_signal_start.pop(sym, None)
             self._entry_streak_dir[sym] = is_bullish
 
-            streak = self._entry_streak.get(sym, 0) + 1
-            self._entry_streak[sym] = streak
+            # Start timer if this is the first qualifying eval
+            if sym not in self._entry_signal_start:
+                self._entry_signal_start[sym] = now
 
-            if streak < self.config.entry_persistence_count:
-                return None  # Signal is real but not persistent enough yet
+            elapsed = now - self._entry_signal_start[sym]
+            if elapsed < self.config.entry_persistence_seconds:
+                return None  # Signal is real but hasn't persisted long enough
 
         return MicroOpportunity(
             market=market,
