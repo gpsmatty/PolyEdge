@@ -499,7 +499,7 @@ class MicroRunner:
                 if rows:
                     micro = self.agg_feed.micro.get(sym)
                     if micro:
-                        micro.price_history = [(r["price"], r["logged_at"]) for r in rows]
+                        micro.price_history = [(r["price"], r["logged_at"].timestamp()) for r in rows]
                         latest = rows[-1]
                         oldest = rows[0]
                         trend_pct = (latest["price"] - oldest["price"]) / oldest["price"] if oldest["price"] > 0 else 0
