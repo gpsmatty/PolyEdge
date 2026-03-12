@@ -308,15 +308,22 @@ class MicroSniperStrategy:
                     if hasattr(self, '_trend_block_logged'):
                         self._trend_block_logged.pop(micro.symbol, None)
 
-        # 30s trend filter — if entry direction disagrees with the dominant
-        # 30-second trend, require a higher momentum threshold. This kills
-        # counter-trend entries that are the #1 source of losses.
+        # 30s trend filter — GRADUAL scaling. When entry direction disagrees
+        # with the 30s trend, scale the threshold between entry_threshold and
+        # counter_trend_threshold based on how strongly the trend opposes us.
+        # Prevents a tiny OFI blip from causing a discrete threshold jump.
+        # At OFI strongly against us (<=−0.30): full counter_trend_threshold.
+        # At OFI neutral (0): base entry_threshold. Linear between.
         trend_ofi = micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0
-        is_counter_trend = (is_bullish and trend_ofi < -0.05) or (not is_bullish and trend_ofi > 0.05)
+        # directional: negative = trend opposes our entry direction
+        directional_trend = trend_ofi if is_bullish else -trend_ofi
+        # Scale: 0 at ofi>=0 (with us or neutral), 1.0 at ofi<=-0.30 (strong opposition)
+        opposition = max(0.0, min(1.0, -directional_trend / 0.30))
         effective_threshold = (
-            self.config.counter_trend_threshold if is_counter_trend
-            else self.config.entry_threshold
+            self.config.entry_threshold
+            + opposition * (self.config.counter_trend_threshold - self.config.entry_threshold)
         )
+        is_counter_trend = opposition > 0.01  # For logging
 
         # Apply 5m trend bias boost on top of 30s filter
         if self.config.trend_bias_enabled and abs(trend_5m) >= self.config.trend_bias_min_pct:
