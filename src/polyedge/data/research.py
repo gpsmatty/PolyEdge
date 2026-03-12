@@ -204,6 +204,7 @@ class SignalSnapshot:
     trade_fired: bool = False
     trade_side: str = ""             # "yes" or "no" if trade fired
     trade_action: str = ""           # "buy_yes", "buy_no", "exit", "flip_yes", "flip_no"
+    exit_reason: str = ""            # "trailing_stop", "reversal", "force_exit", "floor_exit", "faded"
     no_trade_reason: str = "none"    # NoTradeReason value
 
     # Near-threshold tracking (for candidate-event logging)
@@ -254,6 +255,7 @@ class SignalSnapshot:
             "trade_fired": self.trade_fired,
             "trade_side": self.trade_side,
             "trade_action": self.trade_action,
+            "exit_reason": self.exit_reason,
             "no_trade_reason": self.no_trade_reason,
             "near_threshold": self.near_threshold,
             "distance_to_threshold": round(self.distance_to_threshold, 4),
@@ -551,12 +553,14 @@ class ResearchLogger:
         trade_side: str,
         trade_action: str,
         attribution: dict,
+        exit_reason: str = "",
     ):
         """Log a snapshot at trade time with attribution data."""
         snap.event_type = "trade"
         snap.trade_fired = True
         snap.trade_side = trade_side
         snap.trade_action = trade_action
+        snap.exit_reason = exit_reason
         snap.attribution = attribution
         snap.no_trade_reason = NoTradeReason.NONE.value
         # Ensure current_position reflects the trade side for entries

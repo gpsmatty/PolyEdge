@@ -1298,6 +1298,7 @@ class MicroRunner:
                     trade_side=opp.side.value.lower(),
                     trade_action=action.value,
                     attribution=attr,
+                    exit_reason=getattr(opp, 'exit_reason', ''),
                 )
             except Exception as e:
                 logger.debug(f"Research trade log failed (non-fatal): {e}")

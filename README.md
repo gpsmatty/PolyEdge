@@ -81,6 +81,7 @@ polyedge/
 │   ├── indexer.py        # Market sync (API → DB)
 │   ├── markets.py        # Gamma API fetching
 │   ├── orderbook.py      # Order book fetching
+│   ├── research.py       # Research pipeline: signal snapshots, regime classification
 │   ├── weather_feed.py   # Open-Meteo + NOAA weather forecast feed
 │   └── ws_feed.py        # WebSocket real-time feed
 ├── execution/
@@ -117,9 +118,9 @@ Run via `polyedge sniper` with `--dry`, copilot (default), or `--auto` modes.
 ### Micro Sniper (Primary — High-Frequency Momentum)
 Reads Binance aggTrade order flow at tick level (~10-50 trades/sec for BTC) and momentum-trades Polymarket's short-duration (5m/15m) crypto "Up or Down" markets. Unlike the crypto sniper which waits for a clear directional move in the final 90 seconds, the micro sniper trades momentum swings throughout the window.
 
-The strategy computes a composite momentum signal from -1 (strong sell) to +1 (strong buy) using: short-term order flow imbalance (5s, 10% weight), medium-term OFI (15s, 50%), VWAP drift (25%), and trade intensity surge (15%). The raw signal is then multiplied by a **flow-price agreement dampener** — a continuous factor that scales from 0.4 (flow opposed price) through 0.65 (price flat despite flow) to 1.0 (flow confirmed by price). This kills false signals where aggressive order flow gets absorbed by the book without displacing price.
+The strategy computes a composite momentum signal from -1 (strong sell) to +1 (strong buy) using: OFI 5s (10% weight), OFI 15s (50%), VWAP drift (25%), and trade intensity surge (15%). The raw signal is then multiplied by a **flow-price agreement dampener** — a continuous factor that scales from 0.4 (flow opposed price) through 0.65 (price flat despite flow) to 1.0 (flow confirmed by price). This kills false signals where aggressive order flow gets absorbed by the book without displacing price.
 
-Entry requires momentum > 0.50, sustained for 2 seconds, with 10+ trades confirming. A 30-second trend filter blocks counter-trend entries, and a 5-minute trend bias penalizes or hard-blocks entries against the macro direction. Exit triggers on momentum reversal, trailing stop (12% drawdown from HWM), or force exit with <8s remaining. All thresholds, weights, and dampener params are hot-reloadable from the database every 30 seconds — no restart needed.
+Entry requires: momentum > 0.50, sustained for 2 seconds, 10+ trades confirming, low volatility regime pass, and adaptive directional bias adjustments. A 30-second trend filter blocks counter-trend entries, and a 5-minute trend bias penalizes or hard-blocks entries against the macro direction. Adaptive directional bias shifts entry thresholds per-side based on 30-minute macro trend from price history — bullish trends favor YES entries, bearish trends favor NO entries. Exit triggers on momentum reversal, trailing stop (12% drawdown from HWM), or force exit with <8s remaining. Exit reasons (trailing_stop, reversal, force_exit, floor_exit) are now tracked in signal snapshots for analytics. All thresholds, weights, and dampener params are hot-reloadable from the database every 30 seconds — no restart needed.
 
 Safety rails include price band guards (0.35-0.65), dead market detection, trade cooldowns, FOK order rejection as a natural liquidity filter, and exit escalation on stuck sells. Gap detection resets stale data on WebSocket reconnect. Window hopping pre-loads 10 upcoming windows for seamless transitions.
 
@@ -171,7 +172,8 @@ All configurable in `config/default.yaml` and overridable at runtime via databas
 4. **Polymarket WebSocket Feed** provides real-time price/book updates via `wss://ws-subscriptions-clob.polymarket.com`
 5. **Binance WebSocket Feed** provides real-time crypto prices (BTC, ETH, SOL) via `wss://stream.binance.com:9443` — no API key needed, combined streams for all symbols
 6. **Binance aggTrade Feed** provides tick-level trade data with buy/sell classification for order flow analysis — the core data source for the micro sniper
-6. **Order Book Analyzer** extracts microstructure intelligence (imbalance, depth, whales, walls)
+7. **Research Pipeline** records signal snapshots every 2-3s with regime classification, outcome labeling, and attribution analysis — enables data-driven strategy tuning via `scripts/research_analysis.py`
+8. **Order Book Analyzer** extracts microstructure intelligence (imbalance, depth, whales, walls)
 
 ## Agent Scan Cycle
 

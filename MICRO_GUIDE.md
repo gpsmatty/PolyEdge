@@ -104,6 +104,8 @@ Momentum composite score from -1 (strong sell/bearish) to +1 (strong buy/bullish
 
 All from Binance aggTrade WebSocket — real-time buy/sell classification at tick level.
 
+The raw composite is multiplied by a **flow-price agreement dampener** (0.4-1.0) that penalizes signals where aggressive order flow doesn't actually move price — absorbed by the book, not a real signal. Factor of 1.0 when flow and price movement agree, 0.4 when they disagree completely, 0.65 when price is flat despite flow.
+
 ### Entry Logic
 
 A position is opened when ALL of these are true:
@@ -115,9 +117,11 @@ A position is opened when ALL of these are true:
 5. Persistence filter: signal sustained for 2 seconds in same direction
 6. Counter-trend filter: if 30s OFI disagrees with entry, requires 0.55 momentum instead of 0.50
 7. **5-minute trend bias**: if BTC has moved >0.15% in 5 min, blocks entries against the trend. >0.30% = hard block. Between 0.15%-0.30% = threshold boost (+0.10). This is the persistence layer — survives window hops and restarts via DB.
-8. Trade cooldown: 30 seconds since last trade on same market
-9. Window hop cooldown: 30 seconds after hopping to new window
-10. At least 15 seconds remaining in window
+8. **Adaptive directional bias**: shifts entry thresholds per-side based on 30m macro trend from `micro_price_log`. If bearish 30m (>0.30% down), YES threshold += spread/2 and NO threshold -= spread/2. Reverse for bullish. Default 0.10 spread (±0.05). Hot-reloadable from DB config.
+9. **Low volatility blocker**: blocks entries when regime is low_vol (intensity < 5 tps AND price change < 0.05%). Data showed 33% win rate and -18.68% avg move in low_vol conditions.
+10. Trade cooldown: 30 seconds since last trade on same market
+11. Window hop cooldown: 30 seconds after hopping to new window
+12. At least 15 seconds remaining in window
 
 ### Exit Logic
 
@@ -211,6 +215,21 @@ polyedge config set strategies.micro_sniper.<key> <value>
 | `trend_log_interval` | 30 | Seconds between DB price log snapshots |
 | `trend_warmup_seconds` | 60 | Seconds of live data needed before trend is trusted |
 
+#### Adaptive Directional Bias (NEW)
+| Key | Value | Why |
+|-----|-------|-----|
+| `adaptive_bias_enabled` | true | Shifts entry thresholds per-side based on 30m macro trend |
+| `adaptive_bias_spread` | 0.10 | Total spread: favorable side gets -0.05, unfavorable +0.05 |
+| `adaptive_bias_lookback_minutes` | 30.0 | How far back to compute the macro trend from micro_price_log |
+| `adaptive_bias_min_move` | 0.003 | 0.30% min price change to trigger bias (below = neutral) |
+
+#### Low Volatility Blocker (NEW)
+| Key | Value | Why |
+|-----|-------|-----|
+| `low_vol_block_enabled` | true | Block entries in dead markets — 33% win rate, -18.68% avg move |
+| `low_vol_max_intensity` | 5.0 | Max trades/sec (30s window) to be considered "low vol" |
+| `low_vol_max_price_change` | 0.0005 | Max abs price change (fractional) to be "low vol" |
+
 #### Poly Book (Disabled)
 | Key | Value | Why |
 |-----|-------|-----|
@@ -228,6 +247,9 @@ polyedge config set strategies.micro_sniper.<key> <value>
 
 ### What Works
 - **5-minute persistent trend**: Cross-window, cross-restart awareness via DB price log + 300s flow window. Prevents the #1 loss pattern: shorting brief pullbacks in a 5-minute rally.
+- **Adaptive directional bias**: Shifts YES/NO thresholds based on 30m macro trend. Bearish market → harder to buy YES, easier to buy NO. Closes the YES/NO win rate gap.
+- **Low vol blocker**: Blocks entries when market is dead (low intensity + flat price). Data: 33% win rate, -18.68% avg move. Pure noise — now filtered out.
+- **Research pipeline**: Signal snapshots every 2-3s with regime tagging, outcome labeling, and attribution. Enables data-driven tuning via research_analysis.py.
 - **Trailing stop at 12%**: Locks in profits on real moves. The +$1.36 and +$1.18 winners were both trailing stop exits.
 - **Exit escalation**: Each failed FOK adds 3c to floor. Prevents the 7-rejection loop that turned winners into losers.
 - **Persistence filter (2s)**: Filters out sub-second momentum spikes that immediately reverse.
@@ -244,8 +266,8 @@ polyedge config set strategies.micro_sniper.<key> <value>
 - **Trading in tight chop**: When BTC ranges $30-50 with no direction, every signal is a fakeout. The bot trades 16+ times and loses on most. The max_trades_per_window cap (8) helps limit the damage.
 
 ### Market Conditions
-- **Best**: Strong directional moves with pullbacks. BTC drops $100+ or rallies $100+. Momentum signals have follow-through.
-- **Worst**: Tight range chop. BTC oscillates $30-50 with no direction. Every entry immediately reverses. Persistence filter helps but can't fully prevent it.
+- **Best**: Strong directional moves with pullbacks (trend_down + NO: 67% win rate, +26.34%; chop + NO: 100% win rate in small sample). BTC drops $100+ or rallies $100+. Momentum signals have follow-through.
+- **Worst**: Low volatility dead markets (low_vol + NO: 20% win rate, -25.68%). Now blocked by low_vol blocker. Tight range chop. BTC oscillates $30-50 with no direction. Every entry immediately reverses. Persistence filter helps but can't fully prevent it.
 - **Watch out**: Slow grinds up/down. The bot keeps entering against the trend on brief pullbacks. The 30s counter-trend filter catches some but not all.
 
 ### CLOB Quirks

@@ -77,6 +77,7 @@ class MicroOpportunity:
     seconds_remaining: float    # Time left in the window
     is_flip: bool = False       # True if this is a position flip
     poly_book_imbalance: float = 0.0  # Polymarket order book imbalance (if enabled)
+    exit_reason: str = ""       # Why we're exiting: "trailing_stop", "reversal", "force_exit", "floor_exit", "book_override_fail"
 
 
 class MicroSniperStrategy:
@@ -198,6 +199,7 @@ class MicroSniperStrategy:
                 price_change_pct=micro.price_change_pct,
                 market_price=market.yes_price if current_position == "yes" else market.no_price,
                 seconds_remaining=seconds_remaining,
+                exit_reason="force_exit",
             )
 
         # Don't enter new positions too close to end
@@ -557,6 +559,7 @@ class MicroSniperStrategy:
                         price_change_pct=micro.price_change_pct,
                         market_price=our_price,
                         seconds_remaining=seconds_remaining,
+                        exit_reason="trailing_stop",
                     )
 
         # --- TIME-SCALED FLOOR EXIT ---
@@ -598,6 +601,7 @@ class MicroSniperStrategy:
                     price_change_pct=micro.price_change_pct,
                     market_price=our_price,
                     seconds_remaining=seconds_remaining,
+                    exit_reason="floor_exit",
                 )
 
         # Is momentum aligned with our position?
@@ -724,6 +728,7 @@ class MicroSniperStrategy:
                 price_change_pct=micro.price_change_pct,
                 market_price=market.yes_price if holding_yes else market.no_price,
                 seconds_remaining=seconds_remaining,
+                exit_reason="reversal",
             )
 
         if should_exit_faded:
@@ -742,6 +747,7 @@ class MicroSniperStrategy:
                 price_change_pct=micro.price_change_pct,
                 market_price=market.yes_price if holding_yes else market.no_price,
                 seconds_remaining=seconds_remaining,
+                exit_reason="faded",
             )
 
         # HOLD — momentum still aligned

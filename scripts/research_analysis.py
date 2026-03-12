@@ -76,6 +76,9 @@ async def _analyze(hours: int):
             # By regime + direction (cross-tab)
             regime_dir_stats = {}
 
+            # By exit reason
+            exit_reason_stats = {}
+
             for row in trades:
                 features = row["features"] if isinstance(row["features"], dict) else json.loads(row["features"])
 
@@ -146,6 +149,19 @@ async def _analyze(hours: int):
                     regime_stats[regime]["wins"] += 1
                 else:
                     regime_stats[regime]["losses"] += 1
+
+                # Exit reason tracking
+                exit_reason = features.get("exit_reason", "")
+                trade_action = features.get("trade_action", "")
+                if trade_action == "exit" and exit_reason:
+                    if exit_reason not in exit_reason_stats:
+                        exit_reason_stats[exit_reason] = {"wins": 0, "losses": 0, "pnl_10s": 0.0, "pnl_30s": 0.0}
+                    exit_reason_stats[exit_reason]["pnl_10s"] += token_10s
+                    exit_reason_stats[exit_reason]["pnl_30s"] += token_30s
+                    if is_win:
+                        exit_reason_stats[exit_reason]["wins"] += 1
+                    else:
+                        exit_reason_stats[exit_reason]["losses"] += 1
 
                 # Regime + direction cross-tab
                 regime_dir_key = f"{regime}|{position.lower() if position else 'unknown'}"
@@ -240,6 +256,26 @@ async def _analyze(hours: int):
                 avg = data["pnl_10s"] / rt * 100
                 t_rd.add_row(regime, direction.upper(), str(rt), f"{wr:.0f}%", f"{avg:+.2f}%")
             console.print(t_rd)
+
+            # By exit reason
+            if exit_reason_stats:
+                t_exit = Table(title="By Exit Reason")
+                t_exit.add_column("Exit Reason", style="cyan")
+                t_exit.add_column("Exits", style="white")
+                t_exit.add_column("Win Rate", style="yellow")
+                t_exit.add_column("Avg Move 10s", style="green")
+                t_exit.add_column("Avg Move 30s", style="blue")
+                for reason, data in sorted(exit_reason_stats.items(), key=lambda x: x[1]["wins"] + x[1]["losses"], reverse=True):
+                    rt = data["wins"] + data["losses"]
+                    if rt == 0:
+                        continue
+                    wr = data["wins"] / rt * 100
+                    avg_10 = data["pnl_10s"] / rt * 100
+                    avg_30 = data["pnl_30s"] / rt * 100
+                    t_exit.add_row(reason, str(rt), f"{wr:.0f}%", f"{avg_10:+.2f}%", f"{avg_30:+.2f}%")
+                console.print(t_exit)
+            else:
+                console.print("[dim]No exit reason data yet (needs bot restart to start logging)[/dim]")
 
             # --- Blocked signal analysis ---
             # For blocked signals, we check: if we HAD entered in the direction

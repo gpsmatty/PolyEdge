@@ -115,16 +115,16 @@ The most aggressive strategy in the system. While the crypto sniper waits for a 
 
 **The momentum signal** is a composite score from -1 (strong sell) to +1 (strong buy):
 
-- Order Flow Imbalance over 5s window (40% weight) — the most reactive indicator
-- Order Flow Imbalance over 15s window (30% weight) — smoothed confirmation
-- VWAP drift over 15s (20% weight) — are trades executing at higher or lower prices?
-- Trade intensity surge (10% weight) — volume spikes signal conviction
+- Order Flow Imbalance over 5s window (10% weight) — short burst, noisy
+- Order Flow Imbalance over 15s window (50% weight) — main signal, most reliable
+- VWAP drift over 15s (25% weight) — are trades executing at higher or lower prices?
+- Trade intensity surge (15% weight) — volume spikes signal conviction
 
 OFI (Order Flow Imbalance) = `(buy_volume - sell_volume) / total_volume`. A value of +0.80 means 90% of recent volume came from aggressive buyers.
 
-**Entry:** When `|momentum| > 0.40` with at least 10 trades in the 15s window, confidence > 0.40, and the Polymarket price for our side is between $0.15 and $0.80.
+**Entry:** When `|momentum| > 0.50` with at least 10 trades in the 15s window, confidence > 0.40, and the Polymarket price for our side is between $0.35 and $0.65. Signal must sustain for 2 seconds in the same direction (entry persistence filter). A flow-price agreement dampener kills false signals where aggressive order flow doesn't displace price. The 30-second trend filter requires higher threshold (0.55) for counter-trend entries to avoid the main source of losses. The 5-minute trend bias blocks counter-trend entries when BTC has moved >0.30% in 5 min, and boosts entry threshold by 0.10 for moderate trends (0.15%-0.30%). Adaptive directional bias shifts entry thresholds per-side based on the 30-minute macro trend. The low volatility blocker prevents entries when trade intensity <5 tps and price is flat, which is a 33% win rate money pit.
 
-**Exit:** When momentum reverses past 0.15 against our position, or drops below 0.08 even if aligned (signal dying), or with <8 seconds remaining in the window.
+**Exit:** Three triggers: (a) momentum reverses past 0.20 against our position, (b) trailing stop at 12% drawdown from high water mark locks in profits on winners, (c) force exit with <8 seconds remaining. The hold threshold is disabled — it was causing premature exits on momentum pauses. Each failed fill-or-kill sell attempt adds 3 cents to the floor price slippage, preventing stuck exit loops.
 
 **Flip:** When momentum reverses past 0.50 with high confidence and 25+ confirming trades, close the current position and immediately open the opposite side. The higher thresholds exist because flips are expensive — you pay spread twice (close + reopen).
 
@@ -132,14 +132,16 @@ OFI (Order Flow Imbalance) = `(buy_volume - sell_volume) / total_volume`. A valu
 
 **Safety mechanisms:**
 
-- Minimum entry price of $0.15 — if the market says 85%+ chance of the other side, a brief OFI blip doesn't override that
-- Maximum entry price of $0.80 — don't buy heavily-priced sides (not enough upside)
+- Minimum entry price of $0.35 — avoid deep out-of-the-money positions with huge % swings
+- Maximum entry price of $0.65 — avoid overpaying near certainty
 - Gap detection — if >5 seconds pass between aggTrade ticks (WebSocket disconnect), reset all flow windows to avoid trading on stale momentum
-- 10-second cooldown between trades on the same market to prevent whipsaw
-- Maximum 50 trades per window (circuit breaker)
+- 30-second trade cooldown between trades on the same market to prevent whipsaw re-entries
+- Maximum 8 trades per window (circuit breaker) — prevents fee death in choppy markets
+- Low volatility regime blocker — blocks entries when intensity < 5 tps and price movement < 0.05% (33% win rate money pit, now automatically avoided)
+- Research pipeline logging — signal snapshots every 2-3 seconds (50 fields each) plus event-driven logging for data-driven tuning and offline backtesting
 - Binance feeds narrowed to only matched symbols (when filtering by `--market btc 5m`, only subscribes to `btcusdt@aggTrade`)
 
-**Early results show:** The strategy correctly identifies momentum direction most of the time. The main risk is counter-trend entries — buying against a strong established trend on a brief OFI blip that doesn't follow through. With-trend trades are consistently profitable; counter-trend trades are where losses concentrate.
+**Early results show:** 49% overall win rate (10-second horizon), with YES at 55% and NO at 42%. The 0.60-0.70 momentum bucket is the profitable sweet spot (55% win rate, +6.74% avg move). The low volatility regime was a money pit at 33% win rate — now automatically blocked. The flow-price agreement dampener was the biggest single improvement to signal quality, eliminating false signals where aggressive order flow gets absorbed by the order book without displacing price. The adaptive directional bias and low volatility blocker are the latest additions, built on empirical data showing which market regimes are tradeable.
 
 No AI needed. Zero API cost per trade. Pure microstructure math and speed.
 
