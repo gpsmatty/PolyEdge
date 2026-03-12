@@ -56,6 +56,11 @@ from polyedge.strategies.crypto_sniper import (
     CRYPTO_SYMBOL_MAP,
     EXCLUDED_PATTERNS,
 )
+from polyedge.data.research import (
+    ResearchLogger,
+    NoTradeReason,
+    compute_attribution,
+)
 
 logger = logging.getLogger("polyedge.micro_runner")
 console = Console()
@@ -215,6 +220,10 @@ class MicroRunner:
         # --no-warmup skips this and trades immediately.
         self._waiting_for_fresh_window: bool = not skip_warmup
         self._startup_window_id: str | None = None  # condition_id of the window we're skipping
+
+        # Research pipeline — logs signal snapshots, candidate events,
+        # no-trade reasons, regime tags, and attribution data.
+        self.research = ResearchLogger(db=db)
 
         # Window hop cooldown — seconds since last hop before allowing entries.
         # Lets stale cross-window momentum flush out of the 15s/30s OFI windows.
@@ -530,6 +539,7 @@ class MicroRunner:
             asyncio.create_task(self._status_loop()),
             asyncio.create_task(self._price_log_loop()),
             asyncio.create_task(self._config_refresh_loop()),
+            asyncio.create_task(self._research_flush_loop()),
         ]
 
         try:
@@ -668,11 +678,28 @@ class MicroRunner:
         while self.running:
             try:
                 if self.market_filter:
-                    # Prune expired windows from memory — don't touch DB
+                    # Prune expired windows from memory — don't touch DB.
+                    # If the CURRENT (first) window expired, delegate to
+                    # _hop_window so the banner, flow reset, cooldown, and
+                    # WS re-subscribe all happen in one place. Only prune
+                    # non-current expired windows silently here.
                     now = datetime.now(timezone.utc)
                     for symbol in list(self.updown_markets.keys()):
+                        markets = self.updown_markets[symbol]
+                        if not markets:
+                            del self.updown_markets[symbol]
+                            continue
+
+                        current = markets[0][0]
+                        if current.end_date and current.end_date <= now:
+                            # Current window expired — use full hop logic
+                            await self._hop_window(symbol, now)
+                            continue
+
+                        # Only prune future expired windows (shouldn't happen
+                        # often, but defensive)
                         live = [
-                            (m, p) for m, p in self.updown_markets[symbol]
+                            (m, p) for m, p in markets
                             if m.end_date and m.end_date > now
                         ]
                         if live:
@@ -1076,8 +1103,48 @@ class MicroRunner:
             high_water_mark=high_water_mark,
         )
 
+        # --- Research pipeline: periodic + event-driven snapshots ---
+        # Estimate window duration from the market (15m = 900s, 5m = 300s)
+        window_duration = 900.0  # default 15m
+        if market.end_date and micro.window_start_time > 0:
+            window_duration = max(60.0, (market.end_date - datetime.fromtimestamp(micro.window_start_time, tz=timezone.utc)).total_seconds())
+
+        try:
+            # Periodic snapshots every ~2 seconds
+            if self.research.should_log_periodic(symbol, interval=2.0):
+                snap = self.research.build_snapshot(
+                    micro=micro, market=market,
+                    seconds_remaining=remaining,
+                    window_duration=window_duration,
+                    current_position=current_pos or "",
+                    entry_price=entry_price or 0.0,
+                    high_water_mark=high_water_mark or 0.0,
+                    event_type="periodic",
+                )
+                # Candidate detection: momentum near threshold but not crossing
+                abs_mom = abs(micro.momentum_signal)
+                threshold = self.config.entry_threshold
+                if not current_pos and abs_mom >= threshold * 0.80 and abs_mom < threshold:
+                    await self.research.log_candidate(snap, distance_to_threshold=threshold - abs_mom)
+                elif not current_pos and opp is None and self.strategy.last_no_trade_reason:
+                    # Signal was above threshold but got blocked by a filter
+                    reason = self.strategy.last_no_trade_reason
+                    if reason != NoTradeReason.BELOW_THRESHOLD:
+                        await self.research.log_no_trade(snap, reason)
+                    else:
+                        await self.research.log_snapshot(snap)
+                else:
+                    await self.research.log_snapshot(snap)
+        except Exception as e:
+            logger.debug(f"Research snapshot failed (non-fatal): {e}")
+
         if opp:
-            await self._handle_opportunity(opp)
+            await self._handle_opportunity(opp, micro=micro, market=market,
+                                            seconds_remaining=remaining,
+                                            window_duration=window_duration,
+                                            current_pos=current_pos,
+                                            entry_price_val=entry_price,
+                                            high_water_mark_val=high_water_mark)
 
     def _get_book_intel(self, market: Market) -> Optional[dict[str, BookIntelligence]]:
         """Get BookIntelligence for both YES and NO tokens of a market.
@@ -1106,7 +1173,16 @@ class MicroRunner:
     # Opportunity handling
     # ------------------------------------------------------------------
 
-    async def _handle_opportunity(self, opp: MicroOpportunity):
+    async def _handle_opportunity(
+        self, opp: MicroOpportunity,
+        micro: MicroStructure | None = None,
+        market: Market | None = None,
+        seconds_remaining: float = 0.0,
+        window_duration: float = 900.0,
+        current_pos: str | None = None,
+        entry_price_val: float | None = None,
+        high_water_mark_val: float | None = None,
+    ):
         """Handle a micro sniper opportunity."""
         action = opp.action
         cid = opp.market.condition_id
@@ -1137,6 +1213,51 @@ class MicroRunner:
                 f"| {opp.seconds_remaining:.0f}s left"
                 f"{book_str}"
             )
+
+        # --- Research pipeline: log trade event with attribution ---
+        if micro:
+            try:
+                snap = self.research.build_snapshot(
+                    micro=micro, market=opp.market,
+                    seconds_remaining=opp.seconds_remaining,
+                    window_duration=window_duration,
+                    current_position=current_pos or "",
+                    entry_price=entry_price_val or 0.0,
+                    high_water_mark=high_water_mark_val or 0.0,
+                    event_type="trade",
+                )
+                # Compute intensity component for attribution
+                int_5 = micro.flow_5s.trade_intensity if micro.flow_5s.is_active else 0.0
+                int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
+                if int_30 > 0:
+                    i_ratio = int_5 / int_30
+                    i_signal = max(-1.0, min(1.0, (i_ratio - 1.0)))
+                else:
+                    i_signal = 0.0
+                ofi_5_val = micro.flow_5s.ofi if micro.flow_5s.is_active else 0.0
+                d_dir = 1.0 if ofi_5_val > 0 else (-1.0 if ofi_5_val < 0 else 0.0)
+                i_comp = i_signal * d_dir
+
+                attr = compute_attribution(
+                    ofi_5s=opp.ofi_5s,
+                    ofi_15s=opp.ofi_15s,
+                    vwap_drift_scaled=snap.vwap_drift_scaled,
+                    intensity_component=i_comp,
+                    dampener_factor=snap.dampener_factor,
+                    weight_ofi_5s=micro.weight_ofi_5s,
+                    weight_ofi_15s=micro.weight_ofi_15s,
+                    weight_vwap_drift=micro.weight_vwap_drift,
+                    weight_intensity=micro.weight_intensity,
+                    trade_side=opp.side.value.lower(),
+                )
+                await self.research.log_trade(
+                    snap=snap,
+                    trade_side=opp.side.value.lower(),
+                    trade_action=action.value,
+                    attribution=attr,
+                )
+            except Exception as e:
+                logger.debug(f"Research trade log failed (non-fatal): {e}")
 
         if self.dry_run:
             # Update virtual position tracking even in dry run
@@ -1752,6 +1873,10 @@ class MicroRunner:
             poly_str = f"live/{self._ws_price_updates}" if self._poly_connected else "api"
             warmup_str = " | [yellow]WARMING UP — waiting for fresh window[/yellow]" if self._waiting_for_fresh_window else ""
 
+            # Research pipeline stats
+            r = self.research
+            research_str = f" | Snaps: {r._total_snapshots} (T:{r._total_trades} C:{r._total_candidates})"
+
             console.print(
                 f"\n[bold dim]── Micro Status ── "
                 f"{' | '.join(micro_lines) if micro_lines else 'waiting for data'} | "
@@ -1759,7 +1884,7 @@ class MicroRunner:
                 f"{pos_str} | "
                 f"Trades: {self._total_trades} (flips: {self._total_flips}) | "
                 f"Evals: {self._eval_count} | "
-                f"Prices: {poly_str}[/bold dim]"
+                f"Prices: {poly_str}{research_str}[/bold dim]"
                 f"{warmup_str}"
             )
 
@@ -1854,6 +1979,36 @@ class MicroRunner:
                     console.print(f"[bold cyan]CONFIG RELOADED: {', '.join(changes)}[/bold cyan]")
             except Exception as e:
                 logger.warning(f"Config refresh failed: {e}")
+
+    async def _research_flush_loop(self):
+        """Periodically flush research snapshot buffer to DB and prune old data."""
+        while self.running:
+            try:
+                await asyncio.sleep(5.0)
+                flushed = await self.research.flush()
+                if flushed > 0 and self.verbose:
+                    logger.debug(f"Research: flushed {flushed} snapshots to DB")
+            except asyncio.CancelledError:
+                # Final flush on shutdown
+                try:
+                    await self.research.flush()
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                logger.debug(f"Research flush failed (non-fatal): {e}")
+
+            # Prune old snapshots every ~10 minutes
+            if hasattr(self, '_last_prune_time'):
+                if time.time() - self._last_prune_time < 600:
+                    continue
+            self._last_prune_time = time.time()
+            try:
+                pruned = await self.db.prune_snapshots()
+                if pruned > 0 and not self.quiet:
+                    console.print(f"[dim]Research: pruned {pruned} old snapshots[/dim]")
+            except Exception as e:
+                logger.debug(f"Research prune failed (non-fatal): {e}")
 
     async def _get_bankroll(self) -> float:
         """Get current bankroll from actual USDC balance on chain."""
