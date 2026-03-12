@@ -172,6 +172,23 @@ class TradeFlowWindow:
         return (p - v) / v
 
     @property
+    def price_range_pct(self) -> float:
+        """Price range (high - low) / mid as a fraction over the window.
+
+        Returns 0.0 if insufficient data. Used for chop detection:
+        a high range with low net movement = choppy market.
+        """
+        if len(self._trades) < 2:
+            return 0.0
+        prices = [t.price for t in self._trades]
+        hi = max(prices)
+        lo = min(prices)
+        mid = (hi + lo) / 2.0
+        if mid <= 0:
+            return 0.0
+        return (hi - lo) / mid
+
+    @property
     def is_active(self) -> bool:
         """True if we have recent trades in the window."""
         return len(self._trades) > 0
@@ -360,6 +377,27 @@ class MicroStructure:
         elif t < -0.001:
             return "down"
         return "flat"
+
+    @property
+    def chop_index(self) -> float:
+        """Chop index: how much range vs directional movement over 5 minutes.
+
+        Ratio of price range to abs(net movement). High values (>3) = choppy
+        (big swings, little net direction). Low values (~1) = trending.
+
+        Returns 0.0 if insufficient data.
+        Used to auto-scale entry thresholds: choppy → raise threshold.
+        """
+        if not self.flow_5m.is_active or len(self.flow_5m._trades) < 10:
+            return 0.0
+
+        range_pct = self.flow_5m.price_range_pct
+        net_move = abs(self.trend_5m)
+
+        if net_move < 0.00005:  # <0.005% net move = basically flat
+            # Range with no direction = pure chop
+            return range_pct * 10000  # scale to meaningful numbers (0.1% range → 1.0)
+        return range_pct / net_move if net_move > 0 else 0.0
 
     @property
     def momentum_signal(self) -> float:

@@ -337,6 +337,22 @@ class MicroSniperStrategy:
                 effective_threshold += adjustment
                 self._last_bias_adjustment = adjustment
 
+        # --- Chop filter (volatility-scaled threshold) ---
+        # When market is range-bound (big swings, no direction), momentum signals
+        # are unreliable. Auto-boost threshold proportional to chop intensity.
+        # No manual config changes needed — adapts to market conditions.
+        self._last_chop_boost = 0.0
+        if self.config.chop_filter_enabled:
+            chop = micro.chop_index
+            if chop > self.config.chop_threshold:
+                # Linear scale: chop_threshold → 0 boost, chop_scale → max_boost
+                chop_range = self.config.chop_scale - self.config.chop_threshold
+                if chop_range > 0:
+                    chop_frac = min(1.0, (chop - self.config.chop_threshold) / chop_range)
+                    boost = chop_frac * self.config.chop_max_boost
+                    effective_threshold += boost
+                    self._last_chop_boost = boost
+
         # Need strong enough signal
         if abs_momentum < effective_threshold:
             # Even if we don't enter, track momentum for acceleration filter

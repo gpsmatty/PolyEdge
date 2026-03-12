@@ -1165,8 +1165,14 @@ class MicroRunner:
                             ctx = f" ({int_30:.0f}tps > {self.config.high_intensity_max_tps:.0f} cap)"
                         elif reason == NoTradeReason.BELOW_THRESHOLD:
                             bias_adj = self.strategy._last_bias_adjustment
+                            chop_boost = getattr(self.strategy, '_last_chop_boost', 0.0)
+                            parts = []
                             if abs(bias_adj) > 0.001:
-                                ctx = f" (bias:{bias_adj:+.2f})"
+                                parts.append(f"bias:{bias_adj:+.2f}")
+                            if chop_boost > 0.001:
+                                parts.append(f"chop:+{chop_boost:.2f}")
+                            if parts:
+                                ctx = f" ({', '.join(parts)})"
 
                         if not self.quiet:
                             console.print(
@@ -1249,6 +1255,8 @@ class MicroRunner:
             # Show adaptive bias adjustment if active
             bias_adj = self.strategy._last_bias_adjustment
             bias_str = f" | Bias:{bias_adj:+.2f}" if abs(bias_adj) > 0.001 else ""
+            chop_boost = getattr(self.strategy, '_last_chop_boost', 0.0)
+            chop_str = f" | Chop:+{chop_boost:.2f}" if chop_boost > 0.001 else ""
             console.print(
                 f"[bold {action_color}]MICRO [{action_str}][/bold {action_color}] "
                 f"{opp.symbol.replace('usdt','').upper()} "
@@ -1257,7 +1265,7 @@ class MicroRunner:
                 f"| Mkt: {opp.market_price:.2f} ({price_source}) "
                 f"| ${opp.binance_price:,.2f} "
                 f"| {opp.seconds_remaining:.0f}s left"
-                f"{book_str}{bias_str}"
+                f"{book_str}{bias_str}{chop_str}"
             )
 
         # --- Research pipeline: log trade event with attribution ---
@@ -1598,6 +1606,8 @@ class MicroRunner:
                         "seconds_remaining": round(opp.seconds_remaining, 1),
                         "bias_direction": bias_direction,
                         "bias_adjustment": round(bias_adj, 4),
+                        "chop_index": round(micro.chop_index, 2) if micro else 0,
+                        "chop_boost": round(getattr(self.strategy, '_last_chop_boost', 0.0), 4),
                     }
                     await self.db.insert_trade({
                         "trade_id": order_id,
@@ -1932,10 +1942,17 @@ class MicroRunner:
                     else:
                         bias_str = " Bias:NEUTRAL"
 
+                # Chop index indicator
+                chop_str = ""
+                if self.config.chop_filter_enabled:
+                    chop = micro.chop_index
+                    if chop > self.config.chop_threshold:
+                        chop_str = f" CHOP:{chop:.1f}"
+
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
                     f"Mom:{momentum:+.2f} OFI:{ofi:+.2f} "
-                    f"{intensity:.0f}tps{trend_str}{bias_str}"
+                    f"{intensity:.0f}tps{trend_str}{bias_str}{chop_str}"
                 )
 
             n_pos = len(self._positions)

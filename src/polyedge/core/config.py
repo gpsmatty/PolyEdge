@@ -276,6 +276,15 @@ class MicroSniperConfig(BaseModel):
     high_intensity_block_enabled: bool = True     # Master toggle
     high_intensity_max_tps: float = 50.0          # Block entries above this tps (30s window). Data: winners avg 40, losers avg 61
 
+    # --- Chop filter (volatility-scaled threshold) ---
+    # Auto-raises entry threshold when market is choppy (big range, no direction).
+    # Uses 5-minute price range vs net movement. Adapts automatically — no manual
+    # config changes needed across market conditions.
+    chop_filter_enabled: bool = True              # Master toggle
+    chop_threshold: float = 3.0                   # Chop index above this = choppy (range/net_move ratio)
+    chop_max_boost: float = 0.10                  # Max threshold boost in extreme chop
+    chop_scale: float = 5.0                       # Chop index at which max_boost is fully applied
+
     # --- Trailing stop loss ---
     # Tracks the high water mark (HWM) of our side's price since entry.
     # If price drops trailing_stop_pct from the HWM, trigger an exit.
