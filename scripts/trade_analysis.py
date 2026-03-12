@@ -89,6 +89,7 @@ class TradeAnalyzer:
                 status, strategy, reasoning,
                 ai_probability,
                 config_snapshot, signal_data,
+                exit_reason,
                 opened_at, closed_at
             FROM polyedge.trades
             WHERE {where_sql}
@@ -102,71 +103,63 @@ class TradeAnalyzer:
         self._organize_trades()
 
     def _organize_trades(self):
-        """Organize trades into entries and exits, and pair them.
+        """Organize trades into completed pairs.
 
-        In the trades table:
-        - Entry trades have side='BUY', entry_price=actual entry fill price
-        - Exit trades have side='SELL', entry_price=actual exit fill price (exit fills go in entry_price field)
+        Micro sniper stores ONE row per trade with side='YES'/'NO',
+        entry_price, exit_price, pnl, status='CLOSED'/'OPEN'.
+        A completed trade has status='CLOSED' with both entry and exit prices.
         """
-        entry_map = {}  # market_id -> entry trade
-        exit_list = []
-
         for trade in self.trades:
             market_id = trade['market_id']
-            side = trade['side']
 
-            # Store signal and config data at entry
-            if side == 'BUY':
-                self.entry_trades.append(trade)
-                entry_map[market_id] = trade
-                # Parse JSONB if it's a dict, otherwise skip
-                if trade['signal_data']:
-                    if isinstance(trade['signal_data'], dict):
-                        self.signal_data[market_id] = trade['signal_data']
-                    elif isinstance(trade['signal_data'], str):
-                        try:
-                            self.signal_data[market_id] = json.loads(trade['signal_data'])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                if trade['config_snapshot']:
-                    if isinstance(trade['config_snapshot'], dict):
-                        self.config_data[market_id] = trade['config_snapshot']
-                    elif isinstance(trade['config_snapshot'], str):
-                        try:
-                            self.config_data[market_id] = json.loads(trade['config_snapshot'])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-            else:
-                self.exit_trades.append(trade)
-                exit_list.append(trade)
+            # Parse signal and config JSONB data
+            if trade['signal_data']:
+                if isinstance(trade['signal_data'], dict):
+                    self.signal_data[market_id] = trade['signal_data']
+                elif isinstance(trade['signal_data'], str):
+                    try:
+                        self.signal_data[market_id] = json.loads(trade['signal_data'])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            if trade['config_snapshot']:
+                if isinstance(trade['config_snapshot'], dict):
+                    self.config_data[market_id] = trade['config_snapshot']
+                elif isinstance(trade['config_snapshot'], str):
+                    try:
+                        self.config_data[market_id] = json.loads(trade['config_snapshot'])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
-        # Pair entries with exits
-        for exit_trade in exit_list:
-            market_id = exit_trade['market_id']
-            if market_id in entry_map:
-                entry_trade = entry_map[market_id]
+            self.entry_trades.append(trade)
 
-                # Calculate P&L and hold time
-                entry_price = float(entry_trade['entry_price'])
-                exit_price = float(exit_trade['entry_price'])  # In exit trade, entry_price is the exit price
-                size = float(entry_trade['size'])
+            # Completed trade: has exit_price and is CLOSED
+            if trade['status'] == 'CLOSED' and trade['exit_price'] is not None:
+                entry_price = float(trade['entry_price'])
+                exit_price = float(trade['exit_price'])
+                size = float(trade['size'])
 
-                # Simple P&L calculation (before fees)
-                gross_pnl = (exit_price - entry_price) * size
+                # Use stored pnl if available, else compute
+                if trade['pnl'] is not None:
+                    gross_pnl = float(trade['pnl'])
+                else:
+                    gross_pnl = (exit_price - entry_price) * size
 
                 # Hold time
-                if entry_trade['opened_at'] and exit_trade['opened_at']:
-                    hold_time = (exit_trade['opened_at'] - entry_trade['opened_at']).total_seconds()
+                if trade['opened_at'] and trade['closed_at']:
+                    hold_time = (trade['closed_at'] - trade['opened_at']).total_seconds()
                 else:
                     hold_time = 0
 
                 self.paired_trades.append({
-                    'entry': entry_trade,
-                    'exit': exit_trade,
+                    'entry': trade,
+                    'exit': trade,  # Same row — exit data is on the same trade row
                     'gross_pnl': gross_pnl,
                     'hold_time_seconds': hold_time,
                     'market_id': market_id,
                 })
+            elif trade['status'] == 'OPEN':
+                # Still open — track but don't pair
+                pass
 
     def get_overall_stats(self) -> dict:
         """Overall statistics."""
@@ -183,6 +176,7 @@ class TradeAnalyzer:
                 'largest_loser': 0,
                 'avg_p_and_l_per_trade': 0,
                 'avg_hold_time_seconds': 0,
+                'avg_hold_time_readable': '0s',
             }
 
         pnls = [t['gross_pnl'] for t in self.paired_trades]
@@ -390,28 +384,26 @@ class TradeAnalyzer:
         return results
 
     def analyze_by_exit_reason(self) -> dict:
-        """Analyze by exit reason (inferred from reasoning field or exit time)."""
+        """Analyze by exit reason from DB exit_reason column."""
         results = defaultdict(list)
 
         for trade in self.paired_trades:
             exit_trade = trade['exit']
-            reasoning = exit_trade.get('reasoning', '').lower()
+            reason = exit_trade.get('exit_reason', '').strip()
 
-            # Try to infer exit reason from reasoning field
-            if 'reversal' in reasoning or 'momentum reversal' in reasoning:
-                reason = 'momentum_reversal'
-            elif 'trailing' in reasoning or 'stop' in reasoning:
-                reason = 'trailing_stop'
-            elif 'force' in reasoning or 'forced' in reasoning:
-                reason = 'force_exit'
-            elif 'floor' in reasoning or 'slippage' in reasoning:
-                reason = 'floor_exit'
-            else:
-                # Default based on hold time (force exits are quick)
-                if trade['hold_time_seconds'] < 5:
+            # Use DB exit_reason if available, otherwise infer
+            if not reason:
+                reasoning = exit_trade.get('reasoning', '').lower()
+                if 'trailing' in reasoning or 'stop' in reasoning:
+                    reason = 'trailing_stop'
+                elif 'force' in reasoning or 'forced' in reasoning:
+                    reason = 'force_exit'
+                elif 'floor' in reasoning or 'slippage' in reasoning:
+                    reason = 'floor_exit'
+                elif trade['hold_time_seconds'] < 5:
                     reason = 'force_exit'
                 else:
-                    reason = 'momentum_reversal'
+                    reason = 'unknown'
 
             results[reason].append(trade)
 
@@ -498,10 +490,85 @@ class TradeAnalyzer:
                                             for t in unpaired_entries), 2),
         }
 
+    def analyze_by_bias(self) -> dict:
+        """Analyze performance by adaptive bias state at entry.
+
+        Reads bias_direction from signal_data JSONB (FAVORABLE / UNFAVORABLE / NEUTRAL).
+        Shows whether the adaptive bias is actually improving trade selection.
+        """
+        results = defaultdict(list)
+
+        for trade in self.paired_trades:
+            market_id = trade['market_id']
+            signal = self.signal_data.get(market_id, {})
+
+            bias_dir = signal.get('bias_direction', 'UNKNOWN')
+            if not bias_dir or bias_dir == 'UNKNOWN':
+                # Fallback: check config_snapshot for whether bias was enabled
+                config = self.config_data.get(market_id, {})
+                if not config.get('adaptive_bias_enabled', True):
+                    bias_dir = 'DISABLED'
+                else:
+                    bias_dir = 'NEUTRAL'  # No bias_direction field = pre-tracking era
+
+            results[bias_dir].append(trade)
+
+        analyzed = {}
+        for bias_state, trades in sorted(results.items()):
+            if not trades:
+                continue
+            pnls = [t['gross_pnl'] for t in trades]
+            wins = sum(1 for p in pnls if p > 0)
+            analyzed[bias_state] = {
+                'count': len(trades),
+                'win_rate': f"{wins/len(trades)*100:.1f}%" if trades else 'N/A',
+                'avg_pnl': round(sum(pnls) / len(trades), 4) if trades else 0,
+                'total_pnl': round(sum(pnls), 4),
+            }
+
+        return analyzed
+
+    def analyze_by_intensity(self) -> dict:
+        """Analyze performance by trade intensity buckets at entry.
+
+        Helps validate the intensity cap threshold. Data shows losers
+        average ~61 tps vs winners ~40 tps.
+        """
+        buckets = [
+            ('0-20 tps', 0, 20),
+            ('20-40 tps', 20, 40),
+            ('40-50 tps', 40, 50),
+            ('50-60 tps', 50, 60),
+            ('60+ tps', 60, 999),
+        ]
+        results = {}
+
+        for label, lo, hi in buckets:
+            trades = []
+            for trade in self.paired_trades:
+                market_id = trade['market_id']
+                signal = self.signal_data.get(market_id, {})
+                intensity = signal.get('trade_intensity')
+                if intensity is not None and lo <= float(intensity) < hi:
+                    trades.append(trade)
+
+            if not trades:
+                continue
+            pnls = [t['gross_pnl'] for t in trades]
+            wins = sum(1 for p in pnls if p > 0)
+            results[label] = {
+                'count': len(trades),
+                'win_rate': f"{wins/len(trades)*100:.1f}%",
+                'avg_pnl': round(sum(pnls) / len(trades), 4),
+                'total_pnl': round(sum(pnls), 4),
+            }
+
+        return results
+
     def analyze_execution_quality(self) -> dict:
         """Analyze execution quality (slippage, fill rates)."""
         if not self.signal_data or not self.paired_trades:
-            return {'avg_entry_slippage': 'N/A', 'avg_exit_slippage': 'N/A'}
+            return {'avg_entry_slippage': 'N/A', 'avg_exit_slippage': 'N/A', 'entry_trades_analyzed': 0, 'exit_trades_analyzed': 0}
 
         entry_slippages = []
         exit_slippages = []
@@ -522,9 +589,8 @@ class TradeAnalyzer:
                 entry_slip = abs(actual_entry - market_price) / market_price
                 entry_slippages.append(entry_slip)
 
-            # Exit slippage: actual exit price vs best price available
-            # (approximate with exit trade entry_price)
-            exit_price = float(exit_trade['entry_price'])
+            # Exit slippage: actual exit price vs entry price
+            exit_price = float(trade['exit'].get('exit_price', 0) or trade['exit']['entry_price'])
             if actual_entry > 0:
                 exit_slip = abs(exit_price - actual_entry) / actual_entry
                 exit_slippages.append(exit_slip)
@@ -567,7 +633,7 @@ async def print_report(analyzer: TradeAnalyzer):
     console.print(Panel(
         f"[bold green]Trade Analysis Report[/bold green]\n"
         f"Total Completed Trades: {stats['total_completed_trades']}\n"
-        f"Total P&L: [bold ${stats['total_p_and_l']}[/bold]\n"
+        f"Total P&L: ${stats['total_p_and_l']}\n"
         f"Win Rate: {stats['win_rate']}\n"
         f"Wins: {stats['total_wins']} | Losses: {stats['total_losses']}\n"
         f"Gross Profit: ${stats['gross_profit']} | Gross Loss: ${stats['gross_loss']}\n"
@@ -671,6 +737,46 @@ async def print_report(analyzer: TradeAnalyzer):
                 f"${data['total_pnl']}",
             )
     console.print(table)
+
+    # By adaptive bias state
+    by_bias = analyzer.analyze_by_bias()
+    if by_bias:
+        table = Table(title="Performance by Adaptive Bias State")
+        table.add_column("Bias State")
+        table.add_column("Count", justify="right")
+        table.add_column("Win Rate", justify="right")
+        table.add_column("Avg P&L", justify="right")
+        table.add_column("Total P&L", justify="right")
+        for state, data in by_bias.items():
+            if data['count'] > 0:
+                table.add_row(
+                    state,
+                    str(data['count']),
+                    data['win_rate'],
+                    f"${data['avg_pnl']}",
+                    f"${data['total_pnl']}",
+                )
+        console.print(table)
+
+    # By trade intensity
+    by_intensity = analyzer.analyze_by_intensity()
+    if by_intensity:
+        table = Table(title="Performance by Trade Intensity at Entry")
+        table.add_column("Intensity")
+        table.add_column("Count", justify="right")
+        table.add_column("Win Rate", justify="right")
+        table.add_column("Avg P&L", justify="right")
+        table.add_column("Total P&L", justify="right")
+        for bucket, data in by_intensity.items():
+            if data['count'] > 0:
+                table.add_row(
+                    bucket,
+                    str(data['count']),
+                    data['win_rate'],
+                    f"${data['avg_pnl']}",
+                    f"${data['total_pnl']}",
+                )
+        console.print(table)
 
     # Signal components
     signal_comp = analyzer.analyze_signal_components()
