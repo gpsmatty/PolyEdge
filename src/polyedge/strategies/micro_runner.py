@@ -1160,6 +1160,9 @@ class MicroRunner:
                         elif reason == NoTradeReason.LOW_VOL:
                             int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
                             ctx = f" (int:{int_30:.1f}tps, Δ:{micro.price_change_pct:+.4%})"
+                        elif reason == NoTradeReason.HIGH_INTENSITY:
+                            int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
+                            ctx = f" ({int_30:.0f}tps > {self.config.high_intensity_max_tps:.0f} cap)"
                         elif reason == NoTradeReason.BELOW_THRESHOLD:
                             bias_adj = self.strategy._last_bias_adjustment
                             if abs(bias_adj) > 0.001:
@@ -1560,6 +1563,8 @@ class MicroRunner:
                         "entry_persistence_seconds": self.config.entry_persistence_seconds,
                         "trailing_stop_enabled": self.config.trailing_stop_enabled,
                         "trailing_stop_pct": self.config.trailing_stop_pct,
+                        "take_profit_enabled": self.config.take_profit_enabled,
+                        "take_profit_price": self.config.take_profit_price,
                         "exit_slippage": self.config.exit_slippage,
                         "entry_slippage": self.config.entry_slippage,
                         "trade_cooldown": self.config.trade_cooldown,
@@ -1572,7 +1577,14 @@ class MicroRunner:
                         "dampener_disagree_factor": self.config.dampener_disagree_factor,
                         "dampener_flat_factor": self.config.dampener_flat_factor,
                         "dampener_price_deadzone": self.config.dampener_price_deadzone,
+                        "high_intensity_block_enabled": self.config.high_intensity_block_enabled,
+                        "high_intensity_max_tps": self.config.high_intensity_max_tps,
                     }
+                    # Compute bias direction at entry for performance tracking
+                    bias_direction = "NEUTRAL"
+                    bias_adj = self.strategy._last_bias_adjustment
+                    if self.config.adaptive_bias_enabled and abs(bias_adj) > 0.001:
+                        bias_direction = "FAVORABLE" if bias_adj < 0 else "UNFAVORABLE"
                     signal_snap = {
                         "momentum": round(opp.momentum, 4),
                         "confidence": round(opp.confidence, 4),
@@ -1584,6 +1596,8 @@ class MicroRunner:
                         "market_price": opp.market_price,
                         "price_change_pct": round(opp.price_change_pct, 6),
                         "seconds_remaining": round(opp.seconds_remaining, 1),
+                        "bias_direction": bias_direction,
+                        "bias_adjustment": round(bias_adj, 4),
                     }
                     await self.db.insert_trade({
                         "trade_id": order_id,
@@ -1842,6 +1856,7 @@ class MicroRunner:
                     market_id=cid,
                     exit_price=fill_price,
                     pnl=gross_pnl,
+                    exit_reason=getattr(opp, 'exit_reason', ''),
                 )
             except Exception as e:
                 logger.warning(f"Trade close recording failed (non-fatal): {e}")
@@ -1914,6 +1929,8 @@ class MicroRunner:
                         bias_dir = "BEAR" if t30 < 0 else "BULL"
                         half = self.config.adaptive_bias_spread / 2.0
                         bias_str = f" Bias:{bias_dir}(Y{'+'if t30<0 else '-'}{half:.2f}/N{'-'if t30<0 else '+'}{half:.2f})"
+                    else:
+                        bias_str = " Bias:NEUTRAL"
 
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
@@ -2012,6 +2029,8 @@ class MicroRunner:
                     "low_vol_block_enabled": self.config.low_vol_block_enabled,
                     "low_vol_max_intensity": self.config.low_vol_max_intensity,
                     "low_vol_max_price_change": self.config.low_vol_max_price_change,
+                    "high_intensity_block_enabled": self.config.high_intensity_block_enabled,
+                    "high_intensity_max_tps": self.config.high_intensity_max_tps,
                 }
 
                 await apply_db_config(self.settings, self.db)

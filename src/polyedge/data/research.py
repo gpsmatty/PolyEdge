@@ -125,6 +125,7 @@ class NoTradeReason(str, Enum):
     FOK_REJECTED = "fok_rejected"          # FOK order couldn't fill
     SPARSE_DATA = "sparse_data"            # Not enough trades in window
     LOW_VOL = "low_vol"                    # Low volatility regime — momentum is noise
+    HIGH_INTENSITY = "high_intensity"      # Trade intensity too high — chaotic, losers avg 61 tps
     NONE = "none"                          # Trade was taken (no block)
 
 

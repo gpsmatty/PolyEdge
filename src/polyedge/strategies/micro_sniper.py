@@ -243,6 +243,16 @@ class MicroSniperStrategy:
                 self.last_no_trade_reason = NoTradeReason.LOW_VOL
                 return None
 
+        # --- High intensity blocker ---
+        # Data shows losers average ~61 tps vs winners ~40 tps. High trade
+        # intensity = chaotic price action where OFI signals are noise.
+        # The book is getting slammed from both sides and momentum is unreliable.
+        if self.config.high_intensity_block_enabled:
+            int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
+            if int_30 > self.config.high_intensity_max_tps:
+                self.last_no_trade_reason = NoTradeReason.HIGH_INTENSITY
+                return None
+
         # --- 5-minute persistent trend bias ---
         # The macro trend from the 5-minute rolling window (persists across
         # window hops and restarts via DB). If BTC has been trending up for
@@ -517,6 +527,36 @@ class MicroSniperStrategy:
         """Evaluate when we already have a position — exit, hold, or flip."""
         abs_momentum = abs(momentum)
         holding_yes = current_position == "yes"
+
+        # --- TAKE PROFIT ---
+        # When our token price hits the target (e.g. 0.90), take the money.
+        # Don't wait for momentum reversal or trailing stop — lock in the gain.
+        if self.config.take_profit_enabled and entry_price:
+            our_price = market.yes_price if holding_yes else market.no_price
+            if our_price >= self.config.take_profit_price:
+                console.print(
+                    f"[bold green]TAKE PROFIT: {'YES' if holding_yes else 'NO'} "
+                    f"entry=${entry_price:.2f} → now=${our_price:.2f} "
+                    f"(≥ ${self.config.take_profit_price:.2f} target) "
+                    f"— banking profit[/bold green]"
+                )
+                return MicroOpportunity(
+                    market=market,
+                    symbol=micro.symbol,
+                    action=MicroAction.EXIT,
+                    side=Side.YES if holding_yes else Side.NO,
+                    momentum=momentum,
+                    confidence=confidence,
+                    ofi_5s=micro.flow_5s.ofi,
+                    ofi_15s=micro.flow_15s.ofi,
+                    vwap_drift=micro.flow_15s.vwap_drift,
+                    trade_intensity=micro.flow_5s.trade_intensity,
+                    binance_price=micro.current_price,
+                    price_change_pct=micro.price_change_pct,
+                    market_price=our_price,
+                    seconds_remaining=seconds_remaining,
+                    exit_reason="take_profit",
+                )
 
         # --- TRAILING STOP LOSS ---
         # When enabled: tracks the high water mark (HWM) of our position's price.

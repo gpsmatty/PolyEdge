@@ -269,6 +269,13 @@ class MicroSniperConfig(BaseModel):
     low_vol_max_intensity: float = 5.0            # Max trades/sec (30s window) to be "low vol"
     low_vol_max_price_change: float = 0.0005      # Max abs price change (fractional) to be "low vol"
 
+    # --- High intensity blocker ---
+    # Data shows losers avg ~61 tps vs winners ~40 tps. High intensity =
+    # chaotic price action where momentum signals are unreliable. Block entries
+    # when 30s trade intensity exceeds the cap.
+    high_intensity_block_enabled: bool = True     # Master toggle
+    high_intensity_max_tps: float = 50.0          # Block entries above this tps (30s window). Data: winners avg 40, losers avg 61
+
     # --- Trailing stop loss ---
     # Tracks the high water mark (HWM) of our side's price since entry.
     # If price drops trailing_stop_pct from the HWM, trigger an exit.
@@ -278,6 +285,11 @@ class MicroSniperConfig(BaseModel):
     trailing_stop_min_profit_pct: float = 0.10     # Only arm the stop after price is 10% above entry (don't stop out on noise)
     trailing_stop_late_pct: float = 0.15           # Tighter stop in last 90s of window
     trailing_stop_late_seconds: float = 90.0       # When to switch to the tighter stop
+
+    # Take-profit: exit immediately when market price hits target
+    take_profit_enabled: bool = True               # Master toggle
+    take_profit_price: float = 0.90                # Exit when our token price >= this
+
 
 
 class MarketMakerConfig(BaseModel):
