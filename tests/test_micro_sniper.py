@@ -1489,6 +1489,23 @@ class TestPersistentFlowWindow:
 # Tests: Polymarket order book exit override (uses REAL strategy class)
 # ═══════════════════════════════════════════════════════════════════════
 
+import sys
+import os
+# Allow importing polyedge even without pip install -e .
+_src_dir = os.path.join(os.path.dirname(__file__), '..', 'src')
+if _src_dir not in sys.path:
+    sys.path.insert(0, os.path.abspath(_src_dir))
+
+try:
+    from polyedge.core.config import MicroSniperConfig as _MicroSniperConfig
+    from polyedge.strategies.micro_sniper import MicroSniperStrategy as _MicroSniperStrategy
+    from polyedge.data.book_analyzer import BookIntelligence as _BookIntelligence
+    _HAS_POLYEDGE = True
+except ImportError:
+    _HAS_POLYEDGE = False
+
+
+@pytest.mark.skipif(not _HAS_POLYEDGE, reason="polyedge package not installed (missing deps)")
 class TestBookExitOverride:
     """Test the Polymarket order book exit override using the REAL
     MicroSniperStrategy class, not the simplified evaluate_micro function."""
