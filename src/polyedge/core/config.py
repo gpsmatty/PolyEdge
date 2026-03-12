@@ -251,6 +251,16 @@ class MicroSniperConfig(BaseModel):
     trend_log_interval: float = 30.0             # Seconds between DB price log snapshots
     trend_warmup_seconds: float = 60.0           # Seconds of live data needed before trend is trusted
 
+    # --- Adaptive directional bias ---
+    # Shifts entry thresholds based on 30m macro trend. In a bearish market,
+    # YES entries need a stronger signal (threshold + spread/2), while NO
+    # entries get an easier bar (threshold - spread/2). Flips for bullish.
+    # Uses price_history from micro_price_log DB table (30min of snapshots).
+    adaptive_bias_enabled: bool = True            # Master toggle for adaptive per-side bias
+    adaptive_bias_spread: float = 0.10            # Total spread: favorable side gets -spread/2, unfavorable +spread/2
+    adaptive_bias_lookback_minutes: float = 30.0  # How far back to compute the macro trend
+    adaptive_bias_min_move: float = 0.003         # 0.30% min move to trigger bias (below = neutral, no adjustment)
+
     # --- Trailing stop loss ---
     # Tracks the high water mark (HWM) of our side's price since entry.
     # If price drops trailing_stop_pct from the HWM, trigger an exit.

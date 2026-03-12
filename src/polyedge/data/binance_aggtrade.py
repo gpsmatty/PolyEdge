@@ -312,6 +312,40 @@ class MicroStructure:
 
         return 0.0
 
+    def trend_lookback(self, minutes: float = 30.0) -> float:
+        """Price trend over a configurable lookback period using DB price history.
+
+        Returns fractional change: (current - oldest_in_window) / oldest.
+        Positive = BTC trending up over the lookback period.
+        Uses price_history from micro_price_log (30-60min of snapshots).
+
+        Args:
+            minutes: How far back to look (default 30 minutes).
+
+        Returns:
+            Fractional price change, or 0.0 if insufficient data.
+        """
+        import time as _time
+
+        if not self.price_history or self.current_price <= 0:
+            return 0.0
+
+        cutoff = _time.time() - (minutes * 60)
+
+        # Find the oldest price at or after the cutoff
+        # price_history is [(price, timestamp), ...] sorted oldest-first
+        for price, ts in self.price_history:
+            if ts >= cutoff and price > 0:
+                return (self.current_price - price) / price
+
+        # All history is older than cutoff — use the newest entry as best effort
+        if self.price_history:
+            price, ts = self.price_history[-1]
+            if price > 0:
+                return (self.current_price - price) / price
+
+        return 0.0
+
     @property
     def ofi_5m(self) -> float:
         """5-minute aggregate OFI from the persistent flow window."""

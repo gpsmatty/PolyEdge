@@ -120,6 +120,7 @@ class MicroSniperStrategy:
         self._entry_signal_start: dict[str, float] = {}  # symbol -> time.time() when signal started
         # Last reason a potential entry was rejected (read by research logger)
         self.last_no_trade_reason: NoTradeReason | None = None
+        self._last_bias_adjustment: float = 0.0  # Adaptive bias applied to threshold
 
     def evaluate(
         self,
@@ -291,6 +292,28 @@ class MicroSniperStrategy:
             if is_counter_5m and abs(trend_5m) < self.config.trend_bias_strong_pct:
                 # Moderate counter-trend: add boost to threshold
                 effective_threshold += self.config.trend_bias_counter_boost
+
+        # --- Adaptive directional bias (30m macro trend) ---
+        # Shifts the threshold per-side based on the longer-term trend.
+        # Bearish 30m → YES needs higher threshold, NO gets lower.
+        # Bullish 30m → NO needs higher threshold, YES gets lower.
+        # This is the "variable config" — not a hard block, just a bias.
+        self._last_bias_adjustment = 0.0  # Track for logging
+        if self.config.adaptive_bias_enabled:
+            trend_30m = micro.trend_lookback(self.config.adaptive_bias_lookback_minutes)
+            if abs(trend_30m) >= self.config.adaptive_bias_min_move:
+                half_spread = self.config.adaptive_bias_spread / 2.0
+                market_bearish = trend_30m < 0
+                if is_bullish:
+                    # Buying YES (bullish bet)
+                    # Bearish market → harder (+spread/2), bullish → easier (-spread/2)
+                    adjustment = half_spread if market_bearish else -half_spread
+                else:
+                    # Buying NO (bearish bet)
+                    # Bearish market → easier (-spread/2), bullish → harder (+spread/2)
+                    adjustment = -half_spread if market_bearish else half_spread
+                effective_threshold += adjustment
+                self._last_bias_adjustment = adjustment
 
         # Need strong enough signal
         if abs_momentum < effective_threshold:

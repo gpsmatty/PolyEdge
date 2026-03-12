@@ -1157,6 +1157,10 @@ class MicroRunner:
                             ctx = f" (YES: {market.yes_price:.2f})"
                         elif reason == NoTradeReason.SPARSE_DATA:
                             ctx = f" ({micro.flow_15s.total_count} trades)"
+                        elif reason == NoTradeReason.BELOW_THRESHOLD:
+                            bias_adj = self.strategy._last_bias_adjustment
+                            if abs(bias_adj) > 0.001:
+                                ctx = f" (bias:{bias_adj:+.2f})"
 
                         if not self.quiet:
                             console.print(
@@ -1236,6 +1240,9 @@ class MicroRunner:
             book_str = ""
             if self.config.poly_book_enabled and opp.poly_book_imbalance != 0:
                 book_str = f" | Book: {opp.poly_book_imbalance:+.2f}"
+            # Show adaptive bias adjustment if active
+            bias_adj = self.strategy._last_bias_adjustment
+            bias_str = f" | Bias:{bias_adj:+.2f}" if abs(bias_adj) > 0.001 else ""
             console.print(
                 f"[bold {action_color}]MICRO [{action_str}][/bold {action_color}] "
                 f"{opp.symbol.replace('usdt','').upper()} "
@@ -1244,7 +1251,7 @@ class MicroRunner:
                 f"| Mkt: {opp.market_price:.2f} ({price_source}) "
                 f"| ${opp.binance_price:,.2f} "
                 f"| {opp.seconds_remaining:.0f}s left"
-                f"{book_str}"
+                f"{book_str}{bias_str}"
             )
 
         # --- Research pipeline: log trade event with attribution ---
@@ -1895,10 +1902,19 @@ class MicroRunner:
                 trend = micro.trend_5m
                 trend_str = f" T5m:{trend:+.2%}" if abs(trend) > 0.0001 else ""
 
+                # 30m adaptive bias indicator
+                bias_str = ""
+                if self.config.adaptive_bias_enabled:
+                    t30 = micro.trend_lookback(self.config.adaptive_bias_lookback_minutes)
+                    if abs(t30) >= self.config.adaptive_bias_min_move:
+                        bias_dir = "BEAR" if t30 < 0 else "BULL"
+                        half = self.config.adaptive_bias_spread / 2.0
+                        bias_str = f" Bias:{bias_dir}(Y{'+'if t30<0 else '-'}{half:.2f}/N{'-'if t30<0 else '+'}{half:.2f})"
+
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
                     f"Mom:{momentum:+.2f} OFI:{ofi:+.2f} "
-                    f"{intensity:.0f}tps{trend_str}"
+                    f"{intensity:.0f}tps{trend_str}{bias_str}"
                 )
 
             n_pos = len(self._positions)
@@ -1986,6 +2002,9 @@ class MicroRunner:
                     "dampener_flat_factor": self.config.dampener_flat_factor,
                     "min_seconds_remaining": self.config.min_seconds_remaining,
                     "trend_bias_min_pct": self.config.trend_bias_min_pct,
+                    "adaptive_bias_enabled": self.config.adaptive_bias_enabled,
+                    "adaptive_bias_spread": self.config.adaptive_bias_spread,
+                    "adaptive_bias_min_move": self.config.adaptive_bias_min_move,
                 }
 
                 await apply_db_config(self.settings, self.db)
