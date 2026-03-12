@@ -1124,12 +1124,45 @@ class MicroRunner:
                 # Candidate detection: momentum near threshold but not crossing
                 abs_mom = abs(micro.momentum_signal)
                 threshold = self.config.entry_threshold
+                direction = "YES" if micro.momentum_signal > 0 else "NO"
                 if not current_pos and abs_mom >= threshold * 0.80 and abs_mom < threshold:
                     await self.research.log_candidate(snap, distance_to_threshold=threshold - abs_mom)
+                    if self.verbose:
+                        console.print(
+                            f"[dim cyan]CANDIDATE: {direction} Mom {micro.momentum_signal:+.2f} "
+                            f"({abs_mom/threshold:.0%} of threshold)[/dim cyan]"
+                        )
                 elif not current_pos and opp is None and self.strategy.last_no_trade_reason:
                     # Signal was above threshold but got blocked by a filter
                     reason = self.strategy.last_no_trade_reason
                     if reason != NoTradeReason.BELOW_THRESHOLD:
+                        # Build context string based on the reason
+                        ctx = ""
+                        if reason == NoTradeReason.FAILED_PERSISTENCE:
+                            start = self.strategy._entry_signal_start.get(symbol)
+                            if start:
+                                elapsed = time.time() - start
+                                ctx = f" ({elapsed:.1f}s/{self.config.entry_persistence_seconds:.1f}s)"
+                        elif reason == NoTradeReason.TREND_VETO:
+                            ctx = f" (5m: {micro.trend_5m:+.2%})"
+                        elif reason == NoTradeReason.ACCELERATION:
+                            prev = self.strategy._prev_momentum.get(symbol, 0.0)
+                            ctx = f" (prev: {prev:+.2f})"
+                        elif reason == NoTradeReason.PRICE_TO_BEAT:
+                            ctx = f" (window: {micro.price_change_pct:+.3%})"
+                        elif reason == NoTradeReason.PRICE_BAND:
+                            mp = market.yes_price if micro.momentum_signal > 0 else market.no_price
+                            ctx = f" (mkt: {mp:.2f})"
+                        elif reason == NoTradeReason.DEAD_MARKET:
+                            ctx = f" (YES: {market.yes_price:.2f})"
+                        elif reason == NoTradeReason.SPARSE_DATA:
+                            ctx = f" ({micro.flow_15s.total_count} trades)"
+
+                        if not self.quiet:
+                            console.print(
+                                f"[dim yellow]BLOCKED: {direction} Mom {micro.momentum_signal:+.2f} "
+                                f"→ {reason.value}{ctx}[/dim yellow]"
+                            )
                         await self.research.log_no_trade(snap, reason)
                     else:
                         await self.research.log_snapshot(snap)
