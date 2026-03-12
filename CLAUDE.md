@@ -237,6 +237,7 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `hold_threshold` (float, default 0, DISABLED) — was causing premature exits on momentum pauses. Trailing stop + exit_threshold handle all exits.
 - `entry_persistence_enabled` (bool, default true) — filter out sub-second momentum spikes
 - `entry_persistence_seconds` (float, default 2.0) — signal must sustain for 2 seconds in same direction (count-based was too fast at ~450ms)
+- `entry_persistence_count` (int, default 3) — DEPRECATED: use entry_persistence_seconds instead
 - `enable_flips` (bool, default false) — disabled by default, strong reversals just EXIT
 - `flip_threshold` (float, default 0.50) — only used if enable_flips=true
 - `flip_min_confidence` (float, default 0.50)
@@ -247,6 +248,9 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `force_exit_seconds` (float, default 8.0) — dump everything with <8s left in window
 - `trailing_stop_enabled` (bool, default true) — locks in profits on winners
 - `trailing_stop_pct` (float, default 0.12) — exit when price drops 12% from HWM. Was 0.25 (too loose, exited below entry)
+- `trailing_stop_min_profit_pct` (float, default 0.10) — only arm the trailing stop after price is 10% above entry (don't stop out on noise)
+- `trailing_stop_late_pct` (float, default 0.15) — tighter trailing stop in the last 90s of window
+- `trailing_stop_late_seconds` (float, default 90.0) — when to switch to the tighter trailing stop
 - `min_entry_price` (float, default 0.35) — avoid deep OTM positions with huge % swings
 - `max_entry_price` (float, default 0.65) — avoid overpaying near certainty
 - `max_position_per_trade` (float, default 0.03 = 3% of bankroll) — used if fixed_position_usd is 0
@@ -293,6 +297,7 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `chop_threshold` (float, default 3.0) — chop index above this triggers the boost (range/net_move ratio). Higher = more tolerant of chop
 - `chop_max_boost` (float, default 0.10) — max threshold boost applied in extreme chop. Effective threshold = base + boost
 - `chop_scale` (float, default 5.0) — chop index at which max_boost is fully applied. Linear scaling between chop_threshold and chop_scale
+- `acceleration_enabled` (bool, default true) — master toggle for acceleration filter (blocks entries when momentum is fading from a spike)
 - `acceleration_tolerance` (float, default 0.05) — how much momentum can fade between ticks and still pass the acceleration filter. 0.05 = strict (must be accelerating), 0.15 = loose (allows sustained signals that plateau)
 - `take_profit_enabled` (bool, default true) — exit immediately when our token price hits the target
 - `take_profit_price` (float, default 0.90) — take-profit trigger price. Prevents watching winners touch 0.90+ then selling on the way back down in the 70s-80s

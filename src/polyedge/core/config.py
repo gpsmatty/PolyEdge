@@ -299,6 +299,7 @@ class MicroSniperConfig(BaseModel):
     # Only enter when momentum is still building, not fading from a spike.
     # Tolerance = how much momentum can fade between ticks and still pass.
     # 0.05 = strict (must be accelerating), 0.15 = loose (allows sustained signals)
+    acceleration_enabled: bool = True              # Master toggle for acceleration filter
     acceleration_tolerance: float = 0.05           # Noise tolerance for acceleration check
 
     # Take-profit: exit immediately when market price hits target

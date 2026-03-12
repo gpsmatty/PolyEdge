@@ -387,6 +387,8 @@ class MicroSniperStrategy:
         prev = self._prev_momentum.get(micro.symbol, 0.0)
         self._prev_momentum[micro.symbol] = momentum
         tol = self.config.acceleration_tolerance
+        if not self.config.acceleration_enabled:
+            tol = 999.0  # Effectively disabled
         if is_bullish:
             # Bullish: current momentum should be >= previous (still rising)
             fade = prev - momentum
