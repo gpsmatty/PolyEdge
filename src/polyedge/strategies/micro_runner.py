@@ -1049,12 +1049,12 @@ class MicroRunner:
         if remaining <= 0:
             return
 
-        # Check trade cooldown for this market
-        last_trade_time = self._last_trade_log.get(market.condition_id, 0)
-        if time.time() - last_trade_time < self._trade_cooldown:
-            return
-
+        # Check trade cooldown for this market — only block NEW entries, never exits.
+        # A position must always be able to exit regardless of cooldown.
         current_pos = self._positions.get(market.condition_id)
+        last_trade_time = self._last_trade_log.get(market.condition_id, 0)
+        if not current_pos and time.time() - last_trade_time < self._trade_cooldown:
+            return
 
         # --- Trailing stop: update high water mark on every tick ---
         if current_pos and market.condition_id in self._position_info:
