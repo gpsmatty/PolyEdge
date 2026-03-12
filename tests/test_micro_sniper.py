@@ -1532,6 +1532,8 @@ class TestBookExitOverride:
         """Create fake BookIntelligence dicts."""
         from polyedge.data.book_analyzer import BookIntelligence
         yes_book = BookIntelligence(
+            market_id="test_market",
+            token_id="yes_token",
             imbalance_ratio=yes_imbalance,
             imbalance_5c=yes_imbalance,
             imbalance_10c=yes_imbalance,
@@ -1546,6 +1548,8 @@ class TestBookExitOverride:
             ask_wall_price=None,
         )
         no_book = BookIntelligence(
+            market_id="test_market",
+            token_id="no_token",
             imbalance_ratio=no_imbalance,
             imbalance_5c=no_imbalance,
             imbalance_10c=no_imbalance,
