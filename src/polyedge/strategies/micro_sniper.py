@@ -124,6 +124,10 @@ class MicroSniperStrategy:
         self._last_bias_adjustment: float = 0.0  # Adaptive bias applied to threshold
         self._last_accel_detail: str = ""  # Detail string for acceleration blocks
         self._last_chop_boost: float = 0.0  # Chop filter threshold boost
+        # Threshold breakdown — always updated on every eval for logging
+        self._last_effective_threshold: float = 0.0
+        self._last_threshold_base: float = 0.0
+        self._last_threshold_detail: str = ""  # Human-readable breakdown
 
     def evaluate(
         self,
@@ -354,6 +358,23 @@ class MicroSniperStrategy:
                     boost = chop_frac * self.config.chop_max_boost
                     effective_threshold += boost
                     self._last_chop_boost = boost
+
+        # Track threshold breakdown for logging/research
+        base_thr = self.config.counter_trend_threshold if is_counter_trend else self.config.entry_threshold
+        self._last_threshold_base = base_thr
+        self._last_effective_threshold = effective_threshold
+        parts = [f"base={base_thr:.2f}"]
+        if is_counter_trend and base_thr != self.config.entry_threshold:
+            parts[0] = f"ctr={base_thr:.2f}"
+        if self._last_bias_adjustment != 0:
+            parts.append(f"bias={self._last_bias_adjustment:+.2f}")
+        if self._last_chop_boost > 0:
+            parts.append(f"chop=+{self._last_chop_boost:.2f}")
+        # 5m trend boost (lives between counter_trend and adaptive bias)
+        trend_boost = effective_threshold - base_thr - self._last_bias_adjustment - self._last_chop_boost
+        if abs(trend_boost) > 0.001:
+            parts.append(f"trend=+{trend_boost:.2f}")
+        self._last_threshold_detail = f"{effective_threshold:.2f}({'+'.join(parts) if len(parts) > 1 else parts[0]})"
 
         # Need strong enough signal
         if abs_momentum < effective_threshold:

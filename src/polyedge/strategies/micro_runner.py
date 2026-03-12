@@ -1164,20 +1164,20 @@ class MicroRunner:
                             int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
                             ctx = f" ({int_30:.0f}tps > {self.config.high_intensity_max_tps:.0f} cap)"
                         elif reason == NoTradeReason.BELOW_THRESHOLD:
-                            bias_adj = self.strategy._last_bias_adjustment
-                            chop_boost = getattr(self.strategy, '_last_chop_boost', 0.0)
-                            parts = []
-                            if abs(bias_adj) > 0.001:
-                                parts.append(f"bias:{bias_adj:+.2f}")
-                            if chop_boost > 0.001:
-                                parts.append(f"chop:+{chop_boost:.2f}")
-                            if parts:
-                                ctx = f" ({', '.join(parts)})"
+                            thr_detail = getattr(self.strategy, '_last_threshold_detail', '')
+                            if thr_detail:
+                                ctx = f" (thr: {thr_detail})"
+
+                        # Always append threshold info for non-threshold blocks too
+                        thr_str = ""
+                        thr_detail = getattr(self.strategy, '_last_threshold_detail', '')
+                        if thr_detail and reason != NoTradeReason.BELOW_THRESHOLD:
+                            thr_str = f" | thr: {thr_detail}"
 
                         if not self.quiet:
                             console.print(
                                 f"[dim yellow]BLOCKED: {direction} Mom {micro.momentum_signal:+.2f} "
-                                f"→ {reason.value}{ctx}[/dim yellow]"
+                                f"→ {reason.value}{ctx}{thr_str}[/dim yellow]"
                             )
                         await self.research.log_no_trade(snap, reason)
                     else:
@@ -1252,11 +1252,9 @@ class MicroRunner:
             book_str = ""
             if self.config.poly_book_enabled and opp.poly_book_imbalance != 0:
                 book_str = f" | Book: {opp.poly_book_imbalance:+.2f}"
-            # Show adaptive bias adjustment if active
-            bias_adj = self.strategy._last_bias_adjustment
-            bias_str = f" | Bias:{bias_adj:+.2f}" if abs(bias_adj) > 0.001 else ""
-            chop_boost = getattr(self.strategy, '_last_chop_boost', 0.0)
-            chop_str = f" | Chop:+{chop_boost:.2f}" if chop_boost > 0.001 else ""
+            # Show threshold breakdown
+            thr_detail = getattr(self.strategy, '_last_threshold_detail', '')
+            thr_str = f" | Thr: {thr_detail}" if thr_detail else ""
             console.print(
                 f"[bold {action_color}]MICRO [{action_str}][/bold {action_color}] "
                 f"{opp.symbol.replace('usdt','').upper()} "
@@ -1265,7 +1263,7 @@ class MicroRunner:
                 f"| Mkt: {opp.market_price:.2f} ({price_source}) "
                 f"| ${opp.binance_price:,.2f} "
                 f"| {opp.seconds_remaining:.0f}s left"
-                f"{book_str}{bias_str}{chop_str}"
+                f"{book_str}{thr_str}"
             )
 
         # --- Research pipeline: log trade event with attribution ---
@@ -1587,6 +1585,10 @@ class MicroRunner:
                         "dampener_price_deadzone": self.config.dampener_price_deadzone,
                         "high_intensity_block_enabled": self.config.high_intensity_block_enabled,
                         "high_intensity_max_tps": self.config.high_intensity_max_tps,
+                        "chop_filter_enabled": self.config.chop_filter_enabled,
+                        "chop_threshold": self.config.chop_threshold,
+                        "acceleration_enabled": self.config.acceleration_enabled,
+                        "acceleration_tolerance": self.config.acceleration_tolerance,
                     }
                     # Compute bias direction at entry for performance tracking
                     bias_direction = "NEUTRAL"
@@ -1608,6 +1610,8 @@ class MicroRunner:
                         "bias_adjustment": round(bias_adj, 4),
                         "chop_index": round(micro.chop_index, 2) if micro else 0,
                         "chop_boost": round(getattr(self.strategy, '_last_chop_boost', 0.0), 4),
+                        "effective_threshold": round(getattr(self.strategy, '_last_effective_threshold', 0.0), 4),
+                        "threshold_detail": getattr(self.strategy, '_last_threshold_detail', ''),
                     }
                     await self.db.insert_trade({
                         "trade_id": order_id,
