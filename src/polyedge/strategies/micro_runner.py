@@ -1608,7 +1608,7 @@ class MicroRunner:
                         "seconds_remaining": round(opp.seconds_remaining, 1),
                         "bias_direction": bias_direction,
                         "bias_adjustment": round(bias_adj, 4),
-                        "chop_index": round(micro.chop_index, 2) if micro else 0,
+                        "chop_index": round(self.agg_feed.micro[opp.symbol].chop_index, 2) if opp.symbol in getattr(self.agg_feed, 'micro', {}) else 0,
                         "chop_boost": round(getattr(self.strategy, '_last_chop_boost', 0.0), 4),
                         "effective_threshold": round(getattr(self.strategy, '_last_effective_threshold', 0.0), 4),
                         "threshold_detail": getattr(self.strategy, '_last_threshold_detail', ''),
@@ -1960,10 +1960,19 @@ class MicroRunner:
                         # Approaching threshold — show in dim
                         chop_str = f" chop:{chop:.1f}"
 
+                # Threshold breakdown — entry always, exit only when in position
+                thr_str = ""
+                entry_thr = getattr(self.strategy, '_last_threshold_detail', '')
+                exit_thr = getattr(self.strategy, '_last_exit_threshold_detail', '')
+                if entry_thr:
+                    thr_str = f" Entry:{entry_thr}"
+                if exit_thr and len(self._positions) > 0:
+                    thr_str += f" {exit_thr}"
+
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
                     f"Mom:{momentum:+.2f} OFI:{ofi:+.2f} "
-                    f"{intensity:.0f}tps{trend_str}{bias_str}{chop_str}"
+                    f"{intensity:.0f}tps{trend_str}{bias_str}{chop_str}{thr_str}"
                 )
 
             n_pos = len(self._positions)
