@@ -248,6 +248,8 @@ class MicroSniperStrategy:
             abs_price_chg = abs(micro.price_change_pct)
             if int_30 < self.config.low_vol_max_intensity and abs_price_chg < self.config.low_vol_max_price_change:
                 self.last_no_trade_reason = NoTradeReason.LOW_VOL
+                self._entry_streak[micro.symbol] = 0
+                self._entry_signal_start.pop(micro.symbol, None)
                 return None
 
         # --- High intensity blocker ---
@@ -258,6 +260,8 @@ class MicroSniperStrategy:
             int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
             if int_30 > self.config.high_intensity_max_tps:
                 self.last_no_trade_reason = NoTradeReason.HIGH_INTENSITY
+                self._entry_streak[micro.symbol] = 0
+                self._entry_signal_start.pop(micro.symbol, None)
                 return None
 
         # --- 5-minute persistent trend bias ---
@@ -293,6 +297,8 @@ class MicroSniperStrategy:
                                 f"is too strong to fight[/dim red]"
                             )
                         self.last_no_trade_reason = NoTradeReason.TREND_VETO
+                        self._entry_streak[micro.symbol] = 0
+                        self._entry_signal_start.pop(micro.symbol, None)
                         return None
 
                     # Moderate trend = boost threshold
@@ -420,6 +426,8 @@ class MicroSniperStrategy:
             if fade > tol:
                 self.last_no_trade_reason = NoTradeReason.ACCELERATION
                 self._last_accel_detail = f"fade={fade:.2f} tol={tol:.2f}"
+                self._entry_streak[micro.symbol] = 0
+                self._entry_signal_start.pop(micro.symbol, None)
                 return None
         else:
             # Bearish: current momentum should be <= previous (still falling)
@@ -427,6 +435,8 @@ class MicroSniperStrategy:
             if fade > tol:
                 self.last_no_trade_reason = NoTradeReason.ACCELERATION
                 self._last_accel_detail = f"fade={fade:.2f} tol={tol:.2f}"
+                self._entry_streak[micro.symbol] = 0
+                self._entry_signal_start.pop(micro.symbol, None)
                 return None
         self._last_accel_detail = ""
 
@@ -444,10 +454,14 @@ class MicroSniperStrategy:
             if is_bullish and price_change < -block_threshold:
                 # Buying YES but BTC is below the open — fighting the window
                 self.last_no_trade_reason = NoTradeReason.PRICE_TO_BEAT
+                self._entry_streak[micro.symbol] = 0
+                self._entry_signal_start.pop(micro.symbol, None)
                 return None
             if not is_bullish and price_change > block_threshold:
                 # Buying NO but BTC is above the open — fighting the window
                 self.last_no_trade_reason = NoTradeReason.PRICE_TO_BEAT
+                self._entry_streak[micro.symbol] = 0
+                self._entry_signal_start.pop(micro.symbol, None)
                 return None
 
         if is_bullish:
@@ -462,6 +476,8 @@ class MicroSniperStrategy:
         # Don't buy if the market already prices in the direction heavily
         if market_price > self.config.max_entry_price:
             self.last_no_trade_reason = NoTradeReason.PRICE_BAND
+            self._entry_streak[micro.symbol] = 0
+            self._entry_signal_start.pop(micro.symbol, None)
             return None
 
         # Don't buy a side the market has nearly killed — if YES is at 4¢,
@@ -469,6 +485,8 @@ class MicroSniperStrategy:
         # override the entire window's price action.
         if market_price < self.config.min_entry_price:
             self.last_no_trade_reason = NoTradeReason.PRICE_BAND
+            self._entry_streak[micro.symbol] = 0
+            self._entry_signal_start.pop(micro.symbol, None)
             return None
 
         # Dead market filter — if YES is stuck near 0.50, the market isn't
@@ -478,6 +496,8 @@ class MicroSniperStrategy:
         band = self.config.dead_market_band
         if abs(yes_price - 0.50) < band:
             self.last_no_trade_reason = NoTradeReason.DEAD_MARKET
+            self._entry_streak[micro.symbol] = 0
+            self._entry_signal_start.pop(micro.symbol, None)
             return None
 
         # --- Polymarket order book checks (when poly_book_enabled) ---
@@ -499,6 +519,8 @@ class MicroSniperStrategy:
                         f"— no exit liquidity[/dim]"
                     )
                     self.last_no_trade_reason = NoTradeReason.BOOK_NO_LIQUIDITY
+                    self._entry_streak[micro.symbol] = 0
+                    self._entry_signal_start.pop(micro.symbol, None)
                     return None
 
             # 2. Book imbalance signal — use YES book imbalance as the
@@ -518,6 +540,8 @@ class MicroSniperStrategy:
                         f"< {self.config.poly_book_imbalance_veto:+.2f} — book disagrees[/dim]"
                     )
                     self.last_no_trade_reason = NoTradeReason.BOOK_VETO
+                    self._entry_streak[micro.symbol] = 0
+                    self._entry_signal_start.pop(micro.symbol, None)
                     return None
 
         # --- Entry persistence filter (time-based) ---
