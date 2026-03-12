@@ -1942,12 +1942,19 @@ class MicroRunner:
                     else:
                         bias_str = " Bias:NEUTRAL"
 
-                # Chop index indicator
+                # Chop index indicator — always show so you can monitor before enabling
                 chop_str = ""
-                if self.config.chop_filter_enabled:
-                    chop = micro.chop_index
+                chop = micro.chop_index
+                if chop > 0:
                     if chop > self.config.chop_threshold:
-                        chop_str = f" CHOP:{chop:.1f}"
+                        # Above threshold — would block/boost if filter enabled
+                        if self.config.chop_filter_enabled:
+                            chop_str = f" CHOP:{chop:.1f}"
+                        else:
+                            chop_str = f" chop:{chop:.1f}"  # lowercase = observing only
+                    elif chop > self.config.chop_threshold * 0.7:
+                        # Approaching threshold — show in dim
+                        chop_str = f" chop:{chop:.1f}"
 
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
