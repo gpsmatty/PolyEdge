@@ -38,6 +38,7 @@ from polyedge.core.config import Settings
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_aggtrade import MicroStructure, AggTrade
 from polyedge.data.book_analyzer import BookIntelligence
+from polyedge.data.research import NoTradeReason
 
 logger = logging.getLogger("polyedge.micro_sniper")
 console = Console()
@@ -117,6 +118,8 @@ class MicroSniperStrategy:
         self._entry_streak: dict[str, int] = {}       # symbol -> consecutive count (deprecated)
         self._entry_streak_dir: dict[str, bool] = {}  # symbol -> was_bullish
         self._entry_signal_start: dict[str, float] = {}  # symbol -> time.time() when signal started
+        # Last reason a potential entry was rejected (read by research logger)
+        self.last_no_trade_reason: NoTradeReason | None = None
 
     def evaluate(
         self,
@@ -142,6 +145,8 @@ class MicroSniperStrategy:
         Returns:
             MicroOpportunity if action should be taken, None otherwise.
         """
+        self.last_no_trade_reason = None  # Reset on each eval
+
         if not self.config.enabled:
             return None
 
@@ -257,6 +262,7 @@ class MicroSniperStrategy:
                                 f"5m trend {trend_5m:+.3%} ({'up' if trend_5m > 0 else 'down'}) "
                                 f"is too strong to fight[/dim red]"
                             )
+                        self.last_no_trade_reason = NoTradeReason.TREND_VETO
                         return None
 
                     # Moderate trend = boost threshold
@@ -292,6 +298,7 @@ class MicroSniperStrategy:
             self._prev_momentum[micro.symbol] = momentum
             self._entry_streak[micro.symbol] = 0  # Reset persistence
             self._entry_signal_start.pop(micro.symbol, None)  # Reset time-based persistence
+            self.last_no_trade_reason = NoTradeReason.BELOW_THRESHOLD
             return None
 
         # Need enough confidence
@@ -299,6 +306,7 @@ class MicroSniperStrategy:
             self._prev_momentum[micro.symbol] = momentum
             self._entry_streak[micro.symbol] = 0  # Reset persistence
             self._entry_signal_start.pop(micro.symbol, None)
+            self.last_no_trade_reason = NoTradeReason.CONFIDENCE_TOO_LOW
             return None
 
         # Need enough trade activity
@@ -306,6 +314,7 @@ class MicroSniperStrategy:
             self._prev_momentum[micro.symbol] = momentum
             self._entry_streak[micro.symbol] = 0  # Reset persistence
             self._entry_signal_start.pop(micro.symbol, None)
+            self.last_no_trade_reason = NoTradeReason.SPARSE_DATA
             return None
 
         # --- Acceleration filter ---
@@ -317,10 +326,12 @@ class MicroSniperStrategy:
         if is_bullish:
             # Bullish: current momentum should be >= previous (still rising)
             if momentum < prev - 0.05:  # Allow tiny dips (noise tolerance)
+                self.last_no_trade_reason = NoTradeReason.ACCELERATION
                 return None
         else:
             # Bearish: current momentum should be <= previous (still falling)
             if momentum > prev + 0.05:
+                self.last_no_trade_reason = NoTradeReason.ACCELERATION
                 return None
 
         # --- Price-to-beat filter ---
@@ -336,9 +347,11 @@ class MicroSniperStrategy:
 
             if is_bullish and price_change < -block_threshold:
                 # Buying YES but BTC is below the open — fighting the window
+                self.last_no_trade_reason = NoTradeReason.PRICE_TO_BEAT
                 return None
             if not is_bullish and price_change > block_threshold:
                 # Buying NO but BTC is above the open — fighting the window
+                self.last_no_trade_reason = NoTradeReason.PRICE_TO_BEAT
                 return None
 
         if is_bullish:
@@ -352,12 +365,14 @@ class MicroSniperStrategy:
 
         # Don't buy if the market already prices in the direction heavily
         if market_price > self.config.max_entry_price:
+            self.last_no_trade_reason = NoTradeReason.PRICE_BAND
             return None
 
         # Don't buy a side the market has nearly killed — if YES is at 4¢,
         # the market says 96% chance of NO. A 5-second OFI blip doesn't
         # override the entire window's price action.
         if market_price < self.config.min_entry_price:
+            self.last_no_trade_reason = NoTradeReason.PRICE_BAND
             return None
 
         # Dead market filter — if YES is stuck near 0.50, the market isn't
@@ -366,6 +381,7 @@ class MicroSniperStrategy:
         yes_price = market.yes_price
         band = self.config.dead_market_band
         if abs(yes_price - 0.50) < band:
+            self.last_no_trade_reason = NoTradeReason.DEAD_MARKET
             return None
 
         # --- Polymarket order book checks (when poly_book_enabled) ---
@@ -386,6 +402,7 @@ class MicroSniperStrategy:
                         f"{our_book.bid_depth_5c:.0f} < {self.config.poly_book_min_exit_depth:.0f} "
                         f"— no exit liquidity[/dim]"
                     )
+                    self.last_no_trade_reason = NoTradeReason.BOOK_NO_LIQUIDITY
                     return None
 
             # 2. Book imbalance signal — use YES book imbalance as the
@@ -404,6 +421,7 @@ class MicroSniperStrategy:
                         f"[dim]BOOK ENTRY VETO: imbalance {directional_imbalance:+.2f} "
                         f"< {self.config.poly_book_imbalance_veto:+.2f} — book disagrees[/dim]"
                     )
+                    self.last_no_trade_reason = NoTradeReason.BOOK_VETO
                     return None
 
         # --- Entry persistence filter (time-based) ---
@@ -427,6 +445,7 @@ class MicroSniperStrategy:
 
             elapsed = now - self._entry_signal_start[sym]
             if elapsed < self.config.entry_persistence_seconds:
+                self.last_no_trade_reason = NoTradeReason.FAILED_PERSISTENCE
                 return None  # Signal is real but hasn't persisted long enough
 
         return MicroOpportunity(
