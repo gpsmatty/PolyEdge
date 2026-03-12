@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS polyedge.trades (
     ai_probability FLOAT,
     config_snapshot JSONB,
     signal_data JSONB,
+    exit_reason TEXT DEFAULT '',
     opened_at TIMESTAMPTZ DEFAULT NOW(),
     closed_at TIMESTAMPTZ
 );
@@ -474,14 +475,14 @@ class Database:
             )
 
     async def close_trade_by_market(
-        self, market_id: str, exit_price: float, pnl: float
+        self, market_id: str, exit_price: float, pnl: float, exit_reason: str = ""
     ):
         """Close the most recent open trade for a market by condition_id."""
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE polyedge.trades
-                SET exit_price=$2, pnl=$3, status='CLOSED', closed_at=NOW()
+                SET exit_price=$2, pnl=$3, status='CLOSED', closed_at=NOW(), exit_reason=$4
                 WHERE trade_id = (
                     SELECT trade_id FROM polyedge.trades
                     WHERE market_id=$1 AND status='OPEN'
@@ -491,6 +492,7 @@ class Database:
                 market_id,
                 exit_price,
                 pnl,
+                exit_reason,
             )
 
     async def get_open_trades(self) -> list[dict]:
