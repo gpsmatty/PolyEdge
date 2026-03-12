@@ -374,20 +374,24 @@ class MicroSniperStrategy:
                     self._last_chop_boost = boost
 
         # Track threshold breakdown for logging/research
-        base_thr = self.config.counter_trend_threshold if is_counter_trend else self.config.entry_threshold
+        base_thr = self.config.entry_threshold  # Always use entry_threshold as base (30s is now gradual)
         self._last_threshold_base = base_thr
         self._last_effective_threshold = effective_threshold
-        # Build modifier list
+        # Build modifier list — show each contribution to the effective threshold
         mods = []
-        if is_counter_trend and base_thr != self.config.entry_threshold:
-            mods.append(f"ctr={base_thr:.2f}")
+        # 30s trend opposition (gradual scaling from entry_threshold toward counter_trend_threshold)
+        trend_30s_boost = opposition * (self.config.counter_trend_threshold - self.config.entry_threshold)
+        if trend_30s_boost > 0.001:
+            mods.append(f"30s+{trend_30s_boost:.2f}")
         if self._last_bias_adjustment != 0:
             mods.append(f"bias{self._last_bias_adjustment:+.2f}")
         if self._last_chop_boost > 0:
             mods.append(f"chop+{self._last_chop_boost:.2f}")
-        trend_boost = effective_threshold - base_thr - self._last_bias_adjustment - self._last_chop_boost
-        if abs(trend_boost) > 0.001:
-            mods.append(f"trend+{trend_boost:.2f}")
+        # 5m trend boost (anything left after accounting for known modifiers)
+        known_boosts = trend_30s_boost + self._last_bias_adjustment + self._last_chop_boost
+        trend_5m_boost = effective_threshold - base_thr - known_boosts
+        if abs(trend_5m_boost) > 0.001:
+            mods.append(f"trend+{trend_5m_boost:.2f}")
         if mods:
             self._last_threshold_detail = f"{base_thr:.2f}→{effective_threshold:.2f}({'+'.join(mods)})"
         else:
