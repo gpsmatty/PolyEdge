@@ -127,7 +127,8 @@ class MicroSniperStrategy:
         # Threshold breakdown — always updated on every eval for logging
         self._last_effective_threshold: float = 0.0
         self._last_threshold_base: float = 0.0
-        self._last_threshold_detail: str = ""  # Human-readable breakdown
+        self._last_threshold_detail: str = ""  # Human-readable breakdown (entry)
+        self._last_exit_threshold_detail: str = ""  # Human-readable breakdown (exit)
 
     def evaluate(
         self,
@@ -363,18 +364,21 @@ class MicroSniperStrategy:
         base_thr = self.config.counter_trend_threshold if is_counter_trend else self.config.entry_threshold
         self._last_threshold_base = base_thr
         self._last_effective_threshold = effective_threshold
-        parts = [f"base={base_thr:.2f}"]
+        # Build modifier list
+        mods = []
         if is_counter_trend and base_thr != self.config.entry_threshold:
-            parts[0] = f"ctr={base_thr:.2f}"
+            mods.append(f"ctr={base_thr:.2f}")
         if self._last_bias_adjustment != 0:
-            parts.append(f"bias={self._last_bias_adjustment:+.2f}")
+            mods.append(f"bias{self._last_bias_adjustment:+.2f}")
         if self._last_chop_boost > 0:
-            parts.append(f"chop=+{self._last_chop_boost:.2f}")
-        # 5m trend boost (lives between counter_trend and adaptive bias)
+            mods.append(f"chop+{self._last_chop_boost:.2f}")
         trend_boost = effective_threshold - base_thr - self._last_bias_adjustment - self._last_chop_boost
         if abs(trend_boost) > 0.001:
-            parts.append(f"trend=+{trend_boost:.2f}")
-        self._last_threshold_detail = f"{effective_threshold:.2f}({'+'.join(parts) if len(parts) > 1 else parts[0]})"
+            mods.append(f"trend+{trend_boost:.2f}")
+        if mods:
+            self._last_threshold_detail = f"{base_thr:.2f}→{effective_threshold:.2f}({'+'.join(mods)})"
+        else:
+            self._last_threshold_detail = f"{effective_threshold:.2f}"
 
         # Need strong enough signal
         if abs_momentum < effective_threshold:
@@ -754,6 +758,13 @@ class MicroSniperStrategy:
             self.config.counter_trend_exit_threshold if trend_agrees_with_position
             else self.config.exit_threshold
         )
+
+        # Track exit threshold for logging (separate from entry threshold)
+        base_exit = self.config.exit_threshold
+        if trend_agrees_with_position:
+            self._last_exit_threshold_detail = f"Exit:{base_exit:.2f}→{effective_exit_threshold:.2f}(30s_trend+{effective_exit_threshold - base_exit:.2f})"
+        else:
+            self._last_exit_threshold_detail = f"Exit:{effective_exit_threshold:.2f}"
 
         should_exit_reversal = not aligned and abs_momentum >= effective_exit_threshold
         should_exit_faded = aligned and abs_momentum < self.config.hold_threshold
