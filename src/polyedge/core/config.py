@@ -306,6 +306,44 @@ class MicroSniperConfig(BaseModel):
     take_profit_enabled: bool = True               # Master toggle
     take_profit_price: float = 0.90                # Exit when our token price >= this
 
+    # --- Per-timeframe overrides ---
+    # Maps timeframe keys ("5m", "15m", "1h", "1d") to partial config dicts.
+    # Only override fields that differ from the base config above.
+    # Example: {"15m": {"entry_threshold": 0.55, "max_trades_per_window": 8}}
+    # At runtime, the runner merges base + timeframe overrides for the active window.
+    # Set via DB: strategies.micro_sniper.timeframes.15m.entry_threshold = 0.55
+    timeframes: dict[str, dict] = Field(default_factory=dict)
+
+    def for_timeframe(self, duration_minutes: int | None) -> "MicroSniperConfig":
+        """Return a merged config for the given timeframe.
+
+        If duration_minutes matches a key in self.timeframes (e.g., 15 -> "15m",
+        60 -> "1h", 1440 -> "1d"), overlay those overrides onto the base config.
+        If no match or no overrides, returns self unchanged.
+        """
+        if not duration_minutes or not self.timeframes:
+            return self
+
+        # Build timeframe key: 5->5m, 15->15m, 60->1h, 1440->1d
+        if duration_minutes >= 1440:
+            tf_key = f"{duration_minutes // 1440}d"
+        elif duration_minutes >= 60:
+            tf_key = f"{duration_minutes // 60}h"
+        else:
+            tf_key = f"{duration_minutes}m"
+
+        overrides = self.timeframes.get(tf_key)
+        if not overrides:
+            return self
+
+        # Merge: base config dict + overrides (overrides win)
+        base = self.model_dump()
+        base.pop("timeframes", None)  # Don't nest timeframes inside the merged config
+        base.update(overrides)
+        merged = MicroSniperConfig(**base)
+        # Preserve the timeframes dict so hot-reload keeps working
+        merged.timeframes = self.timeframes
+        return merged
 
 
 class MarketMakerConfig(BaseModel):
@@ -451,6 +489,14 @@ def settings_to_db_dict(settings: Settings) -> dict[str, any]:
     for field, value in settings.strategies.weather_sniper.model_dump().items():
         config[f"strategies.weather_sniper.{field}"] = value
     for field, value in settings.strategies.micro_sniper.model_dump().items():
+        if field == "timeframes" and isinstance(value, dict):
+            # Serialize per-timeframe overrides as nested dot keys:
+            # strategies.micro_sniper.timeframes.15m.entry_threshold = 0.55
+            for tf_key, tf_overrides in value.items():
+                if isinstance(tf_overrides, dict):
+                    for tf_field, tf_value in tf_overrides.items():
+                        config[f"strategies.micro_sniper.timeframes.{tf_key}.{tf_field}"] = tf_value
+            continue
         config[f"strategies.micro_sniper.{field}"] = value
     for field, value in settings.strategies.market_maker.model_dump().items():
         config[f"strategies.market_maker.{field}"] = value
@@ -481,7 +527,21 @@ async def apply_db_config(settings: Settings, db) -> Settings:
             sub_parts = field.split(".", 1)
             strategy_name, strategy_field = sub_parts[0], sub_parts[1]
             strategy_obj = getattr(settings.strategies, strategy_name, None)
-            if strategy_obj and hasattr(strategy_obj, strategy_field):
+            if not strategy_obj:
+                continue
+
+            # Handle per-timeframe overrides:
+            # strategies.micro_sniper.timeframes.15m.entry_threshold = 0.55
+            if strategy_field.startswith("timeframes.") and hasattr(strategy_obj, "timeframes"):
+                tf_parts = strategy_field.split(".", 2)  # ["timeframes", "15m", "entry_threshold"]
+                if len(tf_parts) == 3:
+                    _, tf_key, tf_field = tf_parts
+                    if tf_key not in strategy_obj.timeframes:
+                        strategy_obj.timeframes[tf_key] = {}
+                    strategy_obj.timeframes[tf_key][tf_field] = value
+                continue
+
+            if hasattr(strategy_obj, strategy_field):
                 setattr(strategy_obj, strategy_field, value)
             continue
 
