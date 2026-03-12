@@ -293,6 +293,7 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `chop_threshold` (float, default 3.0) — chop index above this triggers the boost (range/net_move ratio). Higher = more tolerant of chop
 - `chop_max_boost` (float, default 0.10) — max threshold boost applied in extreme chop. Effective threshold = base + boost
 - `chop_scale` (float, default 5.0) — chop index at which max_boost is fully applied. Linear scaling between chop_threshold and chop_scale
+- `acceleration_tolerance` (float, default 0.05) — how much momentum can fade between ticks and still pass the acceleration filter. 0.05 = strict (must be accelerating), 0.15 = loose (allows sustained signals that plateau)
 - `take_profit_enabled` (bool, default true) — exit immediately when our token price hits the target
 - `take_profit_price` (float, default 0.90) — take-profit trigger price. Prevents watching winners touch 0.90+ then selling on the way back down in the 70s-80s
 

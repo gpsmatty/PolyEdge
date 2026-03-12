@@ -122,6 +122,8 @@ class MicroSniperStrategy:
         # Last reason a potential entry was rejected (read by research logger)
         self.last_no_trade_reason: NoTradeReason | None = None
         self._last_bias_adjustment: float = 0.0  # Adaptive bias applied to threshold
+        self._last_accel_detail: str = ""  # Detail string for acceleration blocks
+        self._last_chop_boost: float = 0.0  # Chop filter threshold boost
 
     def evaluate(
         self,
@@ -384,16 +386,22 @@ class MicroSniperStrategy:
         # This prevents buying at the top of an OFI spike.
         prev = self._prev_momentum.get(micro.symbol, 0.0)
         self._prev_momentum[micro.symbol] = momentum
+        tol = self.config.acceleration_tolerance
         if is_bullish:
             # Bullish: current momentum should be >= previous (still rising)
-            if momentum < prev - 0.05:  # Allow tiny dips (noise tolerance)
+            fade = prev - momentum
+            if fade > tol:
                 self.last_no_trade_reason = NoTradeReason.ACCELERATION
+                self._last_accel_detail = f"fade={fade:.2f} tol={tol:.2f}"
                 return None
         else:
             # Bearish: current momentum should be <= previous (still falling)
-            if momentum > prev + 0.05:
+            fade = momentum - prev
+            if fade > tol:
                 self.last_no_trade_reason = NoTradeReason.ACCELERATION
+                self._last_accel_detail = f"fade={fade:.2f} tol={tol:.2f}"
                 return None
+        self._last_accel_detail = ""
 
         # --- Price-to-beat filter ---
         # Don't buy the wrong side of a decided market. If BTC has moved

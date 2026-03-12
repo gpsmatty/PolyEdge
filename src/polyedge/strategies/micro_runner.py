@@ -1146,8 +1146,8 @@ class MicroRunner:
                         elif reason == NoTradeReason.TREND_VETO:
                             ctx = f" (5m: {micro.trend_5m:+.2%})"
                         elif reason == NoTradeReason.ACCELERATION:
-                            prev = self.strategy._prev_momentum.get(symbol, 0.0)
-                            ctx = f" (prev: {prev:+.2f})"
+                            detail = self.strategy._last_accel_detail
+                            ctx = f" ({detail})" if detail else ""
                         elif reason == NoTradeReason.PRICE_TO_BEAT:
                             ctx = f" (window: {micro.price_change_pct:+.3%})"
                         elif reason == NoTradeReason.PRICE_BAND:

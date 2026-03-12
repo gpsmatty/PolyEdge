@@ -295,6 +295,12 @@ class MicroSniperConfig(BaseModel):
     trailing_stop_late_pct: float = 0.15           # Tighter stop in last 90s of window
     trailing_stop_late_seconds: float = 90.0       # When to switch to the tighter stop
 
+    # --- Acceleration filter ---
+    # Only enter when momentum is still building, not fading from a spike.
+    # Tolerance = how much momentum can fade between ticks and still pass.
+    # 0.05 = strict (must be accelerating), 0.15 = loose (allows sustained signals)
+    acceleration_tolerance: float = 0.05           # Noise tolerance for acceleration check
+
     # Take-profit: exit immediately when market price hits target
     take_profit_enabled: bool = True               # Master toggle
     take_profit_price: float = 0.90                # Exit when our token price >= this
