@@ -214,6 +214,54 @@ CREATE TABLE IF NOT EXISTS polyedge.micro_price_log (
 
 CREATE INDEX IF NOT EXISTS idx_micro_price_log_symbol_time
     ON polyedge.micro_price_log(symbol, logged_at DESC);
+
+-- Research pipeline: signal snapshots, candidate events, no-trade reasons,
+-- regime tags, and attribution data. Schema version tracked per row.
+CREATE TABLE IF NOT EXISTS polyedge.signal_snapshots (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    schema_version INT NOT NULL DEFAULT 1,
+    session_id TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL,
+    market_id TEXT NOT NULL DEFAULT '',
+    event_type TEXT NOT NULL DEFAULT 'periodic',  -- periodic, candidate, trade, no_trade, threshold_cross, window_hop, gap_reset
+    -- Full feature vector stored as JSONB for flexibility.
+    -- Schema may evolve — version field lets backtests know which fields exist.
+    features JSONB NOT NULL DEFAULT '{}',
+    -- Denormalized columns for fast queries (extracted from features)
+    regime TEXT DEFAULT 'unknown',
+    dampened_momentum DOUBLE PRECISION DEFAULT 0,
+    btc_price DOUBLE PRECISION DEFAULT 0,
+    yes_price DOUBLE PRECISION DEFAULT 0,
+    seconds_remaining DOUBLE PRECISION DEFAULT 0,
+    trade_fired BOOLEAN DEFAULT FALSE,
+    trade_action TEXT DEFAULT '',
+    no_trade_reason TEXT DEFAULT 'none',
+    near_threshold BOOLEAN DEFAULT FALSE,
+    -- Outcome labels (filled in offline by label_outcomes command)
+    btc_move_5s DOUBLE PRECISION,   -- BTC price change 5s after snapshot
+    btc_move_10s DOUBLE PRECISION,
+    btc_move_20s DOUBLE PRECISION,
+    btc_move_30s DOUBLE PRECISION,
+    token_move_5s DOUBLE PRECISION,  -- YES/NO token price change 5s after
+    token_move_10s DOUBLE PRECISION,
+    token_move_20s DOUBLE PRECISION,
+    token_move_30s DOUBLE PRECISION,
+    max_favorable DOUBLE PRECISION,  -- Best price move in our direction within 30s
+    max_adverse DOUBLE PRECISION,    -- Worst price move against us within 30s
+    outcome_labeled BOOLEAN DEFAULT FALSE
+);
+
+-- Indexes for common research queries
+CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON polyedge.signal_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_ts ON polyedge.signal_snapshots(symbol, ts);
+CREATE INDEX IF NOT EXISTS idx_snapshots_session ON polyedge.signal_snapshots(session_id);
+CREATE INDEX IF NOT EXISTS idx_snapshots_event ON polyedge.signal_snapshots(event_type);
+CREATE INDEX IF NOT EXISTS idx_snapshots_regime ON polyedge.signal_snapshots(regime);
+CREATE INDEX IF NOT EXISTS idx_snapshots_trade ON polyedge.signal_snapshots(trade_fired) WHERE trade_fired = TRUE;
+CREATE INDEX IF NOT EXISTS idx_snapshots_candidate ON polyedge.signal_snapshots(near_threshold) WHERE near_threshold = TRUE;
+CREATE INDEX IF NOT EXISTS idx_snapshots_no_trade ON polyedge.signal_snapshots(no_trade_reason) WHERE no_trade_reason != 'none';
+CREATE INDEX IF NOT EXISTS idx_snapshots_unlabeled ON polyedge.signal_snapshots(outcome_labeled) WHERE outcome_labeled = FALSE;
 """
 
 
@@ -1077,4 +1125,153 @@ class Database:
                 WHERE logged_at < NOW() - ($1 || ' minutes')::INTERVAL
                 """,
                 str(keep_minutes),
+            )
+
+    # ------------------------------------------------------------------
+    # Research pipeline — signal snapshots
+    # ------------------------------------------------------------------
+
+    async def bulk_insert_snapshots(self, snapshots: list[dict]):
+        """Batch insert signal snapshots for the research pipeline.
+
+        Each snapshot dict must have keys matching the SignalSnapshot.to_dict() output.
+        The full feature vector is stored as JSONB; key fields are denormalized
+        into columns for fast queries.
+        """
+        if not snapshots:
+            return
+        rows = []
+        for s in snapshots:
+            rows.append((
+                s.get("symbol", ""),
+                s.get("market_id", ""),
+                s.get("event_type", "periodic"),
+                s.get("schema_version", 1),
+                s.get("session_id", ""),
+                json.dumps(s),  # full feature vector as JSONB
+                s.get("regime", "unknown"),
+                s.get("dampened_momentum", 0),
+                s.get("btc_price", 0),
+                s.get("yes_price", 0),
+                s.get("seconds_remaining", 0),
+                s.get("trade_fired", False),
+                s.get("trade_action", ""),
+                s.get("no_trade_reason", "none"),
+                s.get("near_threshold", False),
+            ))
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO polyedge.signal_snapshots
+                    (symbol, market_id, event_type, schema_version, session_id,
+                     features, regime, dampened_momentum, btc_price, yes_price,
+                     seconds_remaining, trade_fired, trade_action, no_trade_reason,
+                     near_threshold)
+                VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                """,
+                rows,
+            )
+
+    async def get_snapshots_for_labeling(self, limit: int = 1000) -> list[dict]:
+        """Get unlabeled snapshots for offline outcome labeling."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, ts, symbol, features
+                FROM polyedge.signal_snapshots
+                WHERE outcome_labeled = FALSE
+                ORDER BY ts ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+            return [dict(r) for r in rows]
+
+    async def label_snapshot_outcomes(self, labels: list[dict]):
+        """Batch update outcome labels on snapshots.
+
+        Each label dict: {id, btc_move_5s, btc_move_10s, btc_move_20s,
+                          btc_move_30s, token_move_5s, ..., max_favorable, max_adverse}
+        """
+        if not labels:
+            return
+        async with self.pool.acquire() as conn:
+            for label in labels:
+                await conn.execute(
+                    """
+                    UPDATE polyedge.signal_snapshots SET
+                        btc_move_5s = $2, btc_move_10s = $3,
+                        btc_move_20s = $4, btc_move_30s = $5,
+                        token_move_5s = $6, token_move_10s = $7,
+                        token_move_20s = $8, token_move_30s = $9,
+                        max_favorable = $10, max_adverse = $11,
+                        outcome_labeled = TRUE
+                    WHERE id = $1
+                    """,
+                    label["id"],
+                    label.get("btc_move_5s"), label.get("btc_move_10s"),
+                    label.get("btc_move_20s"), label.get("btc_move_30s"),
+                    label.get("token_move_5s"), label.get("token_move_10s"),
+                    label.get("token_move_20s"), label.get("token_move_30s"),
+                    label.get("max_favorable"), label.get("max_adverse"),
+                )
+
+    async def get_snapshot_stats(self) -> dict:
+        """Get research pipeline stats."""
+        async with self.pool.acquire() as conn:
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.signal_snapshots"
+            )
+            labeled = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.signal_snapshots WHERE outcome_labeled = TRUE"
+            )
+            trades = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.signal_snapshots WHERE trade_fired = TRUE"
+            )
+            candidates = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.signal_snapshots WHERE near_threshold = TRUE"
+            )
+            no_trade = await conn.fetchval(
+                "SELECT COUNT(*) FROM polyedge.signal_snapshots WHERE no_trade_reason != 'none'"
+            )
+            regimes = await conn.fetch(
+                """
+                SELECT regime, COUNT(*) as count
+                FROM polyedge.signal_snapshots
+                GROUP BY regime
+                ORDER BY count DESC
+                """
+            )
+            return {
+                "total_snapshots": total,
+                "labeled": labeled,
+                "unlabeled": total - labeled,
+                "trades": trades,
+                "candidates": candidates,
+                "no_trade_blocked": no_trade,
+                "regimes": {r["regime"]: r["count"] for r in regimes},
+            }
+
+    async def prune_snapshots(self, keep_hours: int = 72):
+        """Delete old snapshots to prevent unbounded growth.
+
+        Keeps trade events and candidate events longer (7 days).
+        """
+        async with self.pool.acquire() as conn:
+            # Periodic snapshots: keep for keep_hours
+            await conn.execute(
+                """
+                DELETE FROM polyedge.signal_snapshots
+                WHERE event_type = 'periodic'
+                AND ts < NOW() - ($1 || ' hours')::INTERVAL
+                """,
+                str(keep_hours),
+            )
+            # Trade and candidate events: keep for 7 days
+            await conn.execute(
+                """
+                DELETE FROM polyedge.signal_snapshots
+                WHERE event_type IN ('trade', 'candidate', 'no_trade')
+                AND ts < NOW() - INTERVAL '7 days'
+                """
             )
