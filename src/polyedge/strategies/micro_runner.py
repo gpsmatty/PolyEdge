@@ -2016,21 +2016,10 @@ class MicroRunner:
         while self.running:
             await asyncio.sleep(30)
             try:
+                # Snapshot ALL config fields so any change triggers a notification
                 old_config = {
-                    "entry_threshold": self.config.entry_threshold,
-                    "fixed_position_usd": self.config.fixed_position_usd,
-                    "vwap_drift_scale": self.config.vwap_drift_scale,
-                    "dampener_flat_factor": self.config.dampener_flat_factor,
-                    "min_seconds_remaining": self.config.min_seconds_remaining,
-                    "trend_bias_min_pct": self.config.trend_bias_min_pct,
-                    "adaptive_bias_enabled": self.config.adaptive_bias_enabled,
-                    "adaptive_bias_spread": self.config.adaptive_bias_spread,
-                    "adaptive_bias_min_move": self.config.adaptive_bias_min_move,
-                    "low_vol_block_enabled": self.config.low_vol_block_enabled,
-                    "low_vol_max_intensity": self.config.low_vol_max_intensity,
-                    "low_vol_max_price_change": self.config.low_vol_max_price_change,
-                    "high_intensity_block_enabled": self.config.high_intensity_block_enabled,
-                    "high_intensity_max_tps": self.config.high_intensity_max_tps,
+                    field: getattr(self.config, field)
+                    for field in self.config.model_fields
                 }
 
                 await apply_db_config(self.settings, self.db)
