@@ -231,6 +231,16 @@ class MicroSniperStrategy:
         """Check if we should open a new position."""
         abs_momentum = abs(momentum)
 
+        # --- Low volatility regime blocker ---
+        # When trade intensity is low and price isn't moving, momentum signals
+        # are noise. Data: 33% win rate, -18.68% avg move in low_vol regime.
+        if self.config.low_vol_block_enabled:
+            int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
+            abs_price_chg = abs(micro.price_change_pct)
+            if int_30 < self.config.low_vol_max_intensity and abs_price_chg < self.config.low_vol_max_price_change:
+                self.last_no_trade_reason = NoTradeReason.LOW_VOL
+                return None
+
         # --- 5-minute persistent trend bias ---
         # The macro trend from the 5-minute rolling window (persists across
         # window hops and restarts via DB). If BTC has been trending up for

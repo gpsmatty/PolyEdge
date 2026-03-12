@@ -1157,6 +1157,9 @@ class MicroRunner:
                             ctx = f" (YES: {market.yes_price:.2f})"
                         elif reason == NoTradeReason.SPARSE_DATA:
                             ctx = f" ({micro.flow_15s.total_count} trades)"
+                        elif reason == NoTradeReason.LOW_VOL:
+                            int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
+                            ctx = f" (int:{int_30:.1f}tps, Δ:{micro.price_change_pct:+.4%})"
                         elif reason == NoTradeReason.BELOW_THRESHOLD:
                             bias_adj = self.strategy._last_bias_adjustment
                             if abs(bias_adj) > 0.001:
@@ -2005,6 +2008,9 @@ class MicroRunner:
                     "adaptive_bias_enabled": self.config.adaptive_bias_enabled,
                     "adaptive_bias_spread": self.config.adaptive_bias_spread,
                     "adaptive_bias_min_move": self.config.adaptive_bias_min_move,
+                    "low_vol_block_enabled": self.config.low_vol_block_enabled,
+                    "low_vol_max_intensity": self.config.low_vol_max_intensity,
+                    "low_vol_max_price_change": self.config.low_vol_max_price_change,
                 }
 
                 await apply_db_config(self.settings, self.db)

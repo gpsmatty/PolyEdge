@@ -59,7 +59,7 @@ async def _label(limit: int):
                 """
                 SELECT id, ts, symbol, features
                 FROM polyedge.signal_snapshots
-                WHERE ts >= $1 AND ts <= $2 + INTERVAL '60 seconds'
+                WHERE ts >= $1 AND ts <= ($2::timestamptz + INTERVAL '60 seconds')
                 ORDER BY ts ASC
                 """,
                 min_ts, max_ts,

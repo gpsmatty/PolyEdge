@@ -45,11 +45,12 @@ class Regime(str, Enum):
     Computed deterministically from stored features.
     Must be stable — don't mutate definitions after bad sessions.
     """
-    TREND_UP = "trend_up"           # 5m trend > +0.15%
-    TREND_DOWN = "trend_down"       # 5m trend < -0.15%
-    CHOP = "chop"                   # Small 5m trend + high flip frequency
+    TREND_UP = "trend_up"           # 5m trend > +0.08%
+    TREND_DOWN = "trend_down"       # 5m trend < -0.08%
+    CHOP = "chop"                   # Moderate activity + frequent OFI flips
     VOL_EXPANSION = "vol_expansion" # Intensity surge + wide price swings
     LOW_VOL = "low_vol"             # Low intensity + tight range
+    NORMAL = "normal"               # Active market, no strong trend or chop
     UNKNOWN = "unknown"             # Not enough data
 
 
@@ -78,19 +79,23 @@ def classify_regime(
     if intensity_30s > 0 and intensity_5s / intensity_30s > 2.0 and abs(price_change_pct) > 0.002:
         return Regime.VOL_EXPANSION
 
-    # Trend: clear 5-minute directional move
-    if abs_trend > 0.0015:  # >0.15% in 5 min
+    # Trend: 5-minute directional move (lowered from 0.15% to 0.08%)
+    if abs_trend > 0.0008:
         return Regime.TREND_UP if trend_5m > 0 else Regime.TREND_DOWN
 
-    # Chop: small trend + frequent OFI direction flips
-    if ofi_flip_count_30s >= 4 and abs_trend < 0.001:
+    # Chop: frequent OFI direction flips (lowered from 4 to 3 flips)
+    if ofi_flip_count_30s >= 3:
         return Regime.CHOP
 
     # Low vol: low intensity + tight range
     if intensity_30s < 5.0 and abs(price_change_pct) < 0.0005:
         return Regime.LOW_VOL
 
-    # Default: not enough signal to classify
+    # Normal: active market, no strong trend or chop signal
+    if intensity_30s >= 5.0:
+        return Regime.NORMAL
+
+    # Default: not enough data to classify
     return Regime.UNKNOWN
 
 
@@ -119,6 +124,7 @@ class NoTradeReason(str, Enum):
     WARMUP = "warmup"                      # Waiting for fresh window
     FOK_REJECTED = "fok_rejected"          # FOK order couldn't fill
     SPARSE_DATA = "sparse_data"            # Not enough trades in window
+    LOW_VOL = "low_vol"                    # Low volatility regime — momentum is noise
     NONE = "none"                          # Trade was taken (no block)
 
 
@@ -553,6 +559,10 @@ class ResearchLogger:
         snap.trade_action = trade_action
         snap.attribution = attribution
         snap.no_trade_reason = NoTradeReason.NONE.value
+        # Ensure current_position reflects the trade side for entries
+        # (build_snapshot sets it from pre-trade state, which is empty for new entries)
+        if not snap.current_position and trade_side:
+            snap.current_position = trade_side
         self._total_trades += 1
         await self.log_snapshot(snap)
 

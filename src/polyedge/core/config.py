@@ -261,6 +261,14 @@ class MicroSniperConfig(BaseModel):
     adaptive_bias_lookback_minutes: float = 30.0  # How far back to compute the macro trend
     adaptive_bias_min_move: float = 0.003         # 0.30% min move to trigger bias (below = neutral, no adjustment)
 
+    # --- Low volatility regime blocker ---
+    # When market is dead (low trade intensity + tight price range), momentum
+    # signals are pure noise. Data shows 33% win rate, -18.68% avg move.
+    # Block entries entirely when the regime classifier tags "low_vol".
+    low_vol_block_enabled: bool = True            # Master toggle for low_vol entry block
+    low_vol_max_intensity: float = 5.0            # Max trades/sec (30s window) to be "low vol"
+    low_vol_max_price_change: float = 0.0005      # Max abs price change (fractional) to be "low vol"
+
     # --- Trailing stop loss ---
     # Tracks the high water mark (HWM) of our side's price since entry.
     # If price drops trailing_stop_pct from the HWM, trigger an exit.

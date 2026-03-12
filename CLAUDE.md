@@ -284,6 +284,9 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `adaptive_bias_spread` (float, default 0.10) — total spread between favorable/unfavorable side (±0.05 each)
 - `adaptive_bias_lookback_minutes` (float, default 30.0) — how far back to compute macro trend from micro_price_log
 - `adaptive_bias_min_move` (float, default 0.003) — 0.30% min price change to trigger bias (below = neutral)
+- `low_vol_block_enabled` (bool, default true) — block entries when regime is low volatility (33% win rate in data)
+- `low_vol_max_intensity` (float, default 5.0) — max trades/sec (30s window) to be considered "low vol"
+- `low_vol_max_price_change` (float, default 0.0005) — max abs price change (fractional) to be "low vol"
 
 ### Polymarket Order Book Integration (Micro Sniper)
 
