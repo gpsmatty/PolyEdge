@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -84,7 +84,7 @@ class Market(BaseModel):
     def hours_to_resolution(self) -> float | None:
         if not self.end_date:
             return None
-        delta = self.end_date - datetime.now(UTC)
+        delta = self.end_date - datetime.now(timezone.utc)
         return max(delta.total_seconds() / 3600, 0)
 
 
@@ -98,7 +98,7 @@ class OrderBook(BaseModel):
     token_id: str
     bids: list[OrderBookLevel] = Field(default_factory=list)
     asks: list[OrderBookLevel] = Field(default_factory=list)
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def best_bid(self) -> float | None:
@@ -133,7 +133,7 @@ class Signal(BaseModel):
     strategy: str = ""
     ai_probability: Optional[float] = None
     suggested_size_usd: float = 0.0
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class Order(BaseModel):
@@ -150,8 +150,8 @@ class Order(BaseModel):
     status: OrderStatus = OrderStatus.PENDING
     filled_size: float = 0.0
     filled_avg_price: float = 0.0
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     strategy: str = ""
 
 
@@ -168,7 +168,7 @@ class Position(BaseModel):
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     strategy: str = ""
-    opened_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def cost_basis(self) -> float:
@@ -201,7 +201,7 @@ class Trade(BaseModel):
     strategy: str = ""
     reasoning: str = ""
     ai_probability: Optional[float] = None
-    opened_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     closed_at: Optional[datetime] = None
 
 
@@ -219,7 +219,7 @@ class AIAnalysis(BaseModel):
     model: str = ""
     cost_usd: float = 0.0
     cached: bool = False
-    analyzed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    analyzed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class PortfolioSnapshot(BaseModel):
@@ -234,7 +234,7 @@ class PortfolioSnapshot(BaseModel):
     peak_bankroll: float = 0.0
     drawdown_pct: float = 0.0
     ai_cost_today: float = 0.0
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def exposure_pct(self) -> float:

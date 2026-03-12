@@ -1,6 +1,6 @@
 """Tests for Cheap Event Hunter strategy."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from polyedge.core.config import load_config
 from polyedge.core.models import Market, Side
@@ -15,7 +15,7 @@ def make_market(**kwargs) -> Market:
         "no_price": 0.95,
         "volume": 10000,
         "liquidity": 5000,
-        "end_date": datetime.now(UTC) + timedelta(days=7),
+        "end_date": datetime.now(timezone.utc) + timedelta(days=7),
         "clob_token_ids": ["token-yes", "token-no"],
     }
     defaults.update(kwargs)
@@ -24,6 +24,8 @@ def make_market(**kwargs) -> Market:
 
 def get_strategy() -> CheapHunterStrategy:
     settings = load_config()
+    # Enable cheap_hunter for testing (disabled by default due to false positives)
+    settings.strategies.cheap_hunter.enabled = True
     return CheapHunterStrategy(settings)
 
 
@@ -66,7 +68,7 @@ def test_ignores_near_resolution():
     strategy = get_strategy()
     market = make_market(
         yes_price=0.05,
-        end_date=datetime.now(UTC) + timedelta(hours=1),
+        end_date=datetime.now(timezone.utc) + timedelta(hours=1),
     )
     signal = strategy.evaluate(market)
     assert signal is None

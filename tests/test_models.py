@@ -1,6 +1,6 @@
 """Tests for data models."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from polyedge.core.models import (
     Market,
@@ -20,7 +20,7 @@ def test_market_properties():
         yes_price=0.65,
         no_price=0.35,
         clob_token_ids=["yes-token", "no-token"],
-        end_date=datetime.now(UTC) + timedelta(hours=48),
+        end_date=datetime.now(timezone.utc) + timedelta(hours=48),
     )
     assert m.yes_token_id == "yes-token"
     assert m.no_token_id == "no-token"
