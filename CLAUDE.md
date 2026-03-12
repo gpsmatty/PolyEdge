@@ -301,6 +301,34 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `acceleration_tolerance` (float, default 0.05) — how much momentum can fade between ticks and still pass the acceleration filter. 0.05 = strict (must be accelerating), 0.15 = loose (allows sustained signals that plateau)
 - `take_profit_enabled` (bool, default true) — exit immediately when our token price hits the target
 - `take_profit_price` (float, default 0.90) — take-profit trigger price. Prevents watching winners touch 0.90+ then selling on the way back down in the 70s-80s
+- `timeframes` (dict[str, dict], default {}) — per-timeframe config overrides. Maps timeframe keys ("5m", "15m", "1h", "1d") to partial config dicts. Only override fields that differ from the base config. At runtime, the runner merges base + timeframe overrides for the active window duration. Set via DB: `strategies.micro_sniper.timeframes.15m.entry_threshold = 0.55`. Hot-reloadable every 30s.
+
+### Per-Timeframe Config System
+
+The micro sniper supports different config values per window duration (5m, 15m, 1h, 1d). The base config applies to all timeframes. Per-timeframe overrides only need to specify fields that differ.
+
+**How it works:**
+1. Base config is loaded normally from DB/YAML (`strategies.micro_sniper.*`)
+2. Timeframe overrides are stored as nested dict: `strategies.micro_sniper.timeframes.<tf>.<field>`
+3. When the runner starts with `--market "btc 15m"`, it detects the 15m duration and calls `config.for_timeframe(15)` which merges base + 15m overrides
+4. The merged config is pushed to the strategy and used for all decisions
+5. Hot-reload re-merges after every DB refresh (every 30s)
+
+**Setting per-timeframe config:**
+```bash
+# Set 1h-specific overrides
+polyedge config set strategies.micro_sniper.timeframes.1h.entry_threshold 0.45
+polyedge config set strategies.micro_sniper.timeframes.1h.min_seconds_remaining 300.0
+
+# Set 15m-specific overrides
+polyedge config set strategies.micro_sniper.timeframes.15m.entry_threshold 0.55
+polyedge config set strategies.micro_sniper.timeframes.15m.max_trades_per_window 8
+
+# Base config still applies to all unoverridden fields
+polyedge config set strategies.micro_sniper.exit_threshold 0.20
+```
+
+**Timeframe key mapping:** 5 min → "5m", 15 min → "15m", 60 min → "1h", 1440 min → "1d"
 
 ### Polymarket Order Book Integration (Micro Sniper)
 
