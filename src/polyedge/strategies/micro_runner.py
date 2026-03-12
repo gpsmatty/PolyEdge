@@ -142,14 +142,16 @@ class MicroRunner:
                 pat = r'(?:^|[\s\-–,])' + re.escape(w) + r'(?:[\s\-–,]|$)'
             self._filter_patterns.append(re.compile(pat, re.IGNORECASE))
 
-        # Config
-        self.config = settings.strategies.micro_sniper
+        # Config — base config from DB/YAML, effective config merges timeframe overrides
+        self._base_config = settings.strategies.micro_sniper
+        self.config = self._base_config.for_timeframe(self._duration_filter_minutes)
 
         # Lock to prevent concurrent _quick_sync calls (refresh loop + hop can race)
         self._sync_lock = asyncio.Lock()
 
-        # Strategy
+        # Strategy — push the effective (timeframe-merged) config
         self.strategy = MicroSniperStrategy(settings)
+        self.strategy.config = self.config
 
         # Execution engine — instantiate once, not per-trade
         from polyedge.execution.engine import ExecutionEngine
@@ -418,6 +420,16 @@ class MicroRunner:
             f"Price range: {self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}[/dim]"
         )
         filter_str = f" | Filter: '{self.market_filter}'" if self.market_filter else ""
+        if self._duration_filter_minutes and self._base_config.timeframes:
+            tf_key = self._base_config.for_timeframe(self._duration_filter_minutes)
+            # Show which timeframe overrides are active
+            _tf_keys = list(self._base_config.timeframes.keys())
+            _active = f"{self._duration_filter_minutes}m" if self._duration_filter_minutes < 60 else f"{self._duration_filter_minutes // 60}h"
+            if _active in self._base_config.timeframes:
+                _n = len(self._base_config.timeframes[_active])
+                console.print(f"[bold cyan]Timeframe config: {_active} ({_n} overrides active)[/bold cyan]")
+            else:
+                console.print(f"[dim]Timeframe config: {_active} (using base defaults, available: {_tf_keys})[/dim]")
         console.print(
             f"[dim]Feed: Binance aggTrade (~10-50 tps) + Polymarket WS{filter_str}[/dim]"
         )
@@ -2060,6 +2072,11 @@ class MicroRunner:
                 }
 
                 await apply_db_config(self.settings, self.db)
+
+                # Re-merge timeframe overrides (base config was updated by apply_db_config)
+                self._base_config = self.settings.strategies.micro_sniper
+                self.config = self._base_config.for_timeframe(self._duration_filter_minutes)
+                self.strategy.config = self.config
 
                 # Push updated score-shaping params to MicroStructure instances
                 for micro in self.agg_feed.micro.values():
