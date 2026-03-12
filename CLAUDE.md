@@ -289,6 +289,10 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `low_vol_max_price_change` (float, default 0.0005) — max abs price change (fractional) to be "low vol"
 - `high_intensity_block_enabled` (bool, default true) — block entries when 30s trade intensity exceeds cap. Data: losers avg ~61 tps vs winners ~40 tps
 - `high_intensity_max_tps` (float, default 50.0) — max trades/sec (30s window) to allow entry. Above this = chaotic book, signals unreliable
+- `chop_filter_enabled` (bool, default true) — auto-raise entry threshold when market is choppy (big range, no direction). Uses 5m price range vs net movement
+- `chop_threshold` (float, default 3.0) — chop index above this triggers the boost (range/net_move ratio). Higher = more tolerant of chop
+- `chop_max_boost` (float, default 0.10) — max threshold boost applied in extreme chop. Effective threshold = base + boost
+- `chop_scale` (float, default 5.0) — chop index at which max_boost is fully applied. Linear scaling between chop_threshold and chop_scale
 - `take_profit_enabled` (bool, default true) — exit immediately when our token price hits the target
 - `take_profit_price` (float, default 0.90) — take-profit trigger price. Prevents watching winners touch 0.90+ then selling on the way back down in the 70s-80s
 
