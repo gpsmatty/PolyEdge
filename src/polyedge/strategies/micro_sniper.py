@@ -769,24 +769,29 @@ class MicroSniperStrategy:
                         )
 
         # --- EXIT: momentum reversed ---
-        # 30s trend filter for exits — mirrors entry logic. If the 30s trend
-        # still agrees with our position, require a higher exit threshold.
-        # This prevents brief 5s/15s spikes from ejecting us when the broader
-        # move still favours our side.
+        # 30s trend exit protection — GRADUAL scaling instead of binary flip.
+        # The exit threshold scales smoothly between base (exit_threshold) and
+        # max (counter_trend_exit_threshold) based on how strongly the 30s OFI
+        # agrees with our position. This prevents a tiny OFI blip from instantly
+        # dropping all protection and dumping a winner.
+        #
+        # directional_ofi: +1.0 = 30s trend strongly agrees with our position
+        #                   0.0 = neutral
+        #                  -1.0 = 30s trend strongly disagrees
+        # Protection ramps from 0 at ofi=0 to full at ofi>=0.30
         trend_ofi = micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0
-        trend_agrees_with_position = (
-            (holding_yes and trend_ofi > 0.05) or
-            (not holding_yes and trend_ofi < -0.05)
-        )
-        effective_exit_threshold = (
-            self.config.counter_trend_exit_threshold if trend_agrees_with_position
-            else self.config.exit_threshold
-        )
+        # Flip sign so positive = agrees with our position
+        directional_ofi = trend_ofi if holding_yes else -trend_ofi
+        # Scale: 0 at ofi<=0, full protection at ofi>=0.30, linear between
+        trend_strength = max(0.0, min(1.0, directional_ofi / 0.30))
+        base_exit = self.config.exit_threshold
+        max_exit = self.config.counter_trend_exit_threshold
+        effective_exit_threshold = base_exit + trend_strength * (max_exit - base_exit)
 
         # Track exit threshold for logging (separate from entry threshold)
-        base_exit = self.config.exit_threshold
-        if trend_agrees_with_position:
-            self._last_exit_threshold_detail = f"Exit:{base_exit:.2f}→{effective_exit_threshold:.2f}(30s_trend+{effective_exit_threshold - base_exit:.2f})"
+        if trend_strength > 0.01:
+            boost = effective_exit_threshold - base_exit
+            self._last_exit_threshold_detail = f"Exit:{base_exit:.2f}→{effective_exit_threshold:.2f}(30s_trend+{boost:.2f}@{trend_strength:.0%})"
         else:
             self._last_exit_threshold_detail = f"Exit:{effective_exit_threshold:.2f}"
 
