@@ -1972,14 +1972,52 @@ class MicroRunner:
                         # Approaching threshold — show in dim
                         chop_str = f" chop:{chop:.1f}"
 
-                # Threshold breakdown — entry always, exit only when in position
+                # Threshold breakdown — show both sides with gap to momentum
                 thr_str = ""
-                entry_thr = getattr(self.strategy, '_last_threshold_detail', '')
-                exit_thr = getattr(self.strategy, '_last_exit_threshold_detail', '')
-                if entry_thr:
-                    thr_str = f" Entry:{entry_thr}"
-                if exit_thr and len(self._positions) > 0:
-                    thr_str += f" {exit_thr}"
+                abs_mom = abs(momentum)
+                if len(self._positions) > 0:
+                    # In position: show exit threshold + gap
+                    exit_thr = getattr(self.strategy, '_last_exit_threshold_detail', '')
+                    if exit_thr:
+                        entry_thr = getattr(self.strategy, '_last_threshold_detail', '')
+                        thr_str = f" Entry:{entry_thr} {exit_thr}"
+                else:
+                    # Flat: compute both YES and NO effective thresholds
+                    base = self.config.entry_threshold
+                    ctr = self.config.counter_trend_threshold
+                    trend_ofi = micro.flow_30s.ofi if micro.flow_30s.is_active else 0.0
+
+                    # YES side: trend_ofi positive = with us, negative = against
+                    yes_opposition = max(0.0, min(1.0, -trend_ofi / 0.30))
+                    yes_thr = base + yes_opposition * (ctr - base)
+                    # Add bias
+                    if self.config.adaptive_bias_enabled:
+                        t30 = micro.trend_lookback(self.config.adaptive_bias_lookback_minutes)
+                        if abs(t30) >= self.config.adaptive_bias_min_move:
+                            half = self.config.adaptive_bias_spread / 2.0
+                            yes_thr += half if t30 < 0 else -half
+                    yes_gap = yes_thr - abs_mom if momentum > 0 else yes_thr + momentum  # gap to threshold
+
+                    # NO side: trend_ofi negative = with us, positive = against
+                    no_opposition = max(0.0, min(1.0, trend_ofi / 0.30))
+                    no_thr = base + no_opposition * (ctr - base)
+                    if self.config.adaptive_bias_enabled:
+                        t30 = micro.trend_lookback(self.config.adaptive_bias_lookback_minutes)
+                        if abs(t30) >= self.config.adaptive_bias_min_move:
+                            half = self.config.adaptive_bias_spread / 2.0
+                            no_thr += -half if t30 < 0 else half
+                    no_gap = no_thr - abs_mom if momentum < 0 else no_thr + momentum
+
+                    # Show: Y:0.52(gap 0.20) N:0.58(gap 0.26) — lower gap = closer to firing
+                    yes_gap_val = yes_thr - abs_mom if momentum >= 0 else yes_thr - 0  # when bearish, YES is far
+                    no_gap_val = no_thr - abs_mom if momentum <= 0 else no_thr - 0
+
+                    if momentum >= 0:
+                        # Bullish momentum — YES gap is meaningful, NO is dormant
+                        thr_str = f" Y:{yes_thr:.2f}(gap {yes_thr - abs_mom:+.2f}) N:{no_thr:.2f}"
+                    else:
+                        # Bearish momentum — NO gap is meaningful, YES is dormant
+                        thr_str = f" Y:{yes_thr:.2f} N:{no_thr:.2f}(gap {no_thr - abs_mom:+.2f})"
 
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
