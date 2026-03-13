@@ -28,6 +28,7 @@ from polyedge.strategies.micro_sniper import MicroSniperStrategy, MicroAction, M
 from polyedge.core.config import Settings, MicroSniperConfig
 from polyedge.core.models import Market, Side
 from polyedge.data.binance_aggtrade import MicroStructure, AggTrade, TradeFlowWindow
+from polyedge.data.research import NoTradeReason
 
 
 # ── Helpers ──
@@ -155,6 +156,58 @@ def make_strategy(**config_overrides) -> MicroSniperStrategy:
     s = make_settings(**config_overrides)
     strategy = MicroSniperStrategy(s)
     return strategy
+
+
+# Default overrides to disable ALL filters — use as base for single-filter tests.
+# Each test re-enables only the filter it's testing.
+ALL_FILTERS_OFF = dict(
+    trend_bias_enabled=False,
+    adaptive_bias_enabled=False,
+    chop_filter_enabled=False,
+    acceleration_enabled=False,
+    low_vol_block_enabled=False,
+    high_intensity_block_enabled=False,
+    entry_persistence_enabled=False,
+    dead_market_band=0.0,
+    min_entry_price=0.01,
+    max_entry_price=0.99,
+    poly_book_enabled=False,
+    trailing_stop_enabled=False,
+    take_profit_enabled=False,
+    enable_flips=False,
+    entry_threshold=0.30,    # Low so strong signals pass by default
+    min_confidence=0.10,
+    min_trades_in_window=1,
+)
+
+
+def make_clean_strategy(**single_filter_overrides) -> MicroSniperStrategy:
+    """Create a strategy with ALL filters off, then apply specific overrides.
+
+    Use this to test individual filters in isolation.
+    """
+    combined = {**ALL_FILTERS_OFF, **single_filter_overrides}
+    return make_strategy(**combined)
+
+
+def make_book_intel(
+    yes_bid_depth=50.0, yes_imbalance=0.0,
+    no_bid_depth=50.0, no_imbalance=0.0,
+) -> dict:
+    """Create a mock BookIntelligence dict for testing poly book filters."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class MockBookIntel:
+        market_id: str = "test"
+        token_id: str = "test"
+        bid_depth_5c: float = 50.0
+        imbalance_5c: float = 0.0
+
+    return {
+        "yes": MockBookIntel(bid_depth_5c=yes_bid_depth, imbalance_5c=yes_imbalance),
+        "no": MockBookIntel(bid_depth_5c=no_bid_depth, imbalance_5c=no_imbalance),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -948,3 +1001,1008 @@ class TestThresholdLogging:
         detail = strategy._last_exit_threshold_detail
         assert "30s_trend" in detail
         assert "%" in detail  # Shows strength percentage
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Low Volatility Blocker
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestLowVolBlocker:
+    """Verify low_vol_block_enabled filter works correctly."""
+
+    def test_low_vol_blocks_entry(self):
+        """Low intensity + low price change → blocked."""
+        strategy = make_clean_strategy(
+            low_vol_block_enabled=True,
+            low_vol_max_intensity=5.0,
+            low_vol_max_price_change=0.0005,
+        )
+        # Low trade intensity and tiny price move
+        micro = make_micro_with_momentum("bullish", 0.8, n_trades=5, price_change_pct=0.0001)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.LOW_VOL
+
+    def test_low_vol_allows_when_intensity_high(self):
+        """High trade intensity → not low vol, entry allowed."""
+        strategy = make_clean_strategy(
+            low_vol_block_enabled=True,
+            low_vol_max_intensity=5.0,
+            low_vol_max_price_change=0.0005,
+        )
+        # Create micro with high intensity (many trades in short time)
+        micro = MicroStructure("btcusdt")
+        now = time.time()
+        for i in range(100):
+            t = now - 5.0 + (i / 100) * 5.0  # 100 trades in 5s = 20 tps
+            trade = AggTrade(
+                symbol="btcusdt", price=70000.0, quantity=0.01,
+                is_buyer_maker=(i % 3 == 0), timestamp=t,
+            )
+            micro.add_trade(trade)
+        micro.window_start_price = 70000.0
+        micro.window_start_time = now - 15.0
+        micro.current_price = 70000.0  # Tiny price change
+        micro.__class__ = type(
+            'HighIntMicro3', (MicroStructure,),
+            {'momentum_signal': property(lambda s: 0.8),
+             'confidence': property(lambda s: 0.8)},
+        )
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # Should NOT be blocked by low vol (intensity > 5 tps)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.LOW_VOL
+
+    def test_low_vol_allows_when_price_moved(self):
+        """Big price change → not low vol even with few trades."""
+        strategy = make_clean_strategy(
+            low_vol_block_enabled=True,
+            low_vol_max_intensity=5.0,
+            low_vol_max_price_change=0.0005,
+        )
+        # Few trades but significant price movement
+        micro = make_micro_with_momentum("bullish", 0.8, n_trades=5, price_change_pct=0.005)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.LOW_VOL
+
+    def test_low_vol_disabled_allows_entry(self):
+        """When disabled, low vol conditions don't block."""
+        strategy = make_clean_strategy(low_vol_block_enabled=False)
+        micro = make_micro_with_momentum("bullish", 0.8, n_trades=5, price_change_pct=0.0001)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.LOW_VOL
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: High Intensity Blocker
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestHighIntensityBlocker:
+    """Verify high_intensity_block_enabled filter works correctly."""
+
+    def test_high_intensity_blocks_entry(self):
+        """When 30s intensity exceeds max → blocked."""
+        strategy = make_clean_strategy(
+            high_intensity_block_enabled=True,
+            high_intensity_max_tps=10.0,  # Low threshold for test
+        )
+        # Create micro with very fast trades (high tps)
+        micro = MicroStructure("btcusdt")
+        now = time.time()
+        # 500 trades in 10 seconds = 50 tps
+        for i in range(500):
+            t = now - 10.0 + (i / 500) * 10.0
+            trade = AggTrade(
+                symbol="btcusdt", price=70000.0, quantity=0.01,
+                is_buyer_maker=(i % 3 == 0), timestamp=t,
+            )
+            micro.add_trade(trade)
+        micro.window_start_price = 70000.0
+        micro.window_start_time = now - 15.0
+        micro.current_price = 70070.0
+        # Patch momentum
+        micro.__class__ = type(
+            'HighIntMicro', (MicroStructure,),
+            {'momentum_signal': property(lambda s: 0.8),
+             'confidence': property(lambda s: 0.8)},
+        )
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.HIGH_INTENSITY
+
+    def test_normal_intensity_allows_entry(self):
+        """Normal intensity → entry allowed."""
+        strategy = make_clean_strategy(
+            high_intensity_block_enabled=True,
+            high_intensity_max_tps=50.0,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8, n_trades=30)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.HIGH_INTENSITY
+
+    def test_high_intensity_disabled(self):
+        """When disabled, high intensity doesn't block."""
+        strategy = make_clean_strategy(high_intensity_block_enabled=False)
+        # Same high-intensity micro as above
+        micro = MicroStructure("btcusdt")
+        now = time.time()
+        for i in range(500):
+            t = now - 10.0 + (i / 500) * 10.0
+            trade = AggTrade(
+                symbol="btcusdt", price=70000.0, quantity=0.01,
+                is_buyer_maker=(i % 3 == 0), timestamp=t,
+            )
+            micro.add_trade(trade)
+        micro.window_start_price = 70000.0
+        micro.window_start_time = now - 15.0
+        micro.current_price = 70070.0
+        micro.__class__ = type(
+            'HighIntMicro2', (MicroStructure,),
+            {'momentum_signal': property(lambda s: 0.8),
+             'confidence': property(lambda s: 0.8)},
+        )
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.HIGH_INTENSITY
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: 5-Minute Trend Bias
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestTrendBias5m:
+    """Verify 5-minute trend bias blocks and boosts correctly."""
+
+    def _make_micro_with_trend(self, direction, momentum_dir="bullish",
+                                strength=0.8, trend_pct=0.004):
+        """Create micro with a specific 5m trend via price_history (DB fallback).
+
+        Resets flow_5m so trend_5m falls back to price_history.
+        This simulates a bot that just started and has DB context but not
+        5 minutes of live flow data yet.
+        """
+        micro = make_micro_with_momentum(momentum_dir, strength)
+        # Set up a 5m trend by populating price_history
+        base = 70000.0
+        if direction == "up":
+            oldest_price = base * (1 - trend_pct)
+        else:
+            oldest_price = base * (1 + trend_pct)
+        micro.price_history = [(oldest_price, time.time() - 300)]
+        micro.current_price = base
+        # Reset flow_5m so trend_5m uses price_history fallback
+        micro.flow_5m.reset()
+        return micro
+
+    def test_strong_uptrend_blocks_no_entry(self):
+        """Strong 5m uptrend hard blocks bearish (NO) entries."""
+        strategy = make_clean_strategy(
+            trend_bias_enabled=True,
+            trend_bias_min_pct=0.0015,
+            trend_bias_strong_pct=0.003,
+        )
+        # BTC trending up 0.4% → strong uptrend
+        micro = self._make_micro_with_trend("up", "bearish", 0.8, trend_pct=0.004)
+        market = make_market(yes_price=0.55, no_price=0.45)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.TREND_VETO
+
+    def test_strong_downtrend_blocks_yes_entry(self):
+        """Strong 5m downtrend hard blocks bullish (YES) entries."""
+        strategy = make_clean_strategy(
+            trend_bias_enabled=True,
+            trend_bias_min_pct=0.0015,
+            trend_bias_strong_pct=0.003,
+        )
+        # BTC trending down 0.4% → strong downtrend
+        micro = self._make_micro_with_trend("down", "bullish", 0.8, trend_pct=0.004)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.TREND_VETO
+
+    def test_moderate_trend_boosts_threshold(self):
+        """Moderate 5m trend adds boost to threshold instead of blocking."""
+        strategy = make_clean_strategy(
+            trend_bias_enabled=True,
+            trend_bias_min_pct=0.0015,
+            trend_bias_strong_pct=0.003,
+            trend_bias_counter_boost=0.10,
+            entry_threshold=0.50,
+        )
+        # BTC trending up 0.2% → moderate, NOT strong
+        micro = self._make_micro_with_trend("up", "bearish", 0.8, trend_pct=0.002)
+        market = make_market(yes_price=0.55, no_price=0.45)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # Threshold should have been boosted by 0.10
+        assert strategy._last_effective_threshold >= 0.60
+
+    def test_with_trend_entry_not_blocked(self):
+        """Trading WITH the 5m trend is never blocked."""
+        strategy = make_clean_strategy(
+            trend_bias_enabled=True,
+            trend_bias_min_pct=0.0015,
+            trend_bias_strong_pct=0.003,
+        )
+        # BTC trending up, buying YES (with the trend)
+        micro = self._make_micro_with_trend("up", "bullish", 0.8, trend_pct=0.004)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # Should NOT be blocked by trend bias
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.TREND_VETO
+
+    def test_trend_bias_disabled(self):
+        """When disabled, strong counter-trend doesn't block."""
+        strategy = make_clean_strategy(trend_bias_enabled=False)
+        micro = self._make_micro_with_trend("up", "bearish", 0.8, trend_pct=0.005)
+        market = make_market(yes_price=0.55, no_price=0.45)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.TREND_VETO
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Adaptive Directional Bias (30m macro)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestAdaptiveBias:
+    """Verify adaptive_bias shifts entry thresholds per-side."""
+
+    def _make_micro_with_lookback(self, trend_dir, momentum_dir="bullish", strength=0.8):
+        """Create micro with 30m price history for adaptive bias."""
+        micro = make_micro_with_momentum(momentum_dir, strength)
+        base = 70000.0
+        if trend_dir == "bearish":
+            # BTC dropped 0.5% over 30m
+            old_price = base * 1.005
+        else:
+            # BTC rose 0.5% over 30m
+            old_price = base * 0.995
+        micro.price_history = [(old_price, time.time() - 1800)]
+        micro.current_price = base
+        return micro
+
+    def test_bearish_30m_raises_yes_threshold(self):
+        """In a bearish 30m market, YES entries need higher threshold."""
+        strategy = make_clean_strategy(
+            adaptive_bias_enabled=True,
+            adaptive_bias_spread=0.10,
+            adaptive_bias_min_move=0.003,
+            adaptive_bias_lookback_minutes=30.0,
+            entry_threshold=0.50,
+        )
+        micro = self._make_micro_with_lookback("bearish", "bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        # Bearish market + YES entry = UNFAVORABLE → threshold raised by +0.05
+        assert strategy._last_bias_adjustment > 0
+        assert strategy._last_effective_threshold > 0.50
+
+    def test_bearish_30m_lowers_no_threshold(self):
+        """In a bearish 30m market, NO entries get lower threshold."""
+        strategy = make_clean_strategy(
+            adaptive_bias_enabled=True,
+            adaptive_bias_spread=0.10,
+            adaptive_bias_min_move=0.003,
+            adaptive_bias_lookback_minutes=30.0,
+            entry_threshold=0.50,
+        )
+        micro = self._make_micro_with_lookback("bearish", "bearish", 0.8)
+        market = make_market(yes_price=0.55, no_price=0.45)
+
+        strategy.evaluate(market, micro, 300.0)
+        # Bearish market + NO entry = FAVORABLE → threshold lowered by -0.05
+        assert strategy._last_bias_adjustment < 0
+        assert strategy._last_effective_threshold < 0.50
+
+    def test_small_move_no_bias(self):
+        """Below min_move, no bias applied."""
+        strategy = make_clean_strategy(
+            adaptive_bias_enabled=True,
+            adaptive_bias_spread=0.10,
+            adaptive_bias_min_move=0.003,
+            adaptive_bias_lookback_minutes=30.0,
+            entry_threshold=0.50,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        # Tiny 30m move (0.1%)
+        micro.price_history = [(70000 * 0.999, time.time() - 1800)]
+        micro.current_price = 70000.0
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        assert strategy._last_bias_adjustment == 0.0
+
+    def test_adaptive_bias_disabled(self):
+        """When disabled, no bias adjustment."""
+        strategy = make_clean_strategy(adaptive_bias_enabled=False, entry_threshold=0.50)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        micro.price_history = [(70000 * 0.990, time.time() - 1800)]
+        micro.current_price = 70000.0
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        assert strategy._last_bias_adjustment == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Chop Filter
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestChopFilter:
+    """Verify chop filter auto-raises threshold in choppy conditions."""
+
+    def _make_choppy_micro(self, chop_level, momentum_dir="bullish", strength=0.8):
+        """Create micro with controlled chop index."""
+        micro = make_micro_with_momentum(momentum_dir, strength)
+        # Override chop_index via the per-instance subclass
+        current_class = micro.__class__
+        micro.__class__ = type(
+            'ChoppyMicroStructure',
+            (current_class,),
+            {'chop_index': property(lambda self: chop_level)},
+        )
+        return micro
+
+    def test_high_chop_raises_threshold(self):
+        """Chop index above threshold → entry threshold boosted."""
+        strategy = make_clean_strategy(
+            chop_filter_enabled=True,
+            chop_threshold=3.0,
+            chop_scale=5.0,
+            chop_max_boost=0.10,
+            entry_threshold=0.50,
+        )
+        micro = self._make_choppy_micro(4.0)  # Mid-range chop
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        # chop_frac = (4.0 - 3.0) / (5.0 - 3.0) = 0.50 → boost = 0.05
+        assert strategy._last_chop_boost == pytest.approx(0.05, abs=0.01)
+        assert strategy._last_effective_threshold == pytest.approx(0.55, abs=0.01)
+
+    def test_extreme_chop_caps_boost(self):
+        """Chop index way above scale → boost capped at max."""
+        strategy = make_clean_strategy(
+            chop_filter_enabled=True,
+            chop_threshold=3.0,
+            chop_scale=5.0,
+            chop_max_boost=0.10,
+            entry_threshold=0.50,
+        )
+        micro = self._make_choppy_micro(10.0)  # Extreme chop
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        assert strategy._last_chop_boost == pytest.approx(0.10, abs=0.01)
+
+    def test_low_chop_no_boost(self):
+        """Chop below threshold → no boost."""
+        strategy = make_clean_strategy(
+            chop_filter_enabled=True,
+            chop_threshold=3.0,
+            chop_scale=5.0,
+            chop_max_boost=0.10,
+            entry_threshold=0.50,
+        )
+        micro = self._make_choppy_micro(2.0)  # Below threshold
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        assert strategy._last_chop_boost == 0.0
+        assert strategy._last_effective_threshold == pytest.approx(0.50, abs=0.01)
+
+    def test_chop_disabled(self):
+        """When disabled, choppy conditions don't affect threshold."""
+        strategy = make_clean_strategy(chop_filter_enabled=False, entry_threshold=0.50)
+        micro = self._make_choppy_micro(10.0)  # Extreme chop
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        assert strategy._last_chop_boost == 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Acceleration Filter
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestAccelerationFilter:
+    """Verify acceleration filter blocks fading momentum."""
+
+    def test_fading_momentum_blocked(self):
+        """Previous momentum was higher → fading → blocked."""
+        strategy = make_clean_strategy(
+            acceleration_enabled=True,
+            acceleration_tolerance=0.05,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.6)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        # Set previous momentum higher (signal was stronger before)
+        strategy._prev_momentum["btcusdt"] = 0.9
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # fade = 0.9 - 0.6 = 0.3 > tol 0.05 → blocked
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.ACCELERATION
+
+    def test_accelerating_momentum_passes(self):
+        """Previous momentum lower → accelerating → passes."""
+        strategy = make_clean_strategy(
+            acceleration_enabled=True,
+            acceleration_tolerance=0.05,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        # Set previous momentum lower (signal is building)
+        strategy._prev_momentum["btcusdt"] = 0.5
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # fade = 0.5 - 0.8 = -0.3 (negative = accelerating) → passes
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.ACCELERATION
+
+    def test_bearish_fading_blocked(self):
+        """Bearish fade: previous was more negative → fading → blocked."""
+        strategy = make_clean_strategy(
+            acceleration_enabled=True,
+            acceleration_tolerance=0.05,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bearish", 0.6)
+        market = make_market(yes_price=0.55, no_price=0.45)
+
+        # Previous was more bearish
+        strategy._prev_momentum["btcusdt"] = -0.9
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # fade = -0.6 - (-0.9) = 0.3 > tol → blocked
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.ACCELERATION
+
+    def test_within_tolerance_passes(self):
+        """Small fade within tolerance → not blocked."""
+        strategy = make_clean_strategy(
+            acceleration_enabled=True,
+            acceleration_tolerance=0.15,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.7)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        # Previous slightly higher (within tolerance)
+        strategy._prev_momentum["btcusdt"] = 0.8
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # fade = 0.8 - 0.7 = 0.1 < tol 0.15 → passes
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.ACCELERATION
+
+    def test_acceleration_disabled(self):
+        """When disabled, fading doesn't block."""
+        strategy = make_clean_strategy(acceleration_enabled=False, entry_threshold=0.30)
+        micro = make_micro_with_momentum("bullish", 0.5)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy._prev_momentum["btcusdt"] = 0.9  # Huge fade
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.ACCELERATION
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Sparse Data Guard
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestSparseDataGuard:
+    """Verify min_trades_in_window blocks entries with insufficient data."""
+
+    def test_sparse_data_blocks(self):
+        """Too few trades in 15s window → blocked."""
+        strategy = make_clean_strategy(
+            min_trades_in_window=20,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8, n_trades=5)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.SPARSE_DATA
+
+    def test_enough_data_passes(self):
+        """Enough trades → not blocked by sparse data."""
+        strategy = make_clean_strategy(
+            min_trades_in_window=10,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8, n_trades=30)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.SPARSE_DATA
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Confidence Filter
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestConfidenceFilter:
+    """Verify min_confidence blocks low-confidence signals."""
+
+    def test_low_confidence_blocks(self):
+        """Confidence below min → blocked."""
+        strategy = make_clean_strategy(
+            min_confidence=0.80,
+            entry_threshold=0.30,
+        )
+        # strength=0.5 → confidence = min(0.9, 0.4 + 0.5*0.5) = 0.65
+        micro = make_micro_with_momentum("bullish", 0.5)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.CONFIDENCE_TOO_LOW
+
+    def test_high_confidence_passes(self):
+        """Confidence above min → passes."""
+        strategy = make_clean_strategy(
+            min_confidence=0.40,
+            entry_threshold=0.30,
+        )
+        # strength=0.8 → confidence = min(0.9, 0.4 + 0.8*0.5) = 0.80
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.CONFIDENCE_TOO_LOW
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Price Band Filters (min/max entry price)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPriceBandFilters:
+    """Verify min_entry_price and max_entry_price work for both sides."""
+
+    def test_yes_above_max_blocked(self):
+        """YES price above max_entry_price → blocked."""
+        strategy = make_clean_strategy(max_entry_price=0.65)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.70, no_price=0.30)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.PRICE_BAND
+
+    def test_no_above_max_blocked(self):
+        """NO price above max_entry_price → blocked."""
+        strategy = make_clean_strategy(max_entry_price=0.65)
+        micro = make_micro_with_momentum("bearish", 0.8)
+        market = make_market(yes_price=0.30, no_price=0.70)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.PRICE_BAND
+
+    def test_yes_below_min_blocked(self):
+        """YES price below min_entry_price → blocked."""
+        strategy = make_clean_strategy(min_entry_price=0.20)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.10, no_price=0.90)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.PRICE_BAND
+
+    def test_no_below_min_blocked(self):
+        """NO price below min_entry_price → blocked."""
+        strategy = make_clean_strategy(min_entry_price=0.20)
+        micro = make_micro_with_momentum("bearish", 0.8)
+        market = make_market(yes_price=0.90, no_price=0.10)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.PRICE_BAND
+
+    def test_price_in_range_passes(self):
+        """Price within band → not blocked."""
+        strategy = make_clean_strategy(min_entry_price=0.20, max_entry_price=0.80)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.PRICE_BAND
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Dead Market Filter
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestDeadMarketFilter:
+    """Verify dead_market_band blocks when YES stuck near 0.50."""
+
+    def test_dead_market_blocks(self):
+        """YES at exactly 0.50 → blocked."""
+        strategy = make_clean_strategy(dead_market_band=0.03)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.50, no_price=0.50)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.DEAD_MARKET
+
+    def test_near_dead_market_blocks(self):
+        """YES at 0.51 with band=0.03 → still blocked (within band)."""
+        strategy = make_clean_strategy(dead_market_band=0.03)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.51, no_price=0.49)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.DEAD_MARKET
+
+    def test_outside_dead_band_passes(self):
+        """YES at 0.45 with band=0.03 → not blocked."""
+        strategy = make_clean_strategy(dead_market_band=0.03)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.DEAD_MARKET
+
+    def test_dead_market_band_zero_disabled(self):
+        """Band of 0 → never blocks."""
+        strategy = make_clean_strategy(dead_market_band=0.0)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.50, no_price=0.50)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.DEAD_MARKET
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Entry Persistence (time-based)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestEntryPersistence:
+    """Verify entry_persistence requires signal to sustain for N seconds."""
+
+    def test_first_signal_blocked(self):
+        """First qualifying signal → timer starts, entry blocked."""
+        strategy = make_clean_strategy(
+            entry_persistence_enabled=True,
+            entry_persistence_seconds=2.0,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.FAILED_PERSISTENCE
+
+    def test_sustained_signal_passes(self):
+        """After persisting for N seconds, entry allowed."""
+        strategy = make_clean_strategy(
+            entry_persistence_enabled=True,
+            entry_persistence_seconds=2.0,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        # Simulate: first eval starts timer
+        strategy.evaluate(market, micro, 300.0)
+        assert strategy.last_no_trade_reason == NoTradeReason.FAILED_PERSISTENCE
+
+        # Backdate the start time to simulate 2+ seconds passing
+        strategy._entry_signal_start["btcusdt"] = time.time() - 3.0
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # Should pass persistence now
+        assert result is not None
+        assert result.action == MicroAction.BUY_YES
+
+    def test_direction_flip_resets_timer(self):
+        """If direction flips, timer resets."""
+        strategy = make_clean_strategy(
+            entry_persistence_enabled=True,
+            entry_persistence_seconds=2.0,
+            entry_threshold=0.30,
+        )
+        # Start bullish
+        micro_bull = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+        strategy.evaluate(market, micro_bull, 300.0)
+
+        # Backdate timer
+        strategy._entry_signal_start["btcusdt"] = time.time() - 3.0
+
+        # Now flip to bearish — should reset timer
+        micro_bear = make_micro_with_momentum("bearish", 0.8)
+        result = strategy.evaluate(market, micro_bear, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.FAILED_PERSISTENCE
+
+    def test_persistence_disabled(self):
+        """When disabled, first signal enters immediately."""
+        strategy = make_clean_strategy(
+            entry_persistence_enabled=False,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        # Should pass immediately — no persistence wait
+        assert result is not None
+        assert result.action == MicroAction.BUY_YES
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Polymarket Book Entry Veto
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestBookEntryVeto:
+    """Verify poly_book_enabled entry veto works."""
+
+    def test_thin_exit_book_blocks(self):
+        """Bid depth below min → entry blocked (no exit path)."""
+        strategy = make_clean_strategy(
+            poly_book_enabled=True,
+            poly_book_min_exit_depth=20.0,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        book = make_book_intel(yes_bid_depth=5.0)  # Thin bids
+        result = strategy.evaluate(market, micro, 300.0, book_intel=book)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.BOOK_NO_LIQUIDITY
+
+    def test_deep_exit_book_passes(self):
+        """Bid depth above min → not blocked."""
+        strategy = make_clean_strategy(
+            poly_book_enabled=True,
+            poly_book_min_exit_depth=20.0,
+            poly_book_imbalance_veto=-0.40,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        book = make_book_intel(yes_bid_depth=50.0, yes_imbalance=0.2)
+        result = strategy.evaluate(market, micro, 300.0, book_intel=book)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.BOOK_NO_LIQUIDITY
+
+    def test_imbalance_veto_blocks(self):
+        """Book strongly disagrees with direction → blocked."""
+        strategy = make_clean_strategy(
+            poly_book_enabled=True,
+            poly_book_min_exit_depth=20.0,
+            poly_book_imbalance_veto=-0.40,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        # Strong bearish imbalance on YES book → bullish entry vetoed
+        book = make_book_intel(yes_bid_depth=50.0, yes_imbalance=-0.60)
+        result = strategy.evaluate(market, micro, 300.0, book_intel=book)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.BOOK_VETO
+
+    def test_book_disabled_ignores_thin_book(self):
+        """When poly_book_enabled=False, thin book doesn't matter."""
+        strategy = make_clean_strategy(
+            poly_book_enabled=False,
+            entry_threshold=0.30,
+        )
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        book = make_book_intel(yes_bid_depth=1.0, yes_imbalance=-0.90)
+        result = strategy.evaluate(market, micro, 300.0, book_intel=book)
+        if result is None:
+            assert strategy.last_no_trade_reason not in (
+                NoTradeReason.BOOK_NO_LIQUIDITY, NoTradeReason.BOOK_VETO
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Price-to-Beat Filter
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPriceToBeat:
+    """Verify price-to-beat filter blocks fighting the window direction."""
+
+    def test_buying_yes_when_btc_down_blocked(self):
+        """Buying YES but BTC below window open → blocked."""
+        strategy = make_clean_strategy(entry_threshold=0.30)
+        # BTC dropped from window start
+        micro = make_micro_with_momentum("bullish", 0.8, price_change_pct=-0.002)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 120.0)  # Within 180s
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.PRICE_TO_BEAT
+
+    def test_buying_no_when_btc_up_blocked(self):
+        """Buying NO but BTC above window open → blocked."""
+        strategy = make_clean_strategy(entry_threshold=0.30)
+        # BTC rose from window start
+        micro = make_micro_with_momentum("bearish", 0.8, price_change_pct=0.002)
+        market = make_market(yes_price=0.55, no_price=0.45)
+
+        result = strategy.evaluate(market, micro, 120.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.PRICE_TO_BEAT
+
+    def test_buying_with_window_direction_passes(self):
+        """Buying YES when BTC is up → aligned, not blocked."""
+        strategy = make_clean_strategy(entry_threshold=0.30)
+        micro = make_micro_with_momentum("bullish", 0.8, price_change_pct=0.002)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 120.0)
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.PRICE_TO_BEAT
+
+    def test_early_window_not_active(self):
+        """With >180s remaining, price-to-beat doesn't apply."""
+        strategy = make_clean_strategy(entry_threshold=0.30)
+        micro = make_micro_with_momentum("bullish", 0.8, price_change_pct=-0.005)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)  # >180s
+        if result is None:
+            assert strategy.last_no_trade_reason != NoTradeReason.PRICE_TO_BEAT
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Correct Entry Action / Side
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestEntryAction:
+    """Verify correct BUY_YES/BUY_NO action and side assignment."""
+
+    def test_bullish_buys_yes(self):
+        """Bullish momentum → BUY_YES."""
+        strategy = make_clean_strategy(entry_threshold=0.30)
+        micro = make_micro_with_momentum("bullish", 0.8)
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is not None
+        assert result.action == MicroAction.BUY_YES
+        assert result.side == Side.YES
+        assert result.market_price == 0.45
+
+    def test_bearish_buys_no(self):
+        """Bearish momentum → BUY_NO."""
+        strategy = make_clean_strategy(entry_threshold=0.30)
+        micro = make_micro_with_momentum("bearish", 0.8)
+        market = make_market(yes_price=0.55, no_price=0.45)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is not None
+        assert result.action == MicroAction.BUY_NO
+        assert result.side == Side.NO
+        assert result.market_price == 0.45
+
+    def test_weak_momentum_no_entry(self):
+        """Momentum below threshold → no entry."""
+        strategy = make_clean_strategy(entry_threshold=0.50)
+        micro = make_micro_with_momentum("bullish", 0.3)  # Below 0.50
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        result = strategy.evaluate(market, micro, 300.0)
+        assert result is None
+        assert strategy.last_no_trade_reason == NoTradeReason.BELOW_THRESHOLD
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tests: Multiple Filters Stacking
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestFilterStacking:
+    """Verify multiple threshold modifiers stack correctly."""
+
+    def test_30s_plus_chop_stack(self):
+        """30s opposition + chop boost should both add to threshold."""
+        strategy = make_strategy(
+            entry_threshold=0.50,
+            counter_trend_threshold=0.55,
+            chop_filter_enabled=True,
+            chop_threshold=3.0,
+            chop_scale=5.0,
+            chop_max_boost=0.10,
+            # Disable everything else
+            trend_bias_enabled=False,
+            adaptive_bias_enabled=False,
+            acceleration_enabled=False,
+            low_vol_block_enabled=False,
+            high_intensity_block_enabled=False,
+            entry_persistence_enabled=False,
+            dead_market_band=0.0,
+        )
+        # Full 30s opposition + high chop
+        micro = make_micro_with_momentum("bullish", 0.8, ofi_30s=-0.30)
+        # Override chop
+        current_class = micro.__class__
+        micro.__class__ = type(
+            'StackedMicro', (current_class,),
+            {'chop_index': property(lambda self: 5.0)},
+        )
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        # 30s: 0.50 + 1.0 * 0.05 = 0.55
+        # chop: full boost = +0.10
+        # total: ~0.65
+        assert strategy._last_effective_threshold >= 0.64
+
+    def test_30s_plus_adaptive_bias_stack(self):
+        """30s opposition + adaptive bias should both contribute."""
+        strategy = make_strategy(
+            entry_threshold=0.50,
+            counter_trend_threshold=0.55,
+            adaptive_bias_enabled=True,
+            adaptive_bias_spread=0.10,
+            adaptive_bias_min_move=0.003,
+            adaptive_bias_lookback_minutes=30.0,
+            # Disable everything else
+            trend_bias_enabled=False,
+            chop_filter_enabled=False,
+            acceleration_enabled=False,
+            low_vol_block_enabled=False,
+            high_intensity_block_enabled=False,
+            entry_persistence_enabled=False,
+            dead_market_band=0.0,
+        )
+        # Full 30s opposition + bearish 30m (bad for YES)
+        micro = make_micro_with_momentum("bullish", 0.8, ofi_30s=-0.30)
+        micro.price_history = [(70000 * 1.005, time.time() - 1800)]
+        micro.current_price = 70000.0
+        market = make_market(yes_price=0.45, no_price=0.55)
+
+        strategy.evaluate(market, micro, 300.0)
+        # 30s: +0.05, adaptive: +0.05 → ~0.60
+        assert strategy._last_effective_threshold >= 0.59
