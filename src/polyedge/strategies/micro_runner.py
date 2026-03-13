@@ -1607,6 +1607,7 @@ class MicroRunner:
                         "seconds_remaining": round(opp.seconds_remaining, 1),
                         "bias_direction": bias_direction,
                         "bias_adjustment": round(bias_adj, 4),
+                        "is_flip": opp.is_flip,
                         "chop_index": round(self.agg_feed.micro[opp.symbol].chop_index, 2) if opp.symbol in getattr(self.agg_feed, 'micro', {}) else 0,
                         "chop_boost": round(getattr(self.strategy, '_last_chop_boost', 0.0), 4),
                         "effective_threshold": round(getattr(self.strategy, '_last_effective_threshold', 0.0), 4),

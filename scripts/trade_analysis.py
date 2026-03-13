@@ -565,6 +565,44 @@ class TradeAnalyzer:
 
         return results
 
+    def analyze_by_flip(self) -> dict:
+        """Analyze flip entries vs normal entries.
+
+        Flips (close + reopen opposite side) are expensive — two fees, two
+        fills. Shows whether they're net positive vs normal entries.
+        Also breaks out hold time to validate the flip_min_hold fix.
+        """
+        flip_trades = []
+        normal_trades = []
+
+        for trade in self.paired_trades:
+            market_id = trade['market_id']
+            signal = self.signal_data.get(market_id, {})
+            is_flip = signal.get('is_flip', False)
+            if is_flip:
+                flip_trades.append(trade)
+            else:
+                normal_trades.append(trade)
+
+        def analyze_group(trades):
+            if not trades:
+                return {'count': 0, 'win_rate': 'N/A', 'avg_pnl': 0, 'total_pnl': 0, 'avg_hold_s': 0}
+            pnls = [t['gross_pnl'] for t in trades]
+            wins = sum(1 for p in pnls if p > 0)
+            hold_times = [t['hold_time_seconds'] for t in trades if t['hold_time_seconds'] > 0]
+            return {
+                'count': len(trades),
+                'win_rate': f"{wins/len(trades)*100:.1f}%",
+                'avg_pnl': round(sum(pnls) / len(trades), 4),
+                'total_pnl': round(sum(pnls), 4),
+                'avg_hold_s': round(statistics.mean(hold_times), 1) if hold_times else 0,
+            }
+
+        return {
+            'flip': analyze_group(flip_trades),
+            'normal': analyze_group(normal_trades),
+        }
+
     def analyze_execution_quality(self) -> dict:
         """Analyze execution quality (slippage, fill rates)."""
         if not self.signal_data or not self.paired_trades:
@@ -758,6 +796,28 @@ async def print_report(analyzer: TradeAnalyzer):
                 )
         console.print(table)
 
+    # Flip vs normal entries
+    by_flip = analyzer.analyze_by_flip()
+    if by_flip['flip']['count'] > 0:
+        table = Table(title="Performance by Entry Type (Flip vs Normal)")
+        table.add_column("Entry Type")
+        table.add_column("Count", justify="right")
+        table.add_column("Win Rate", justify="right")
+        table.add_column("Avg P&L", justify="right")
+        table.add_column("Total P&L", justify="right")
+        table.add_column("Avg Hold", justify="right")
+        for entry_type, data in by_flip.items():
+            if data['count'] > 0:
+                table.add_row(
+                    entry_type.title(),
+                    str(data['count']),
+                    data['win_rate'],
+                    f"${data['avg_pnl']}",
+                    f"${data['total_pnl']}",
+                    f"{data['avg_hold_s']}s",
+                )
+        console.print(table)
+
     # By trade intensity
     by_intensity = analyzer.analyze_by_intensity()
     if by_intensity:
@@ -878,6 +938,7 @@ async def main():
                 'by_exit_reason': analyzer.analyze_by_exit_reason(),
                 'signal_components': analyzer.analyze_signal_components(),
                 'fok_rejections': analyzer.analyze_fok_rejections(),
+                'by_flip': analyzer.analyze_by_flip(),
                 'execution_quality': analyzer.analyze_execution_quality(),
             }
             print(json.dumps(output, indent=2, default=str))
