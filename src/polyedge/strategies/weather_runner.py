@@ -42,7 +42,7 @@ from polyedge.strategies.weather_sniper import (
 )
 
 logger = logging.getLogger("polyedge.weather_runner")
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 # Intervals
 MARKET_REFRESH_INTERVAL = 300     # 5 minutes — weather markets don't change fast

@@ -46,7 +46,7 @@ from polyedge.strategies.crypto_sniper import (
 )
 
 logger = logging.getLogger("polyedge.sniper_runner")
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 # How often to re-read crypto markets from the DB.
 # The MarketIndexer handles API sync separately (default every 15 min).
