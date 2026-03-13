@@ -80,7 +80,7 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 
 | File | Purpose | Key exports |
 |------|---------|-------------|
-| `trade_analysis.py` | Comprehensive post-trade attribution analysis. Breaks down performance by entry quality, direction, trend alignment, time remaining, exit reason, adaptive bias state (FAVORABLE/UNFAVORABLE/NEUTRAL), trade intensity buckets, signal components, FOK rejections, and execution quality. Usage: `python scripts/trade_analysis.py --hours 4` | — |
+| `trade_analysis.py` | Comprehensive post-trade attribution analysis. Breaks down performance by entry quality, direction, trend alignment, time remaining, exit reason, adaptive bias state (FAVORABLE/UNFAVORABLE/NEUTRAL), trade intensity buckets, signal components, FOK rejections, execution quality, and flip vs normal trade comparison. Usage: `python scripts/trade_analysis.py --hours 4` | — |
 | `label_outcomes.py` | Offline outcome labeling for signal snapshots. Computes future BTC/token price moves at 5s/10s/20s/30s horizons + max favorable/adverse excursion (MFE/MAE) within 30s. Uses signal_snapshots table as price source (snapshots every 2-3s provide the timeline). Usage: `python scripts/label_outcomes.py --limit 5000` or `--stats`. | — |
 
 ### Risk (`src/polyedge/risk/`)
@@ -141,6 +141,7 @@ All tables in the `polyedge` schema (PostgreSQL). Defined in `core/db.py` as the
 | `pnl_ledger` | Reconciled P&L entries: each row is a completed buy/sell pair or resolution with gross P&L, fees, net P&L, gas estimate. |
 | `reconcile_state` | Tracks last CLOB API sync cursor for incremental reconciliation. |
 | `micro_price_log` | Persistent price snapshots for micro sniper trend context. Logged every ~30s per symbol. Loaded on startup for cross-restart awareness. Auto-pruned to 60 min. |
+| `tuning_log` | Config change history. Each row records: key, old/new value, reason, data window, and win_rate/avg_pnl/trade_count at time of change. Written by `/tune` command (source='auto') or manually. Indexes on `ts` and `key`. |
 | `signal_snapshots` | Research pipeline data. Complete feature vector snapshots (~50 fields as JSONB) logged every 2-3s + event-driven (trades, candidates, threshold crossings). Denormalized columns for fast queries (regime, dampened_momentum, btc_price, yes_price, seconds_remaining, trade_fired, no_trade_reason, near_threshold). Outcome labels (btc/token moves at 5/10/20/30s + MFE/MAE) added offline by `label_outcomes.py`. Schema-versioned (version=1). Pruned: periodic snapshots 72h, trade/candidate 7 days. |
 
 ## Polymarket API Details
@@ -247,9 +248,10 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `entry_persistence_enabled` (bool, default true) — filter out sub-second momentum spikes
 - `entry_persistence_seconds` (float, default 2.0) — signal must sustain for 2 seconds in same direction (count-based was too fast at ~450ms)
 - `entry_persistence_count` (int, default 3) — DEPRECATED: use entry_persistence_seconds instead
-- `enable_flips` (bool, default false) — disabled by default, strong reversals just EXIT
+- `enable_flips` (bool, default false) — disabled by default, strong reversals just EXIT. Re-enabled in live config after flip_min_hold_seconds protection was added.
 - `flip_threshold` (float, default 0.50) — only used if enable_flips=true
 - `flip_min_confidence` (float, default 0.50)
+- `flip_min_hold_seconds` (float, default 45.0) — after a flip entry, exit threshold is raised to at least `flip_threshold` for this many seconds. Prevents the 30s OFI window from flipping bullish post-flip (buy-the-dip orders flooding in) from collapsing exit protection and triggering an immediate exit. `is_flip` flag stored in `signal_data` JSONB for analysis.
 - `min_confidence` (float, default 0.40)
 - `min_trades_in_window` (int, default 10) — need enough data for OFI to be meaningful
 - `min_trades_for_flip` (int, default 25)
@@ -398,7 +400,7 @@ The AI sees a ~100 token text summary via `format_book_for_ai()`, not the raw or
 
 Secrets are stored in macOS Keychain under the service name `polyedge`. The `config.py` module handles this:
 
-- `KEYCHAIN_KEYS` — List of all secret field names: `poly_private_key`, `poly_wallet_address`, `poly_api_key`, `poly_api_secret`, `poly_api_passphrase`, `database_url`, `anthropic_api_key`, `openai_api_key`, `news_api_key`.
+- `KEYCHAIN_KEYS` — List of all secret field names: `poly_private_key`, `poly_wallet_address`, `poly_api_key`, `poly_api_secret`, `poly_api_passphrase`, `database_url`, `anthropic_api_key`, `openai_api_key`, `news_api_key`, `do_api_token`.
 - `_get_from_keychain(account)` — Reads a secret via `security find-generic-password`.
 - `_set_in_keychain(account, value)` — Writes a secret via `security add-generic-password`.
 - `load_keychain_secrets()` — Loads all known secrets from Keychain into a dict.
@@ -525,6 +527,14 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 - Two-step process: `/points/{lat},{lon}` → get grid coordinates → `/gridpoints/{office}/{gridX},{gridY}/forecast`.
 - Official US government data that directly matches Polymarket resolution source for US weather markets.
 - Used as cross-reference for US locations alongside Open-Meteo ensemble data.
+
+## Slash Commands (`.claude/commands/`)
+
+Project-level slash commands available in Claude Code when working in this repo:
+
+| Command | File | Purpose |
+|---------|------|---------|
+| `/tune` | `.claude/commands/tune.md` | Autonomous tuning agent. Queries DB trade performance + DO logs + current config, analyzes all dimensions (win rate, regime, exit quality, MFE/MAE, blockers), auto-applies small parameter nudges, flags structural changes for approval, logs all changes to `tuning_log`. Flags: `--hours N` (data window, default 4), `--label` (run label_outcomes.py first for fresh MFE/MAE data, slow). |
 
 ## Owner Preferences
 
