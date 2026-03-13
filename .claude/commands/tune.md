@@ -28,6 +28,9 @@ Recent tuning history (last 10 changes):
 Recent DO app logs (last 200 lines):
 !`DO_TOKEN=$(security find-generic-password -s polyedge -a do_api_token -w 2>/dev/null); [ -n "$DO_TOKEN" ] && LOG_URL=$(curl -sf -H "Authorization: Bearer $DO_TOKEN" "https://api.digitalocean.com/v2/apps/ca9759eb-3b7e-4d01-b1f0-ec93537b57b7/logs?type=RUN&tail_lines=200" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null) && [ -n "$LOG_URL" ] && curl -sf "$LOG_URL" 2>/dev/null | tail -200 || echo "DO logs not accessible - check do_api_token in keychain"`
 
+Config tuning playbook (read this before making any recommendations):
+Read `.claude/commands/tune-refs/config-playbook.md` for the full "if you see X, adjust Y" guide — it maps every data observation to a specific config key, direction, and safe nudge range. Do not guess at config semantics; use the playbook.
+
 ## Your task
 
 Work through these steps in order:
@@ -81,9 +84,28 @@ For each dimension, state the data finding and what it implies:
 **DO logs**
 - Look for: repeated FOK rejections (exit_slippage too low), WebSocket disconnects (gap detection), config reload messages, ERROR patterns, stuck exit loops (same market selling 5+ times).
 
-### 4. Identify changes
+### 4. Bug detection (before tuning)
 
-Categorize each potential change:
+Before making config recommendations, check whether the data patterns are explainable by config alone or suggest a code bug. Tuning config on top of a bug makes things worse, not better.
+
+**Red flags that indicate a bug, not a config issue:**
+- A filter is enabled in config but the DO logs show it never firing (or always firing regardless of data)
+- Exit reason distribution is impossible (e.g., 0% trailing stop exits when trailing_stop_enabled=true and trades are hitting >10% gains)
+- Flip protection not working: exits appearing in logs within `flip_min_hold_seconds` of a flip entry
+- OFI values flat or constant (feed might be stale, gap detection might not be resetting properly)
+- Entry persistence firing but trades still entering on sub-second signals
+- Config reloads in DO logs showing wrong values vs what `polyedge config show` reports
+- Win rate perfectly 0% or 100% (almost always a logic error, not market conditions)
+
+**If a bug is suspected:**
+- Do NOT apply config changes that would mask the bug (e.g., raising a threshold to avoid the bad behavior)
+- Read the relevant source file(s) to diagnose: `src/polyedge/strategies/micro_sniper.py` (strategy logic), `src/polyedge/strategies/micro_runner.py` (runner/state management)
+- Flag it clearly in the report: **BUG SUSPECTED: [description] — [evidence from data/logs] — [files to check]**
+- Suggest the specific code section to review, but do not apply code changes in tune — that requires the user's attention
+
+### 5. Identify config changes (use playbook)
+
+Categorize each potential change. Use `.claude/commands/tune-refs/config-playbook.md` to map observations to keys and safe nudge ranges. Do not recommend changes not grounded in the playbook or clear data evidence.
 
 **AUTO-APPLY** (small parameter nudges, clearly data-backed, ±10-20% of current value, reversible):
 - Threshold adjustments based on clear bucket performance data
@@ -95,7 +117,7 @@ Categorize each potential change:
 - Changes >30% from current value
 - Anything that could fundamentally change trading behavior
 
-### 5. Apply and log changes
+### 6. Apply and log changes
 
 For each AUTO-APPLY change:
 1. Get current value: `.venv/bin/polyedge config show 2>/dev/null | grep <key>`
@@ -107,7 +129,7 @@ DB_URL=$(security find-generic-password -s polyedge -a database_url -w 2>/dev/nu
 psql "$DB_URL" -c "INSERT INTO polyedge.tuning_log (source, key, old_value, new_value, reason, data_window_hours, win_rate_at_change, avg_pnl_at_change, trade_count_at_change) VALUES ('auto', '<key>', '<old>', '<new>', '<reason>', <hours>, <win_rate>, <avg_pnl>, <count>);"
 ```
 
-### 6. Output a concise tuning report
+### 7. Output a concise tuning report
 
 Format:
 
@@ -127,6 +149,10 @@ Win rate: X% | Avg P&L: $X.XX | Net: $X.XX
 
 ### Flagged for Approval
 - [change description] — [data backing it] — apply with: polyedge config set <key> <value>
+
+### Bugs Suspected
+- [description] — [evidence] — check [file:line_area]
+(omit section if none)
 
 ### No Action Needed
 - [dimension]: looks healthy
