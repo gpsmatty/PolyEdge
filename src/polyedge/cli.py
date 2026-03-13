@@ -74,25 +74,33 @@ def health_server(port):
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--quiet", "-q", is_flag=True, help="Quiet — trades + status only")
 @click.option("--port", default=8080, help="Health/control server port (default 8080)")
-def run(strategy, auto, dry, market, no_warmup, verbose, quiet, port):
+@click.option("--paused", is_flag=True, help="Start with health server only — no strategy until you curl /start")
+def run(strategy, auto, dry, market, no_warmup, verbose, quiet, port, paused):
     """Launcher for DigitalOcean App Platform.
 
     \b
     Runs the health server permanently (keeps container alive, passes DO
     health probes) and manages the trading strategy as a controllable task.
+    Same Docker image works for any strategy — just tell it what to run.
 
     \b
     Control endpoints on port 8080:
       curl localhost:8080/status   → see if strategy is running
       curl localhost:8080/stop     → pause trading (container stays up)
-      curl localhost:8080/start    → resume trading
+      curl localhost:8080/start    → resume trading (uses CLI defaults)
+
+    \b
+    Start a specific strategy via curl (overrides CLI defaults):
+      curl "localhost:8080/start?strategy=micro&market=btc+15m"
+      curl "localhost:8080/start?strategy=sniper"
+      curl "localhost:8080/start?strategy=weather"
 
     \b
     Examples:
-      polyedge run                              # micro sniper, auto mode
-      polyedge run -s micro -m "btc 15m"        # micro, BTC 15-min only
-      polyedge run -s sniper                    # crypto sniper
-      polyedge run -s weather                   # weather sniper
+      polyedge run --paused                     # health server only, curl /start later
+      polyedge run -s micro -m "btc 15m"        # auto-start micro on BTC 15-min
+      polyedge run -s sniper                    # auto-start crypto sniper
+      polyedge run -s weather                   # auto-start weather sniper
       polyedge run --dry -m "btc 5m"            # dry run micro
     """
     from polyedge.launcher import Launcher
@@ -110,6 +118,7 @@ def run(strategy, auto, dry, market, no_warmup, verbose, quiet, port):
         strategy=strategy,
         strategy_args=strategy_args,
         port=port,
+        paused=paused,
     )
 
     run_async(launcher.run())

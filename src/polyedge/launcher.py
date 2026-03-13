@@ -47,10 +47,12 @@ class Launcher:
         strategy: str = "micro",
         strategy_args: dict | None = None,
         port: int = _PORT,
+        paused: bool = False,
     ):
         self.strategy = strategy
         self.strategy_args = strategy_args or {}
         self.port = port
+        self.paused = paused
 
         # State
         self._strategy_task: asyncio.Task | None = None
@@ -243,9 +245,41 @@ class Launcher:
         )
 
     async def _handle_start(self, request: web.Request) -> web.Response:
+        # Accept optional JSON body to override strategy + args:
+        #   curl localhost:8080/start
+        #   curl -X POST localhost:8080/start -d '{"strategy":"micro","market":"btc 5m"}'
+        #   curl "localhost:8080/start?strategy=sniper"
+        try:
+            if request.content_type == "application/json":
+                body = await request.json()
+            else:
+                body = {}
+        except Exception:
+            body = {}
+
+        # Also accept query params
+        params = dict(request.query)
+        body.update(params)
+
+        # Override strategy if provided
+        if "strategy" in body:
+            self.strategy = body["strategy"]
+
+        # Override strategy_args from body
+        arg_keys = ["market", "auto", "dry", "verbose", "quiet", "no_warmup"]
+        for key in arg_keys:
+            if key in body:
+                val = body[key]
+                # Parse string booleans
+                if isinstance(val, str) and val.lower() in ("true", "1", "yes"):
+                    val = True
+                elif isinstance(val, str) and val.lower() in ("false", "0", "no"):
+                    val = False
+                self.strategy_args[key] = val
+
         msg = await self.start_strategy()
         return web.Response(
-            text=json.dumps({"message": msg, **self.get_status()}),
+            text=json.dumps({"message": msg, **self.get_status()}, indent=2),
             content_type="application/json",
             status=200,
         )
@@ -279,9 +313,11 @@ class Launcher:
         await site.start()
         console.print(f"[green]Health + control server listening on 0.0.0.0:{self.port}[/green]")
 
-        # Auto-start the strategy if resources initialized
-        if ok:
+        # Auto-start the strategy unless --paused
+        if ok and not self.paused:
             await self.start_strategy()
+        elif self.paused:
+            console.print(f"[yellow]Started paused — curl localhost:{self.port}/start to begin trading[/yellow]")
 
         # Run forever
         try:
