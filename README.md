@@ -190,6 +190,60 @@ Each cycle (every 5 minutes):
 
 The crypto sniper, micro sniper, and weather sniper each run as separate persistent loops (`polyedge sniper`, `polyedge micro`, `polyedge weather`), independent of the 5-minute agent cycle.
 
+## Deployment (DigitalOcean App Platform)
+
+PolyEdge ships with a `Dockerfile` and a launcher that handles the DO lifecycle. The container starts paused — health server only — and you tell it what to run.
+
+```bash
+# Build & push (or let DO auto-deploy from GitHub)
+docker build -t polyedge .
+```
+
+**How it works:** The `polyedge run` command is the container entrypoint. It starts a health server on port 8080 (passes DO readiness probes) and exposes HTTP control endpoints. No strategy runs until you start one.
+
+### Control from DO Console
+
+```bash
+# Start the micro sniper on BTC 15-min
+curl "localhost:8080/start?strategy=micro&market=btc+15m"
+
+# Start the crypto sniper
+curl "localhost:8080/start?strategy=sniper"
+
+# Start the weather sniper
+curl "localhost:8080/start?strategy=weather"
+
+# Check what's running
+curl localhost:8080/status
+
+# Pause trading (container stays alive, health checks pass)
+curl localhost:8080/stop
+
+# Switch strategies: stop current, start new
+curl localhost:8080/stop
+curl "localhost:8080/start?strategy=micro&market=btc+5m"
+```
+
+### Auto-Start on Deploy
+
+Override the Run Command in DO app spec or Settings to skip the paused state:
+
+```bash
+polyedge run -s micro -m "btc 15m"        # auto-start micro on BTC 15-min
+polyedge run -s micro -m "btc 5m" --dry    # dry run, BTC 5-min
+polyedge run -s sniper                     # auto-start crypto sniper
+```
+
+### Secrets
+
+Set all secrets as environment variables in DO App Platform Settings (no Keychain on Linux):
+
+- `POLY_PRIVATE_KEY`, `POLY_WALLET_ADDRESS`
+- `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE`
+- `DATABASE_URL`, `ANTHROPIC_API_KEY`
+
+Trading config still lives in the database — `polyedge config set` from the DO Console works the same as locally.
+
 ## Stack
 
 - Python 3.11+ with asyncio

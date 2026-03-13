@@ -99,9 +99,18 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | `tracker.py` | P&L tracking and display (internal, today's trades). | `PnLTracker` |
 | `reconciler.py` | P&L reconciliation against CLOB API fills. Pulls actual fill prices and fees (hardcoded 2% taker fee — CLOB's `fee_rate_bps` field returns 1000/10% cap, not real fee), matches buy/sell pairs (FIFO), computes gross/net/true-net P&L. Also checks for resolved markets. | `PnLReconciler` |
 
+### Launcher (`src/polyedge/launcher.py`)
+
+| File | Purpose | Key exports |
+|------|---------|-------------|
+| `launcher.py` | DO App Platform orchestrator. Runs health server permanently on port 8080, manages trading strategy as a controllable asyncio task. HTTP endpoints: `/status`, `/start`, `/stop`. Strategy can be started/stopped/switched without killing the container. `/start` accepts query params or JSON body to override strategy and args (e.g. `?strategy=micro&market=btc+15m`). | `Launcher` |
+| `health.py` | Standalone health-check server (legacy, still used by direct strategy commands). | `start_health_server()` |
+
 ### CLI (`src/polyedge/cli.py`)
 
-Click-based CLI. Commands: `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `pnl reconcile`, `pnl history`, `pnl strategy`, `pnl cleanup`, `pnl debug-fills`, `status`, `autopilot`, `sniper`, `weather`, `micro`, `price-logger`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`.
+Click-based CLI. Commands: `run`, `setup`, `init`, `scan`, `search`, `price`, `hunt`, `edges`, `analyze`, `trade`, `positions`, `pnl`, `pnl reconcile`, `pnl history`, `pnl strategy`, `pnl cleanup`, `pnl debug-fills`, `status`, `autopilot`, `sniper`, `weather`, `micro`, `price-logger`, `dashboard`, `initdb`, `sync`, `costs`, `movers`, `book`, `feed`, `config`, `vault`, `health-server`.
+
+The `run` command is the DO App Platform entrypoint. Starts the health server on port 8080 and manages a trading strategy as a controllable task. Flags: `--strategy micro|sniper|weather` (default: micro), `--paused` (start with no strategy, wait for `curl /start`), `--auto/--no-auto`, `--dry`, `--market`, `--no-warmup`, `-v`, `-q`, `--port`. The Dockerfile CMD is `polyedge run --paused`. Control from DO Console: `curl "localhost:8080/start?strategy=micro&market=btc+15m"`, `curl localhost:8080/stop`, `curl localhost:8080/status`. The `/start` endpoint accepts query params to override strategy and args at runtime — same Docker image for any strategy.
 
 The `pnl cleanup` command finds orphaned positions/trades (dry run by default, `--fix` to remove). The `pnl debug-fills` command dumps raw CLOB fill data including fee_rate_bps distribution — useful for verifying fee calculations.
 

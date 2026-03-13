@@ -29,7 +29,8 @@ polyedge micro --auto --market "btc 15m" -q
 
 | Command | Description |
 |---------|-------------|
-| `polyedge micro` | Start micro sniper |
+| `polyedge run` | **Launcher** — health server + controllable strategy. Use on DO App Platform |
+| `polyedge micro` | Start micro sniper directly (local use) |
 | `polyedge price-logger` | Standalone price logger — keeps DB trend context fresh across restarts |
 | `polyedge sniper` | Start crypto sniper (separate strategy) |
 | `polyedge weather` | Start weather sniper |
@@ -37,6 +38,26 @@ polyedge micro --auto --market "btc 15m" -q
 | `polyedge status` | Smoke test all CLOB connectivity |
 | `polyedge positions` | Show open positions |
 | `polyedge dashboard` | Real-time terminal UI |
+
+### Launcher Flags (`polyedge run`)
+
+| Flag | Description |
+|------|-------------|
+| `--strategy micro\|sniper\|weather` | Which strategy to run (default: micro) |
+| `--paused` | Start with health server only — no trading until you `curl /start` |
+| `--market "btc 15m"` | Market filter (passed to strategy) |
+| `--auto` / `--no-auto` | Auto-execute trades (default: on) |
+| `--dry` | Watch only — no trades |
+| `--port 8080` | Health/control server port |
+
+### Launcher Control Endpoints (port 8080)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /status` | Check if strategy is running, uptime, args |
+| `GET /start` or `POST /start` | Start the strategy. Accepts query params to override: `?strategy=micro&market=btc+15m` |
+| `GET /stop` or `POST /stop` | Stop the strategy (container stays alive) |
+| `GET /health` | Always 200 (DO health probe) |
 
 ### Micro Flags
 
@@ -308,3 +329,33 @@ Highest wins:
 6. **Pydantic defaults** in `config.py`
 
 DB values override code defaults. If you change a default in code but the DB has an old value, the DB wins. Always use `polyedge config set` to change trading params.
+
+---
+
+## DigitalOcean Deployment
+
+The Dockerfile starts `polyedge run --paused` — health server only, no strategy. From the DO Console:
+
+```bash
+# Start BTC 15-min micro sniper
+curl "localhost:8080/start?strategy=micro&market=btc+15m"
+
+# Check status
+curl localhost:8080/status
+
+# Stop trading (container stays alive)
+curl localhost:8080/stop
+
+# Switch to BTC 5-min
+curl "localhost:8080/start?strategy=micro&market=btc+5m"
+
+# Or start the crypto sniper instead
+curl "localhost:8080/start?strategy=sniper"
+```
+
+To auto-start on deploy, override the Run Command in DO Settings:
+```
+polyedge run -s micro -m "btc 15m"
+```
+
+All output streams to DO Runtime Logs since `polyedge run` is PID 1.
