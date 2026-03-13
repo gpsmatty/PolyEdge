@@ -209,8 +209,8 @@ class MicroSniperStrategy:
                 exit_reason="force_exit",
             )
 
-        # Don't enter new positions too close to end
-        if seconds_remaining < self.config.min_seconds_remaining:
+        # Don't enter new positions too close to end (but always evaluate exits)
+        if seconds_remaining < self.config.min_seconds_remaining and not current_position:
             return None
 
         # --- Check if we should exit or flip ---
