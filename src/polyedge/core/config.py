@@ -161,25 +161,25 @@ class MicroSniperConfig(BaseModel):
     enabled: bool = True
     symbols: list[str] = Field(default_factory=lambda: ["btcusdt"])
     entry_threshold: float = 0.55          # Momentum signal threshold to enter (raised from 0.40 — avoid sideways noise)
-    counter_trend_threshold: float = 0.70  # Higher bar for entries against 30s trend (kills counter-trend losers)
-    exit_threshold: float = 0.20           # Reverse momentum threshold to exit (raised from 0.15 — give trades room)
-    counter_trend_exit_threshold: float = 0.65  # Higher bar for exits when 30s trend still agrees with position
-    hold_threshold: float = 0.10           # Below this (aligned), exit for weak signal
+    counter_trend_threshold: float = 0.58  # Higher bar for entries against 30s trend (kills counter-trend losers)
+    exit_threshold: float = 0.30           # Reverse momentum threshold to exit
+    counter_trend_exit_threshold: float = 0.45  # Higher bar for exits when 30s trend still agrees with position
+    hold_threshold: float = 0.0            # Disabled — trailing stop + exit_threshold handle exits
     enable_flips: bool = False             # Flips disabled — marginal profitability, strong reversals just EXIT
     flip_threshold: float = 0.50           # Reverse momentum threshold to flip (only if enable_flips=True)
     flip_min_confidence: float = 0.50      # Min confidence to flip
     min_confidence: float = 0.40           # Min confidence to enter (raised from 0.30)
     min_trades_in_window: int = 10          # Min trades in 15s window to consider (raised — we get 10+ tps now)
     min_trades_for_flip: int = 25          # Min trades in 15s window to flip (higher bar — flips are costly)
-    min_seconds_remaining: float = 45.0    # Don't enter with less than this left (raised from 15 — need time to exit)
+    min_seconds_remaining: float = 200.0   # Don't enter with less than this left in 15m windows
     force_exit_seconds: float = 8.0        # Force exit with this many seconds left
-    min_entry_price: float = 0.20          # Don't buy a side priced below this (raised from 0.15 — stop fighting the market)
-    max_entry_price: float = 0.70          # Don't buy a side priced above this (lowered from 0.80 — less overpaying)
+    min_entry_price: float = 0.35          # Don't buy a side priced below this
+    max_entry_price: float = 0.58          # Don't buy a side priced above this
     max_position_per_trade: float = 0.03   # 3% of bankroll per micro trade (used if fixed_position_usd is 0)
-    fixed_position_usd: float = 10.0       # Fixed $ per trade — simpler than Kelly for micro. 0 = use Kelly sizing
-    max_trades_per_window: int = 3         # Max trades in a single 5-min window (reduced from 50 — stop churning)
+    fixed_position_usd: float = 5.0        # Fixed $ per trade — simpler than Kelly for micro. 0 = use Kelly sizing
+    max_trades_per_window: int = 10        # Max trades in a single window
     min_liquidity: float = 500             # Min market liquidity to trade
-    dead_market_band: float = 0.06         # Skip entry when YES is within this band of 0.50 (raised from 0.02 — skip sideways markets)
+    dead_market_band: float = 0.02         # Skip entry when YES is within this band of 0.50
 
     # Momentum signal weights — must sum to 1.0
     # Default shifts weight from noisy 5s OFI to more stable 15s/30s windows
@@ -210,7 +210,7 @@ class MicroSniperConfig(BaseModel):
 
     # Trade cooldown: seconds between trades on the same market.
     # Prevents whipsaw — trading the same market twice during noisy bounces.
-    trade_cooldown: float = 10.0           # 10s between trades on same condition_id
+    trade_cooldown: float = 30.0           # 30s between trades on same condition_id
 
     # Window hop cooldown: seconds to wait after hopping to a new window
     # before allowing entries. Lets stale cross-window momentum flush out
@@ -224,19 +224,19 @@ class MicroSniperConfig(BaseModel):
     # 2. Book imbalance signal — Polymarket bid/ask imbalance as a tiebreaker
     poly_book_enabled: bool = False         # Master toggle — OFF by default
     poly_book_min_exit_depth: float = 20.0  # Min bid depth (contracts within 5c) to enter — ensures we can exit
-    poly_book_imbalance_weight: float = 0.10  # Weight of Poly book imbalance in momentum composite (steals from OFI 5s)
+    poly_book_imbalance_weight: float = 0.15  # Weight of Poly book imbalance in momentum composite (steals from OFI 5s)
     poly_book_imbalance_veto: float = -0.40   # If Poly book imbalance is this negative against our direction, block entry
 
     # Book-based exit override — when momentum says "exit" but the Poly book
     # disagrees, hold the position. Requires BOTH depth AND imbalance to override.
     poly_book_exit_override_depth: float = 25.0   # Hold if our token's bid depth > this (strong exit liquidity = market believes in our side)
-    poly_book_exit_override_imbalance: float = 0.15  # Hold if directional imbalance > this (book sentiment favors our position)
+    poly_book_exit_override_imbalance: float = -0.05  # Hold if directional imbalance > this (book sentiment favors our position)
 
     # --- Entry persistence filter ---
     # Requires momentum to stay above entry threshold for a continuous duration
     # before actually entering. Kills single-spike noise entries.
     # Time-based: momentum must persist for N seconds (not just N evals).
-    entry_persistence_enabled: bool = False       # Master toggle — OFF by default
+    entry_persistence_enabled: bool = True        # Filter out sub-second momentum spikes
     entry_persistence_count: int = 3              # DEPRECATED: use entry_persistence_seconds
     entry_persistence_seconds: float = 2.0        # Momentum must hold for 2s before entry
 
@@ -245,8 +245,8 @@ class MicroSniperConfig(BaseModel):
     # trend. Blocks entries against the trend (e.g., don't short into a rally).
     # This is the "persistence" feature: cross-window, cross-restart awareness.
     trend_bias_enabled: bool = True              # Master toggle for trend bias veto
-    trend_bias_min_pct: float = 0.0015           # 0.15% move over 5 min to consider "trending"
-    trend_bias_strong_pct: float = 0.003         # 0.30% move = strong trend, block counter-trend entirely
+    trend_bias_min_pct: float = 0.001            # 0.10% move over 5 min to consider "trending"
+    trend_bias_strong_pct: float = 0.002         # 0.20% move = strong trend, block counter-trend entirely
     trend_bias_counter_boost: float = 0.10       # Add this to entry_threshold for counter-trend entries (when between min and strong)
     trend_log_interval: float = 30.0             # Seconds between DB price log snapshots
     trend_warmup_seconds: float = 60.0           # Seconds of live data needed before trend is trusted
@@ -258,7 +258,7 @@ class MicroSniperConfig(BaseModel):
     # Uses price_history from micro_price_log DB table (30min of snapshots).
     adaptive_bias_enabled: bool = True            # Master toggle for adaptive per-side bias
     adaptive_bias_spread: float = 0.10            # Total spread: favorable side gets -spread/2, unfavorable +spread/2
-    adaptive_bias_lookback_minutes: float = 30.0  # How far back to compute the macro trend
+    adaptive_bias_lookback_minutes: float = 15.0  # How far back to compute the macro trend
     adaptive_bias_min_move: float = 0.003         # 0.30% min move to trigger bias (below = neutral, no adjustment)
 
     # --- Low volatility regime blocker ---
@@ -266,7 +266,7 @@ class MicroSniperConfig(BaseModel):
     # signals are pure noise. Data shows 33% win rate, -18.68% avg move.
     # Block entries entirely when the regime classifier tags "low_vol".
     low_vol_block_enabled: bool = True            # Master toggle for low_vol entry block
-    low_vol_max_intensity: float = 5.0            # Max trades/sec (30s window) to be "low vol"
+    low_vol_max_intensity: float = 3.5            # Max trades/sec (30s window) to be "low vol"
     low_vol_max_price_change: float = 0.0005      # Max abs price change (fractional) to be "low vol"
 
     # --- High intensity blocker ---
@@ -281,7 +281,7 @@ class MicroSniperConfig(BaseModel):
     # Uses 5-minute price range vs net movement. Adapts automatically — no manual
     # config changes needed across market conditions.
     chop_filter_enabled: bool = True              # Master toggle
-    chop_threshold: float = 3.0                   # Chop index above this = choppy (range/net_move ratio)
+    chop_threshold: float = 5.0                   # Chop index above this = choppy (range/net_move ratio)
     chop_max_boost: float = 0.10                  # Max threshold boost in extreme chop
     chop_scale: float = 5.0                       # Chop index at which max_boost is fully applied
 
@@ -289,8 +289,8 @@ class MicroSniperConfig(BaseModel):
     # Tracks the high water mark (HWM) of our side's price since entry.
     # If price drops trailing_stop_pct from the HWM, trigger an exit.
     # Time-scaled: wider early in the window, tighter late.
-    trailing_stop_enabled: bool = False            # Master toggle — OFF by default
-    trailing_stop_pct: float = 0.12                # Base trailing stop: exit if price drops 12% from HWM
+    trailing_stop_enabled: bool = True             # Locks in profits on winners
+    trailing_stop_pct: float = 0.18                # Base trailing stop: exit if price drops 18% from HWM
     trailing_stop_min_profit_pct: float = 0.10     # Only arm the stop after price is 10% above entry (don't stop out on noise)
     trailing_stop_late_pct: float = 0.15           # Tighter stop in last 90s of window
     trailing_stop_late_seconds: float = 90.0       # When to switch to the tighter stop
@@ -300,7 +300,7 @@ class MicroSniperConfig(BaseModel):
     # Tolerance = how much momentum can fade between ticks and still pass.
     # 0.05 = strict (must be accelerating), 0.15 = loose (allows sustained signals)
     acceleration_enabled: bool = True              # Master toggle for acceleration filter
-    acceleration_tolerance: float = 0.05           # Noise tolerance for acceleration check
+    acceleration_tolerance: float = 0.15           # Noise tolerance for acceleration check
 
     # Take-profit: exit immediately when market price hits target
     take_profit_enabled: bool = True               # Master toggle
