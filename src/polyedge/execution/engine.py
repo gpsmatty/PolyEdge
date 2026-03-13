@@ -15,7 +15,7 @@ from polyedge.core.models import Market, OrderStatus, Side, TradeStatus
 from polyedge.risk.portfolio import PortfolioRiskManager, PortfolioSnapshot
 
 logger = logging.getLogger("polyedge.execution")
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 
 class ExecutionEngine:

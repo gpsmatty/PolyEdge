@@ -26,7 +26,7 @@ from polyedge.core.config import Settings
 from polyedge.core.db import Database
 
 logger = logging.getLogger("polyedge.reconciler")
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 # Average Polygon gas cost per transaction (in USD)
 # Polygon gas is very cheap — typically 0.001-0.01 per tx

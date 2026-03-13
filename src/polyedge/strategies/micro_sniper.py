@@ -41,7 +41,7 @@ from polyedge.data.book_analyzer import BookIntelligence
 from polyedge.data.research import NoTradeReason
 
 logger = logging.getLogger("polyedge.micro_sniper")
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 
 # ---------------------------------------------------------------------------

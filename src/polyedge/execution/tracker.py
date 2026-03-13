@@ -10,7 +10,7 @@ from rich.table import Table
 
 from polyedge.core.db import Database
 
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 
 class PnLTracker:

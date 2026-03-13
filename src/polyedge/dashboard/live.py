@@ -15,7 +15,7 @@ from rich.text import Text
 from polyedge.core.db import Database
 from polyedge.core.config import Settings
 
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 
 class Dashboard:

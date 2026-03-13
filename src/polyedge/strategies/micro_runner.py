@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from rich.console import Console
+import sys
 
 from polyedge.core.config import Settings
 from polyedge.core.client import PolyClient
@@ -63,7 +64,7 @@ from polyedge.data.research import (
 )
 
 logger = logging.getLogger("polyedge.micro_runner")
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 # How often to refresh market list from DB
 MARKET_REFRESH_INTERVAL = 120  # seconds (unfiltered)
@@ -1012,32 +1013,11 @@ class MicroRunner:
 
         # On startup, skip trading until the first fresh window starts.
         # The aggTrade callback still fires (warming up microstructure).
-        # We detect the new window by checking if markets[0] is different
-        # from the window we started on (refresh loop prunes expired ones).
+        # The flag is cleared by _hop_window() when the startup window
+        # expires and we transition to a fresh one — no need to detect
+        # the transition here. Just return early while warming up.
         if self._waiting_for_fresh_window:
-            current_cid = markets[0][0].condition_id if markets else None
-            if current_cid and current_cid != self._startup_window_id:
-                # The startup window expired and was pruned — we're on a fresh one
-                self._waiting_for_fresh_window = False
-                self._trades_this_window = 0
-                # Mark window start price for price-to-beat filter
-                if micro.current_price > 0:
-                    micro.start_window(micro.current_price)
-                next_mkt = markets[0][0]
-                remaining = (next_mkt.end_date - now).total_seconds()
-                console.print(
-                    "[bold green]Fresh window ready — microstructure warmed up, "
-                    "starting to trade![/bold green]"
-                )
-                console.print(
-                    f"\n[bold green]{'='*60}[/bold green]"
-                    f"\n[bold green]WINDOW HOP → {next_mkt.question}[/bold green]"
-                    f"\n[bold green]{remaining:.0f}s remaining | "
-                    f"YES={next_mkt.yes_price:.2f} NO={next_mkt.no_price:.2f}[/bold green]"
-                    f"\n[bold green]{'='*60}[/bold green]\n"
-                )
-            else:
-                return
+            return
 
         # Only evaluate the CURRENT (first) window — the rest are pre-loaded
         # for seamless hopping, NOT for simultaneous trading.

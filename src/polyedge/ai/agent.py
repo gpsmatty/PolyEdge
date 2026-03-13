@@ -25,7 +25,7 @@ from polyedge.strategies.edge_finder import EdgeFinderStrategy
 from polyedge.strategies.cheap_hunter import CheapHunterStrategy
 
 logger = logging.getLogger("polyedge.agent")
-console = Console()
+console = Console(force_terminal=True, force_jupyter=False)
 
 
 class TradingAgent:
