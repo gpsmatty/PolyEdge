@@ -662,11 +662,13 @@ class MicroSniperStrategy:
                 drawdown_from_hwm = (high_water_mark - our_price) / high_water_mark if high_water_mark > 0 else 0
 
                 # Breakeven protection: once trailing stop is armed, never let
-                # the floor drop below entry price.  Without this, a small HWM
-                # with a large stop_pct can produce a floor *below* entry,
-                # turning a winner into a loser.
+                # the floor drop below entry price + exit_slippage.  Without
+                # this, the stop fires at entry_price but the FOK fills at
+                # entry_price - exit_slippage = guaranteed small loss.
+                # Adding exit_slippage ensures the fill comes in at or above
+                # entry (breakeven).
                 trailing_floor = high_water_mark * (1 - stop_pct)
-                breakeven_floor = entry_price
+                breakeven_floor = entry_price + self.config.exit_slippage
                 effective_floor = max(trailing_floor, breakeven_floor)
                 triggered = our_price <= effective_floor
 
