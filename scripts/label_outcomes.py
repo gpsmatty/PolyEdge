@@ -164,6 +164,102 @@ async def _label(limit: int):
         await db.close()
 
 
+async def _label_post_exit(limit: int):
+    """Label closed trades with post-exit MFE/MAE using signal_snapshots as price source.
+
+    For each closed trade, looks at the 5 minutes of signal_snapshots after exit
+    and computes how far the held token's price moved favorably/adversely.
+    This answers: "did we exit too early / leave money on the table?"
+    """
+    from polyedge.core.config import load_config
+    from polyedge.core.db import Database
+
+    settings = load_config()
+    db = Database(settings.database_url)
+    await db.connect()
+
+    try:
+        trades = await db.get_trades_for_post_exit_labeling(limit=limit)
+        if not trades:
+            console.print("[green]All closed trades already have post-exit labels![/green]")
+            return
+
+        console.print(f"[cyan]Labeling post-exit outcomes for {len(trades)} trades[/cyan]")
+
+        # Load snapshot timeline for each unique market in one batch
+        market_ids = list({t["market_id"] for t in trades})
+        min_closed = min(t["closed_at"] for t in trades)
+        max_closed = max(t["closed_at"] for t in trades)
+
+        async with db.pool.acquire() as conn:
+            snap_rows = await conn.fetch(
+                """
+                SELECT ts, features->>'market_id' as market_id,
+                       (features->>'yes_price')::float as yes_price,
+                       (features->>'no_price')::float as no_price
+                FROM polyedge.signal_snapshots
+                WHERE ts >= $1
+                  AND ts <= ($2::timestamptz + INTERVAL '5 minutes')
+                  AND features->>'market_id' = ANY($3)
+                ORDER BY ts ASC
+                """,
+                min_closed,
+                max_closed,
+                market_ids,
+            )
+
+        # Build per-market timeline: {market_id: [(ts, yes_price, no_price), ...]}
+        timelines: dict[str, list[tuple]] = {}
+        for row in snap_rows:
+            mid = row["market_id"]
+            if mid and row["yes_price"] and row["yes_price"] > 0:
+                if mid not in timelines:
+                    timelines[mid] = []
+                timelines[mid].append((row["ts"].timestamp(), row["yes_price"], row["no_price"] or 0))
+
+        labels = []
+        for trade in trades:
+            mid = trade["market_id"]
+            side = trade["side"].lower()  # "yes" or "no"
+            closed_ts = trade["closed_at"].timestamp()
+            exit_price = trade["exit_price"] or 0
+
+            timeline = timelines.get(mid, [])
+            if not timeline or exit_price <= 0:
+                # No snapshot data for this market — mark as 0 so we don't retry
+                labels.append({"trade_id": trade["trade_id"], "post_exit_mfe_5m": 0.0, "post_exit_mae_5m": 0.0})
+                continue
+
+            max_fav = 0.0
+            max_adv = 0.0
+            for ts, yes_p, no_p in timeline:
+                if ts <= closed_ts:
+                    continue
+                if ts > closed_ts + 300:  # 5 minutes
+                    break
+                token_price = yes_p if side == "yes" else no_p
+                if token_price <= 0 or exit_price <= 0:
+                    continue
+                move = (token_price - exit_price) / exit_price
+                max_fav = max(max_fav, move)
+                max_adv = min(max_adv, move)
+
+            labels.append({
+                "trade_id": trade["trade_id"],
+                "post_exit_mfe_5m": max_fav,
+                "post_exit_mae_5m": max_adv,
+            })
+
+        if labels:
+            await db.label_trade_post_exit(labels)
+            console.print(f"[green]Labeled post-exit outcomes for {len(labels)} trades[/green]")
+        else:
+            console.print("[yellow]No trades could be labeled (no snapshot data in range)[/yellow]")
+
+    finally:
+        await db.close()
+
+
 async def _stats():
     """Show research pipeline statistics."""
     from polyedge.core.config import load_config
@@ -207,9 +303,12 @@ async def _stats():
 @click.command()
 @click.option("--limit", default=1000, help="Max snapshots to label per run")
 @click.option("--stats", "show_stats", is_flag=True, help="Show pipeline stats")
-def main(limit: int, show_stats: bool):
+@click.option("--post-exit", "post_exit", is_flag=True, help="Label closed trades with post-exit MFE/MAE (5m window)")
+def main(limit: int, show_stats: bool, post_exit: bool):
     if show_stats:
         asyncio.run(_stats())
+    elif post_exit:
+        asyncio.run(_label_post_exit(limit))
     else:
         asyncio.run(_label(limit))
 

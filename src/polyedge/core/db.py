@@ -307,6 +307,14 @@ class Database:
                 ALTER TABLE polyedge.trades
                 ADD COLUMN IF NOT EXISTS signal_data JSONB;
             """)
+            await conn.execute("""
+                ALTER TABLE polyedge.trades
+                ADD COLUMN IF NOT EXISTS post_exit_mfe_5m FLOAT;
+            """)
+            await conn.execute("""
+                ALTER TABLE polyedge.trades
+                ADD COLUMN IF NOT EXISTS post_exit_mae_5m FLOAT;
+            """)
 
     # --- Markets ---
 
@@ -1233,6 +1241,43 @@ class Database:
                     label.get("token_move_5s"), label.get("token_move_10s"),
                     label.get("token_move_20s"), label.get("token_move_30s"),
                     label.get("max_favorable"), label.get("max_adverse"),
+                )
+
+    async def get_trades_for_post_exit_labeling(self, limit: int = 500) -> list[dict]:
+        """Get closed trades that don't yet have post-exit outcome labels."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT trade_id, market_id, side, exit_price, closed_at
+                FROM polyedge.trades
+                WHERE status = 'CLOSED'
+                  AND closed_at IS NOT NULL
+                  AND post_exit_mfe_5m IS NULL
+                ORDER BY closed_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+            return [dict(r) for r in rows]
+
+    async def label_trade_post_exit(self, labels: list[dict]):
+        """Batch update post-exit MFE/MAE on closed trades.
+
+        Each label dict: {trade_id, post_exit_mfe_5m, post_exit_mae_5m}
+        """
+        if not labels:
+            return
+        async with self.pool.acquire() as conn:
+            for label in labels:
+                await conn.execute(
+                    """
+                    UPDATE polyedge.trades
+                    SET post_exit_mfe_5m = $2, post_exit_mae_5m = $3
+                    WHERE trade_id = $1
+                    """,
+                    label["trade_id"],
+                    label.get("post_exit_mfe_5m"),
+                    label.get("post_exit_mae_5m"),
                 )
 
     async def get_snapshot_stats(self) -> dict:

@@ -603,6 +603,46 @@ class TradeAnalyzer:
             'normal': analyze_group(normal_trades),
         }
 
+    def analyze_post_exit(self) -> dict:
+        """Analyze how much was left on the table after exits using post_exit_mfe_5m.
+
+        post_exit_mfe_5m: max favorable move in the 5 minutes after exit.
+        High value = we exited too early, price kept running.
+        """
+        labeled = [
+            t for t in self.paired_trades
+            if t['exit'].get('post_exit_mfe_5m') is not None
+            and t['exit']['post_exit_mfe_5m'] != 0.0
+        ]
+        if not labeled:
+            return {'labeled_count': 0}
+
+        by_exit_reason = defaultdict(list)
+        all_mfe = []
+        all_mae = []
+        for trade in labeled:
+            mfe = float(trade['exit'].get('post_exit_mfe_5m') or 0)
+            mae = float(trade['exit'].get('post_exit_mae_5m') or 0)
+            all_mfe.append(mfe)
+            all_mae.append(mae)
+            reason = trade['exit'].get('exit_reason', 'unknown') or 'unknown'
+            by_exit_reason[reason].append(mfe)
+
+        reason_summary = {}
+        for reason, mfes in by_exit_reason.items():
+            reason_summary[reason] = {
+                'count': len(mfes),
+                'avg_post_exit_mfe': round(sum(mfes) / len(mfes), 4),
+            }
+
+        return {
+            'labeled_count': len(labeled),
+            'avg_post_exit_mfe': round(sum(all_mfe) / len(all_mfe), 4),
+            'avg_post_exit_mae': round(sum(all_mae) / len(all_mae), 4),
+            'max_left_on_table': round(max(all_mfe), 4),
+            'by_exit_reason': reason_summary,
+        }
+
     def analyze_execution_quality(self) -> dict:
         """Analyze execution quality (slippage, fill rates)."""
         if not self.signal_data or not self.paired_trades:
@@ -864,6 +904,23 @@ async def print_report(analyzer: TradeAnalyzer):
             f"Total Rejected USD: ${fok.get('total_rejected_usd', 0)}",
             title="FOK Rejection Analysis"
         ))
+
+    # Post-exit analysis
+    post_exit = analyzer.analyze_post_exit()
+    if post_exit.get('labeled_count', 0) > 0:
+        lines = [
+            f"[bold]Post-Exit Price Action (5min window)[/bold]",
+            f"Trades with labels: {post_exit['labeled_count']}",
+            f"Avg MFE after exit: {post_exit['avg_post_exit_mfe']*100:.1f}% (money left on table)",
+            f"Avg MAE after exit: {post_exit['avg_post_exit_mae']*100:.1f}% (would have gone against us)",
+            f"Max single exit left on table: {post_exit['max_left_on_table']*100:.1f}%",
+        ]
+        if post_exit.get('by_exit_reason'):
+            lines.append("")
+            lines.append("By exit reason:")
+            for reason, data in post_exit['by_exit_reason'].items():
+                lines.append(f"  {reason}: n={data['count']}, avg_mfe={data['avg_post_exit_mfe']*100:.1f}%")
+        console.print(Panel("\n".join(lines), title="Post-Exit Analysis"))
 
     # Execution quality
     exec_quality = analyzer.analyze_execution_quality()
