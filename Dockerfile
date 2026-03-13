@@ -16,8 +16,11 @@ COPY config/ config/
 # Install package and all dependencies
 RUN pip install --no-cache-dir .
 
-# Starts only the health-check server so DO passes readiness probes.
-# Start trading strategies manually from the DO console:
+# Unbuffered stdout/stderr — critical for real-time logs in DO
+ENV PYTHONUNBUFFERED=1
+
+# Starts health-check server only — passes DO readiness probe on port 8080.
+# Initiate strategies manually from the DO console:
 #   polyedge micro --auto --market "btc 15m"
 #   polyedge sniper --auto
 #   polyedge weather --auto
