@@ -243,7 +243,11 @@ class MicroSniperStrategy:
         # are noise. Data: 33% win rate, -18.68% avg move in low_vol regime.
         if self.config.low_vol_block_enabled:
             int_30 = micro.flow_30s.trade_intensity if micro.flow_30s.is_active else 0.0
-            abs_price_chg = abs(micro.price_change_pct)
+            # Use 30s VWAP drift (recent price activity) instead of cumulative
+            # window move (price_change_pct). The cumulative move stays large
+            # after an early-window spike even when the market is currently dead.
+            raw_drift_30 = micro.flow_30s.vwap_drift if micro.flow_30s.is_active else 0.0
+            abs_price_chg = abs(raw_drift_30)
             if int_30 < self.config.low_vol_max_intensity and abs_price_chg < self.config.low_vol_max_price_change:
                 self.last_no_trade_reason = NoTradeReason.LOW_VOL
                 self._entry_streak[micro.symbol] = 0
