@@ -223,6 +223,10 @@ class MicroStructure:
         return (self.current_price - self.window_start_price) / self.window_start_price
 
     @property
+    def chop_index(self) -> float:
+        return 0.0
+
+    @property
     def momentum_signal(self) -> float:
         if not self.flow_5s.is_active:
             return 0.0

@@ -817,10 +817,30 @@ class MicroSniperStrategy:
         max_exit = self.config.counter_trend_exit_threshold
         effective_exit_threshold = base_exit + trend_strength * (max_exit - base_exit)
 
+        # --- Chop-aware exit threshold ---
+        # In choppy markets a momentum dip to -0.31 is noise, not a reversal.
+        # Reuse the same chop index + config already used by the entry filter —
+        # no new params needed. CHOP:33 with max_boost=0.10 raises the exit bar
+        # from 0.30 to 0.40, requiring deeper conviction before bailing.
+        exit_chop_boost = 0.0
+        if self.config.chop_filter_enabled:
+            chop = micro.chop_index
+            if chop > self.config.chop_threshold:
+                chop_range = self.config.chop_scale - self.config.chop_threshold
+                if chop_range > 0:
+                    chop_frac = min(1.0, (chop - self.config.chop_threshold) / chop_range)
+                    exit_chop_boost = chop_frac * self.config.chop_max_boost
+                    effective_exit_threshold += exit_chop_boost
+
         # Track exit threshold for logging (separate from entry threshold)
+        mods = []
         if trend_strength > 0.01:
-            boost = effective_exit_threshold - base_exit
-            self._last_exit_threshold_detail = f"Exit:{base_exit:.2f}→{effective_exit_threshold:.2f}(30s_trend+{boost:.2f}@{trend_strength:.0%})"
+            trend_boost = base_exit + trend_strength * (max_exit - base_exit) - base_exit
+            mods.append(f"30s_trend+{trend_boost:.2f}@{trend_strength:.0%}")
+        if exit_chop_boost > 0.001:
+            mods.append(f"chop+{exit_chop_boost:.2f}")
+        if mods:
+            self._last_exit_threshold_detail = f"Exit:{base_exit:.2f}→{effective_exit_threshold:.2f}({'+'.join(mods)})"
         else:
             self._last_exit_threshold_detail = f"Exit:{effective_exit_threshold:.2f}"
 
