@@ -23,11 +23,11 @@ import logging
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from rich.console import Console
 from rich.table import Table
 
 from polyedge.core.config import Settings
 from polyedge.core.client import PolyClient
+from polyedge.core.console import console
 from polyedge.core.db import Database
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.markets import fetch_active_markets
@@ -42,7 +42,6 @@ from polyedge.strategies.weather_sniper import (
 )
 
 logger = logging.getLogger("polyedge.weather_runner")
-console = Console(force_terminal=True, force_jupyter=False)
 
 # Intervals
 MARKET_REFRESH_INTERVAL = 300     # 5 minutes — weather markets don't change fast

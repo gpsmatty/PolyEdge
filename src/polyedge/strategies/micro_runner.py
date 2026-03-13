@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from rich.console import Console
+
 import sys
 
 from polyedge.core.config import Settings
@@ -63,8 +63,9 @@ from polyedge.data.research import (
     compute_attribution,
 )
 
+from polyedge.core.console import console
+
 logger = logging.getLogger("polyedge.micro_runner")
-console = Console(force_terminal=True, force_jupyter=False)
 
 # How often to refresh market list from DB
 MARKET_REFRESH_INTERVAL = 120  # seconds (unfiltered)

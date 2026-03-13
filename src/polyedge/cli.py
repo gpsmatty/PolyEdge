@@ -8,13 +8,10 @@ import sys
 from pathlib import Path
 
 import click
-from rich.console import Console
 from rich.table import Table
 
 from polyedge.core.config import load_config
-
-# Force stdout, no TTY auto-detection — ensures output appears in DO runtime logs
-console = Console(file=sys.stdout, highlight=False)
+from polyedge.core.console import console
 
 
 def setup_logging() -> None:

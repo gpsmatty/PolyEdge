@@ -27,10 +27,9 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from rich.console import Console
-
 from polyedge.core.config import Settings
 from polyedge.core.client import PolyClient
+from polyedge.core.console import console
 from polyedge.core.db import Database
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_feed import BinanceFeed, PriceSnapshot, PriceWindow
@@ -46,7 +45,6 @@ from polyedge.strategies.crypto_sniper import (
 )
 
 logger = logging.getLogger("polyedge.sniper_runner")
-console = Console(force_terminal=True, force_jupyter=False)
 
 # How often to re-read crypto markets from the DB.
 # The MarketIndexer handles API sync separately (default every 15 min).

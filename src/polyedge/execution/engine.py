@@ -6,16 +6,14 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from rich.console import Console
-
 from polyedge.core.client import PolyClient
 from polyedge.core.config import Settings
+from polyedge.core.console import console
 from polyedge.core.db import Database
 from polyedge.core.models import Market, OrderStatus, Side, TradeStatus
 from polyedge.risk.portfolio import PortfolioRiskManager, PortfolioSnapshot
 
 logger = logging.getLogger("polyedge.execution")
-console = Console(force_terminal=True, force_jupyter=False)
 
 
 class ExecutionEngine:

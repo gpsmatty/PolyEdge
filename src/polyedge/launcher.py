@@ -29,12 +29,10 @@ import time
 from datetime import datetime, timezone
 
 from aiohttp import web
-from rich.console import Console
+
+from polyedge.core.console import console
 
 logger = logging.getLogger(__name__)
-
-# Force stdout for DO runtime log capture
-console = Console(force_terminal=True, force_jupyter=False, file=sys.stdout, highlight=False)
 
 _PORT = int(os.environ.get("PORT", 8080))
 

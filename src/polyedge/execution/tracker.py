@@ -5,12 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from rich.console import Console
 from rich.table import Table
 
+from polyedge.core.console import console
 from polyedge.core.db import Database
-
-console = Console(force_terminal=True, force_jupyter=False)
 
 
 class PnLTracker:

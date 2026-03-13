@@ -32,16 +32,14 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from rich.console import Console
-
 from polyedge.core.config import Settings
+from polyedge.core.console import console
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_aggtrade import MicroStructure, AggTrade
 from polyedge.data.book_analyzer import BookIntelligence
 from polyedge.data.research import NoTradeReason
 
 logger = logging.getLogger("polyedge.micro_sniper")
-console = Console(force_terminal=True, force_jupyter=False)
 
 
 # ---------------------------------------------------------------------------

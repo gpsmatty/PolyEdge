@@ -8,13 +8,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from rich.console import Console
-
 from polyedge.ai.analyst import analyze_market, quick_score_market
 from polyedge.ai.llm import LLMClient
 from polyedge.ai.news import get_news_context
 from polyedge.core.config import Settings
 from polyedge.core.client import PolyClient
+from polyedge.core.console import console
 from polyedge.core.db import Database
 from polyedge.core.models import AgentMode, Market, Signal, Side
 from polyedge.data.book_analyzer import get_book_intelligence, format_book_for_ai
@@ -25,7 +24,6 @@ from polyedge.strategies.edge_finder import EdgeFinderStrategy
 from polyedge.strategies.cheap_hunter import CheapHunterStrategy
 
 logger = logging.getLogger("polyedge.agent")
-console = Console(force_terminal=True, force_jupyter=False)
 
 
 class TradingAgent:

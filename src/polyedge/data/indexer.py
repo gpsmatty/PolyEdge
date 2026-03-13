@@ -6,15 +6,13 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from rich.console import Console
-
 from polyedge.core.config import Settings
+from polyedge.core.console import console
 from polyedge.core.db import Database
 from polyedge.core.models import Market
 from polyedge.data.markets import fetch_all_markets, _parse_market
 
 logger = logging.getLogger("polyedge.indexer")
-console = Console(force_terminal=True, force_jupyter=False)
 
 
 class MarketIndexer:
