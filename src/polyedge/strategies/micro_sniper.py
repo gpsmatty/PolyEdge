@@ -137,6 +137,7 @@ class MicroSniperStrategy:
         book_intel: Optional[dict[str, BookIntelligence]] = None,  # {"yes": ..., "no": ...}
         entry_price: Optional[float] = None,       # For trailing stop
         high_water_mark: Optional[float] = None,   # For trailing stop
+        flip_hold_remaining: float = 0.0,          # Seconds of flip hold protection left
     ) -> Optional[MicroOpportunity]:
         """Evaluate a single up/down market against current microstructure.
 
@@ -216,7 +217,7 @@ class MicroSniperStrategy:
             return self._evaluate_with_position(
                 market, micro, seconds_remaining, current_position,
                 momentum, confidence, is_bullish, book_intel,
-                entry_price, high_water_mark,
+                entry_price, high_water_mark, flip_hold_remaining,
             )
 
         # --- Check if we should enter ---
@@ -612,6 +613,7 @@ class MicroSniperStrategy:
         book_intel: Optional[dict[str, BookIntelligence]] = None,
         entry_price: Optional[float] = None,
         high_water_mark: Optional[float] = None,
+        flip_hold_remaining: float = 0.0,
     ) -> Optional[MicroOpportunity]:
         """Evaluate when we already have a position — exit, hold, or flip."""
         abs_momentum = abs(momentum)
@@ -839,10 +841,22 @@ class MicroSniperStrategy:
             mods.append(f"30s_trend+{trend_boost:.2f}@{trend_strength:.0%}")
         if exit_chop_boost > 0.001:
             mods.append(f"chop+{exit_chop_boost:.2f}")
+        if flip_hold_remaining > 0:
+            mods.append(f"flip_hold({flip_hold_remaining:.0f}s)")
         if mods:
             self._last_exit_threshold_detail = f"Exit:{base_exit:.2f}→{effective_exit_threshold:.2f}({'+'.join(mods)})"
         else:
             self._last_exit_threshold_detail = f"Exit:{effective_exit_threshold:.2f}"
+
+        # --- Flip hold protection ---
+        # After a flip, the 30s OFI window can flip quickly (e.g., buy-the-dip orders
+        # flood in while price still falls), collapsing exit protection and triggering
+        # an exit on tiny counter-momentum. Require flip_threshold (0.50) conviction
+        # to exit during the hold window instead of the normal exit_threshold.
+        if flip_hold_remaining > 0:
+            effective_exit_threshold = max(effective_exit_threshold, self.config.flip_threshold)
+            if not self.quiet if hasattr(self, 'quiet') else True:
+                pass  # Logged via exit threshold detail below
 
         should_exit_reversal = not aligned and abs_momentum >= effective_exit_threshold
         should_exit_faded = aligned and abs_momentum < self.config.hold_threshold

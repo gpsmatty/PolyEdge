@@ -1081,10 +1081,15 @@ class MicroRunner:
         # Pass trailing stop info to strategy if we have a position
         entry_price = None
         high_water_mark = None
+        flip_hold_remaining = 0.0
         if current_pos and market.condition_id in self._position_info:
             info = self._position_info[market.condition_id]
             entry_price = info["entry_price"]
             high_water_mark = info["hwm"]
+            flip_time = info.get("flip_time", 0.0)
+            if flip_time > 0:
+                elapsed = time.time() - flip_time
+                flip_hold_remaining = max(0.0, self.config.flip_min_hold_seconds - elapsed)
 
         opp = self.strategy.evaluate(
             market=market,
@@ -1094,6 +1099,7 @@ class MicroRunner:
             book_intel=book_intel,
             entry_price=entry_price,
             high_water_mark=high_water_mark,
+            flip_hold_remaining=flip_hold_remaining,
         )
 
         # --- Research pipeline: periodic + event-driven snapshots ---
@@ -1640,6 +1646,7 @@ class MicroRunner:
                     "token_id": token_id,
                     "size": actual_size,
                     "entry_time": time.time(),  # Track when we entered for min-hold
+                    "flip_time": time.time() if opp.is_flip else 0.0,  # Track flip for hold protection
                 }
                 self._trades_this_window += 1
                 self._total_trades += 1

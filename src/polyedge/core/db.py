@@ -263,6 +263,23 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_trade ON polyedge.signal_snapshots(trad
 CREATE INDEX IF NOT EXISTS idx_snapshots_candidate ON polyedge.signal_snapshots(near_threshold) WHERE near_threshold = TRUE;
 CREATE INDEX IF NOT EXISTS idx_snapshots_no_trade ON polyedge.signal_snapshots(no_trade_reason) WHERE no_trade_reason != 'none';
 CREATE INDEX IF NOT EXISTS idx_snapshots_unlabeled ON polyedge.signal_snapshots(outcome_labeled) WHERE outcome_labeled = FALSE;
+
+CREATE TABLE IF NOT EXISTS polyedge.tuning_log (
+    id SERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source VARCHAR(20) NOT NULL DEFAULT 'manual',  -- 'manual', 'scheduled', 'skill'
+    key TEXT NOT NULL,                              -- e.g. 'strategies.micro_sniper.min_seconds_remaining'
+    old_value TEXT,
+    new_value TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',               -- why the change was made
+    data_window_hours INT DEFAULT NULL,            -- how many hours of data informed the decision
+    win_rate_at_change FLOAT DEFAULT NULL,         -- snapshot of key metrics at time of change
+    avg_pnl_at_change FLOAT DEFAULT NULL,
+    trade_count_at_change INT DEFAULT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tuning_log_ts ON polyedge.tuning_log(ts);
+CREATE INDEX IF NOT EXISTS idx_tuning_log_key ON polyedge.tuning_log(key);
 """
 
 
@@ -1277,3 +1294,57 @@ class Database:
                 AND ts < NOW() - INTERVAL '7 days'
                 """
             )
+
+    async def log_tuning_change(
+        self,
+        key: str,
+        new_value: str,
+        reason: str,
+        old_value: str | None = None,
+        source: str = "manual",
+        data_window_hours: int | None = None,
+        win_rate: float | None = None,
+        avg_pnl: float | None = None,
+        trade_count: int | None = None,
+    ):
+        """Log a config change made during a tuning session."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO polyedge.tuning_log
+                    (source, key, old_value, new_value, reason,
+                     data_window_hours, win_rate_at_change, avg_pnl_at_change, trade_count_at_change)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                source,
+                key,
+                old_value,
+                new_value,
+                reason,
+                data_window_hours,
+                win_rate,
+                avg_pnl,
+                trade_count,
+            )
+
+    async def get_tuning_history(self, key: str | None = None, limit: int = 50) -> list[dict]:
+        """Fetch recent tuning changes, optionally filtered by config key."""
+        async with self.pool.acquire() as conn:
+            if key:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM polyedge.tuning_log
+                    WHERE key = $1
+                    ORDER BY ts DESC LIMIT $2
+                    """,
+                    key, limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM polyedge.tuning_log
+                    ORDER BY ts DESC LIMIT $1
+                    """,
+                    limit,
+                )
+            return [dict(r) for r in rows]

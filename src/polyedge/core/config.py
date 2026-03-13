@@ -37,6 +37,7 @@ KEYCHAIN_KEYS = [
     "anthropic_api_key",
     "openai_api_key",
     "news_api_key",
+    "do_api_token",
 ]
 
 
@@ -168,6 +169,7 @@ class MicroSniperConfig(BaseModel):
     enable_flips: bool = False             # Flips disabled — marginal profitability, strong reversals just EXIT
     flip_threshold: float = 0.50           # Reverse momentum threshold to flip (only if enable_flips=True)
     flip_min_confidence: float = 0.50      # Min confidence to flip
+    flip_min_hold_seconds: float = 45.0    # After a flip, require flip_threshold momentum to exit for this many seconds
     min_confidence: float = 0.40           # Min confidence to enter (raised from 0.30)
     min_trades_in_window: int = 10          # Min trades in 15s window to consider (raised — we get 10+ tps now)
     min_trades_for_flip: int = 25          # Min trades in 15s window to flip (higher bar — flips are costly)
@@ -390,6 +392,7 @@ class Settings(BaseSettings):
 
     # External APIs
     news_api_key: str = ""
+    do_api_token: str = ""
 
     # Nested configs (loaded from YAML)
     polymarket: PolymarketConfig = PolymarketConfig()
