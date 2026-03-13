@@ -510,7 +510,10 @@ class MicroStructure:
         if not nonzero:
             return 0.0
 
-        agreement = abs(sum(nonzero)) / len(nonzero)  # 0-1
+        # Use len(signs) not len(nonzero) — otherwise a single active window
+        # gives agreement=1.0 (1/1) instead of 0.33 (1/3).  Flat windows
+        # (ofi near zero) should reduce agreement, not be ignored.
+        agreement = abs(sum(nonzero)) / len(signs)  # 0-1
 
         # Signal strength
         strength = min(1.0, abs(self.momentum_signal) * 2)
