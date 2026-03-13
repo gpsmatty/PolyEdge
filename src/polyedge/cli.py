@@ -1164,6 +1164,7 @@ def autopilot(mode):
         from polyedge.core.config import apply_db_config
         from polyedge.ai.llm import LLMClient
         from polyedge.ai.agent import TradingAgent
+        from polyedge.health import start_health_server
 
         settings = get_settings()
 
@@ -1194,6 +1195,8 @@ def autopilot(mode):
         )
 
         agent = TradingAgent(settings, client, db, llm)
+
+        asyncio.create_task(start_health_server())
 
         try:
             await agent.run()
@@ -1226,6 +1229,7 @@ def sniper(auto, dry, verbose, quiet):
         from polyedge.core.db import Database
         from polyedge.core.config import apply_db_config
         from polyedge.strategies.sniper_runner import SniperRunner
+        from polyedge.health import start_health_server
 
         settings = get_settings()
 
@@ -1251,6 +1255,8 @@ def sniper(auto, dry, verbose, quiet):
             verbose=verbose,
             quiet=quiet,
         )
+
+        asyncio.create_task(start_health_server())
 
         try:
             await runner.run()
@@ -1296,6 +1302,7 @@ def micro(auto, dry, verbose, quiet, market, no_warmup):
         from polyedge.core.db import Database
         from polyedge.core.config import apply_db_config
         from polyedge.strategies.micro_runner import MicroRunner
+        from polyedge.health import start_health_server
 
         settings = get_settings()
 
@@ -1323,6 +1330,8 @@ def micro(auto, dry, verbose, quiet, market, no_warmup):
             market_filter=market,
             skip_warmup=no_warmup,
         )
+
+        asyncio.create_task(start_health_server())
 
         try:
             await runner.run()
@@ -1463,6 +1472,7 @@ def weather(auto, dry):
         from polyedge.core.db import Database
         from polyedge.core.config import apply_db_config
         from polyedge.strategies.weather_runner import WeatherRunner
+        from polyedge.health import start_health_server
 
         settings = get_settings()
 
@@ -1486,6 +1496,8 @@ def weather(auto, dry):
             auto_execute=auto,
             dry_run=dry,
         )
+
+        asyncio.create_task(start_health_server())
 
         try:
             await runner.run()

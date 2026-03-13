@@ -8,16 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps first (cached layer)
+# Copy source and config
 COPY pyproject.toml .
-RUN pip install --no-cache-dir .
-
-# Copy source
 COPY src/ src/
 COPY config/ config/
 
-# Reinstall with local source
-RUN pip install --no-cache-dir -e .
+# Install package and all dependencies
+RUN pip install --no-cache-dir .
 
 # No CMD — run manually via console:
 #   polyedge micro --auto --market "btc 5m"
