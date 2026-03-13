@@ -26,6 +26,10 @@ def setup_logging() -> None:
     root.handlers.clear()
     root.addHandler(handler)
 
+    # Suppress verbose httpx request logging (floods DO Runtime Logs with every CLOB API call)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 def run_async(coro):
     """Helper to run async functions from Click commands."""

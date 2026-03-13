@@ -661,11 +661,24 @@ class MicroSniperStrategy:
 
                 drawdown_from_hwm = (high_water_mark - our_price) / high_water_mark if high_water_mark > 0 else 0
 
-                if drawdown_from_hwm >= stop_pct:
+                # Breakeven protection: once trailing stop is armed, never let
+                # the floor drop below entry price.  Without this, a small HWM
+                # with a large stop_pct can produce a floor *below* entry,
+                # turning a winner into a loser.
+                trailing_floor = high_water_mark * (1 - stop_pct)
+                breakeven_floor = entry_price
+                effective_floor = max(trailing_floor, breakeven_floor)
+                triggered = our_price <= effective_floor
+
+                if triggered:
+                    reason_detail = (
+                        "breakeven protect" if trailing_floor < breakeven_floor
+                        else f"drawdown {drawdown_from_hwm:.0%} ≥ {stop_pct:.0%}"
+                    )
                     console.print(
                         f"[bold yellow]TRAILING STOP: {'YES' if holding_yes else 'NO'} "
                         f"entry=${entry_price:.2f} → HWM=${high_water_mark:.2f} → "
-                        f"now=${our_price:.2f} (drawdown {drawdown_from_hwm:.0%} ≥ {stop_pct:.0%}) "
+                        f"now=${our_price:.2f} ({reason_detail}) "
                         f"— locking in profit[/bold yellow]"
                     )
                     return MicroOpportunity(
