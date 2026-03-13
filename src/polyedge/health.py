@@ -41,7 +41,12 @@ async def start_health_server(port: int = _PORT) -> None:
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    try:
+        await site.start()
+    except OSError:
+        # Port already in use — health-server CMD is already running, nothing to do
+        await runner.cleanup()
+        return
 
     # Run forever — cancelled when the parent task is cancelled
     try:
