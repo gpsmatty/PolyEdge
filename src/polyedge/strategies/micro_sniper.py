@@ -672,10 +672,15 @@ class MicroSniperStrategy:
                 # the floor drop below entry price + exit_slippage.  Without
                 # this, the stop fires at entry_price but the FOK fills at
                 # entry_price - exit_slippage = guaranteed small loss.
-                # Adding exit_slippage ensures the fill comes in at or above
-                # entry (breakeven).
+                # Breakeven floor is entry_price — don't exit at a loss.
+                # The FOK is placed at floor - exit_slippage, so when the floor
+                # equals entry_price the order goes in $0.05 below entry. In
+                # practice the market bid is usually at or above entry so fills
+                # come in at breakeven or better. The old formula used
+                # entry + exit_slippage which made the trailing stop fire $0.05
+                # early and rendered trailing_stop_pct irrelevant on small moves.
                 trailing_floor = high_water_mark * (1 - stop_pct)
-                breakeven_floor = entry_price + self.config.exit_slippage
+                breakeven_floor = entry_price
                 effective_floor = max(trailing_floor, breakeven_floor)
                 triggered = our_price <= effective_floor
 
