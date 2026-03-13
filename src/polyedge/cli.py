@@ -64,6 +64,57 @@ def health_server(port):
     run_async(start_health_server(port=port))
 
 
+@cli.command("run")
+@click.option("--strategy", "-s", default="micro", type=click.Choice(["micro", "sniper", "weather"]),
+              help="Which strategy to run (default: micro)")
+@click.option("--auto/--no-auto", default=True, help="Auto-execute trades (default: on)")
+@click.option("--dry", is_flag=True, help="Dry run — signals only, no trades")
+@click.option("--market", "-m", default=None, help="Market filter (e.g. 'btc 15m')")
+@click.option("--no-warmup", is_flag=True, help="Skip warmup — trade immediately")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--quiet", "-q", is_flag=True, help="Quiet — trades + status only")
+@click.option("--port", default=8080, help="Health/control server port (default 8080)")
+def run(strategy, auto, dry, market, no_warmup, verbose, quiet, port):
+    """Launcher for DigitalOcean App Platform.
+
+    \b
+    Runs the health server permanently (keeps container alive, passes DO
+    health probes) and manages the trading strategy as a controllable task.
+
+    \b
+    Control endpoints on port 8080:
+      curl localhost:8080/status   → see if strategy is running
+      curl localhost:8080/stop     → pause trading (container stays up)
+      curl localhost:8080/start    → resume trading
+
+    \b
+    Examples:
+      polyedge run                              # micro sniper, auto mode
+      polyedge run -s micro -m "btc 15m"        # micro, BTC 15-min only
+      polyedge run -s sniper                    # crypto sniper
+      polyedge run -s weather                   # weather sniper
+      polyedge run --dry -m "btc 5m"            # dry run micro
+    """
+    from polyedge.launcher import Launcher
+
+    strategy_args = {
+        "auto": auto,
+        "dry": dry,
+        "market": market,
+        "no_warmup": no_warmup,
+        "verbose": verbose,
+        "quiet": quiet,
+    }
+
+    launcher = Launcher(
+        strategy=strategy,
+        strategy_args=strategy_args,
+        port=port,
+    )
+
+    run_async(launcher.run())
+
+
 # --- Setup ---
 
 
