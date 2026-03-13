@@ -33,6 +33,21 @@ def cli(ctx, config):
     ctx.obj["config_path"] = config
 
 
+@cli.command("health-server")
+@click.option("--port", default=8080, help="Port to listen on (default 8080)")
+def health_server(port):
+    """Run only the health-check HTTP server (no trading).
+
+    Used as the container entrypoint on DigitalOcean App Platform so the
+    process stays alive and passes readiness probes while you start trading
+    strategies manually from the console.
+    """
+    from polyedge.health import start_health_server
+
+    console.print(f"[cyan]Health server listening on 0.0.0.0:{port}[/cyan]")
+    run_async(start_health_server(port=port))
+
+
 # --- Setup ---
 
 

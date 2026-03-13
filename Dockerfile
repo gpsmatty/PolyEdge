@@ -16,7 +16,9 @@ COPY config/ config/
 # Install package and all dependencies
 RUN pip install --no-cache-dir .
 
-# No CMD — run manually via console:
-#   polyedge micro --auto --market "btc 5m"
+# Starts only the health-check server so DO passes readiness probes.
+# Start trading strategies manually from the DO console:
+#   polyedge micro --auto --market "btc 15m"
 #   polyedge sniper --auto
 #   polyedge weather --auto
+CMD ["polyedge", "health-server"]
