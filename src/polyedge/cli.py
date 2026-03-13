@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -12,7 +13,21 @@ from rich.table import Table
 
 from polyedge.core.config import load_config
 
-console = Console()
+# Force stdout, no TTY auto-detection — ensures output appears in DO runtime logs
+console = Console(file=sys.stdout, highlight=False)
+
+
+def setup_logging() -> None:
+    """Route all logging module output to stdout for DO runtime log capture."""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(handler)
 
 
 def run_async(coro):
@@ -29,6 +44,7 @@ def get_settings():
 @click.pass_context
 def cli(ctx, config):
     """PolyEdge — AI-powered Polymarket trading bot."""
+    setup_logging()
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config
 
