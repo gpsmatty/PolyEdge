@@ -321,11 +321,25 @@ class MicroStructure:
             if oldest > 0 and newest > 0:
                 return (newest - oldest) / oldest
 
-        # Fall back to DB-loaded price history
+        # Fall back to DB-loaded price history — use only the last 5 minutes.
+        # price_history can hold up to 30 minutes of snapshots; using price_history[0]
+        # (the oldest) would make this a 30-minute trend, which is far too wide for
+        # a threshold calibrated against 5-minute moves (0.30% in 30m is common,
+        # in 5m it's a genuine strong move).
         if self.price_history and self.current_price > 0:
-            oldest_price = self.price_history[0][0]  # (price, timestamp)
-            if oldest_price > 0:
-                return (self.current_price - oldest_price) / oldest_price
+            cutoff = time.time() - 300  # 5 minutes ago
+            # Walk forward from oldest to find the oldest snapshot within 5 minutes
+            ref_price = None
+            for price, ts in self.price_history:
+                if ts >= cutoff:
+                    ref_price = price
+                    break
+            # If all snapshots are older than 5m, use the most recent one as a
+            # best-effort approximation rather than returning a stale 30m value.
+            if ref_price is None and self.price_history:
+                ref_price = self.price_history[-1][0]
+            if ref_price and ref_price > 0:
+                return (self.current_price - ref_price) / ref_price
 
         return 0.0
 

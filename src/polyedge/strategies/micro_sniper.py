@@ -272,13 +272,14 @@ class MicroSniperStrategy:
         # 5 minutes, don't buy NO on a brief dip — it's a pullback, not a
         # reversal. This is the "persistence" that was missing.
         trend_5m = micro.trend_5m
+        # Compute trust once — reused by both the hard block and threshold boost below.
+        flow_age = 0.0
+        if micro.flow_5m.is_active and micro.flow_5m._trades:
+            flow_age = micro.flow_5m._trades[-1].timestamp - micro.flow_5m._trades[0].timestamp
+        has_db_context = len(micro.price_history) > 0
+        trend_trusted = flow_age >= self.config.trend_warmup_seconds or has_db_context
+
         if self.config.trend_bias_enabled and abs(trend_5m) > 0:
-            # Check if we have enough data to trust the trend
-            flow_age = 0.0
-            if micro.flow_5m.is_active and micro.flow_5m._trades:
-                flow_age = micro.flow_5m._trades[-1].timestamp - micro.flow_5m._trades[0].timestamp
-            has_db_context = len(micro.price_history) > 0
-            trend_trusted = flow_age >= self.config.trend_warmup_seconds or has_db_context
 
             if trend_trusted:
                 is_counter_5m = (
@@ -327,8 +328,8 @@ class MicroSniperStrategy:
         )
         is_counter_trend = opposition > 0.01  # For logging
 
-        # Apply 5m trend bias boost on top of 30s filter
-        if self.config.trend_bias_enabled and abs(trend_5m) >= self.config.trend_bias_min_pct:
+        # Apply 5m trend bias boost on top of 30s filter — only when trend is trusted.
+        if self.config.trend_bias_enabled and trend_trusted and abs(trend_5m) >= self.config.trend_bias_min_pct:
             is_counter_5m = (
                 (is_bullish and trend_5m < -self.config.trend_bias_min_pct) or
                 (not is_bullish and trend_5m > self.config.trend_bias_min_pct)
