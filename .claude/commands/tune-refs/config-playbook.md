@@ -202,11 +202,24 @@ Below this abs(drift_signal) = "flat price."
 **Lower** when: consistently exiting far below mid (paying too much slippage)
 **Nudge**: ±0.01.
 
-### `entry_slippage` (default 0.02)
-2 cents above market for instant FOK fill on entry.
-**Raise** when: entry FOK rejections appearing in DO logs
-**Lower** when: consistently overpaying on entry
+### `entry_slippage` (default 0.02, currently 0.04)
+Base slippage above market for first FOK entry attempt.
+**Raise** when: first-attempt FOK rejections still common after retry escalation
+**Lower** when: consistently overpaying on entry (fill price far above signal price)
 **Nudge**: ±0.01.
+
+### `entry_slippage_retry_step` (default 0.02) ⚠️ NEW — under evaluation
+Added to slippage on each FOK retry. Attempt 1=base, attempt 2=base+step, attempt 3=base+2×step, then resets. Motivation: strong OFI signals (0.99) were getting FOK'd on thin books during fast BTC moves, then the 30s cooldown locked out the entire move. Now retries with escalating slippage, signal threshold is the only gate.
+**Raise** when: still missing fills after 3 retries on strong signals
+**Lower** when: overpaying on retries, entering at bad prices
+**Set to 0** to disable retry escalation entirely.
+**Do not tune aggressively** — this feature is new and needs a full session of data before drawing conclusions.
+
+### `entry_slippage_max` (default 0.10)
+Hard cap on entry slippage across all retries. Prevents runaway slippage on repeated rejections.
+**Raise** when: retries hitting the cap but signal is still strong and book has repriced to a level worth entering
+**Lower** when: paying too much on retried entries
+**Nudge**: ±0.02.
 
 ---
 

@@ -202,6 +202,9 @@ class MicroRunner:
         # Exit attempt tracking: condition_id -> count of failed FOK sells
         self._exit_attempts: dict[str, int] = {}
 
+        # Entry FOK retry tracking: condition_id -> count of failed FOK buys
+        self._entry_attempts: dict[str, int] = {}
+
         # Trade tracking
         self._trades_this_window: int = 0
         self._total_trades: int = 0
@@ -845,6 +848,7 @@ class MicroRunner:
 
         # Reset window counters for new market set
         self._trades_this_window = 0
+        self._entry_attempts.clear()
 
         # Manage Polymarket WS
         new_token_set = set(new_token_ids)
@@ -1506,7 +1510,12 @@ class MicroRunner:
         # place_fok_order takes USD amount directly — SDK handles rounding to avoid
         # the "invalid amounts" error where maker_amount has >2 decimal places.
         price = opp.market_price
-        slippage = self.config.entry_slippage
+        cid = opp.market.condition_id
+        retry_count = self._entry_attempts.get(cid, 0)
+        slippage = min(
+            self.config.entry_slippage + retry_count * self.config.entry_slippage_retry_step,
+            self.config.entry_slippage_max,
+        )
         entry_price = min(round(price + slippage, 2), 0.99)  # Pay up to Nc more for instant fill
         size = round(size_usd / entry_price, 2) if entry_price > 0 else 0
 
@@ -1652,6 +1661,7 @@ class MicroRunner:
                 self._trades_this_window += 1
                 self._total_trades += 1
                 self._last_trade_log[cid] = time.time()
+                self._entry_attempts.pop(cid, None)  # Reset retry counter on success
                 console.print(
                     f"[green]Order placed: {opp.side.value} {actual_size:.1f} @ ${actual_entry:.3f} "
                     f"(${size_usd:.2f}) — ID: {poly_order_id}[/green]"
@@ -1663,11 +1673,15 @@ class MicroRunner:
         except Exception as e:
             err_msg = str(e)
             if "fully filled" in err_msg or "FOK" in err_msg:
-                # FOK rejected — not enough liquidity at our price. Normal, just skip.
-                # Apply trade cooldown so we don't spam retries on an empty book.
-                self._last_trade_log[cid] = time.time()
+                # FOK rejected — escalate slippage on next retry, reset after 3 attempts.
+                attempts = self._entry_attempts.get(cid, 0) + 1
+                self._entry_attempts[cid] = 0 if attempts >= 3 else attempts
+                new_slip = min(
+                    self.config.entry_slippage + attempts * self.config.entry_slippage_retry_step,
+                    self.config.entry_slippage_max,
+                )
                 if not self.quiet:
-                    console.print(f"[dim]  FOK rejected @ ${entry_price:.2f} (mkt ${price:.2f}) — no liquidity, cooling down[/dim]")
+                    console.print(f"[dim]  FOK rejected @ ${entry_price:.2f} (mkt ${price:.2f}) — retry #{attempts} slippage → ${new_slip:.2f}[/dim]")
             else:
                 console.print(f"[red]  Execution error: {e}[/red]")
                 logger.error(f"Micro execution failed: {e}", exc_info=True)

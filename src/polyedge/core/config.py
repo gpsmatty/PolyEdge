@@ -208,6 +208,8 @@ class MicroSniperConfig(BaseModel):
 
     # Slippage: how many cents above market to bid for instant fill
     entry_slippage: float = 0.02           # Pay up to 2c more for entry FOK fill
+    entry_slippage_retry_step: float = 0.02  # Each FOK retry adds this much slippage (0 = no escalation)
+    entry_slippage_max: float = 0.10       # Max slippage cap across all retries
     exit_slippage: float = 0.05            # Sell up to 5c below market for exit FOK fill (wider = fills on first try)
 
     # Trade cooldown: seconds between trades on the same market.
