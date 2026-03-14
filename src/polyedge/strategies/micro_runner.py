@@ -1720,11 +1720,14 @@ class MicroRunner:
         local_token_id = info.get("token_id", "")
 
         # Use wider exit slippage — price moves fast, tight slippage = FOK rejections.
-        # ESCALATION: each failed FOK attempt adds 3 cents to slippage so we don't
-        # loop forever while the price drops. After 3 failures the floor is 14 cents
-        # below market, which practically guarantees a fill.
+        # ESCALATION: each failed FOK attempt adds exit_slippage_retry_step to the floor,
+        # capped at exit_slippage_max total. Cap prevents runaway floors on fast crashes
+        # where each failed attempt would otherwise compound into a terrible fill price.
         attempts = self._exit_attempts.get(cid, 0)
-        exit_slip = self.config.exit_slippage + (attempts * 0.03)
+        exit_slip = min(
+            self.config.exit_slippage + (attempts * self.config.exit_slippage_retry_step),
+            self.config.exit_slippage_max,
+        )
         sell_price = max(0.01, round(price - exit_slip, 2))
 
         # Log book for visibility but ALWAYS use floor price for the FOK.
