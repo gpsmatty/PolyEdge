@@ -649,6 +649,38 @@ class MicroSniperStrategy:
                     exit_reason="take_profit",
                 )
 
+        # --- MAX LOSS STOP ---
+        # If position loses max_loss_pct from entry, exit immediately.
+        # Fills the gap below entry that trailing stop doesn't cover
+        # (trailing stop only arms after min_profit_pct gain).
+        if self.config.max_loss_pct > 0 and entry_price:
+            our_price = market.yes_price if holding_yes else market.no_price
+            loss_from_entry = (entry_price - our_price) / entry_price if entry_price > 0 else 0
+            if loss_from_entry >= self.config.max_loss_pct:
+                console.print(
+                    f"[bold red]MAX LOSS STOP: {'YES' if holding_yes else 'NO'} "
+                    f"entry=${entry_price:.2f} → now=${our_price:.2f} "
+                    f"(loss {loss_from_entry:.0%} ≥ {self.config.max_loss_pct:.0%}) "
+                    f"— cutting loss[/bold red]"
+                )
+                return MicroOpportunity(
+                    market=market,
+                    symbol=micro.symbol,
+                    action=MicroAction.EXIT,
+                    side=Side.YES if holding_yes else Side.NO,
+                    momentum=momentum,
+                    confidence=confidence,
+                    ofi_5s=micro.flow_5s.ofi,
+                    ofi_15s=micro.flow_15s.ofi,
+                    vwap_drift=micro.flow_15s.vwap_drift,
+                    trade_intensity=micro.flow_5s.trade_intensity,
+                    binance_price=micro.current_price,
+                    price_change_pct=micro.price_change_pct,
+                    market_price=our_price,
+                    seconds_remaining=seconds_remaining,
+                    exit_reason="max_loss",
+                )
+
         # --- TRAILING STOP LOSS ---
         # When enabled: tracks the high water mark (HWM) of our position's price.
         # Once price has risen above entry by min_profit_pct, the stop is "armed".
@@ -668,32 +700,24 @@ class MicroSniperStrategy:
 
                 drawdown_from_hwm = (high_water_mark - our_price) / high_water_mark if high_water_mark > 0 else 0
 
-                # Breakeven protection: once trailing stop is armed, never let
-                # the floor drop below entry price + exit_slippage.  Without
-                # this, the stop fires at entry_price but the FOK fills at
-                # entry_price - exit_slippage = guaranteed small loss.
-                # Breakeven floor is entry_price — don't exit at a loss.
-                # The FOK is placed at floor - exit_slippage, so when the floor
-                # equals entry_price the order goes in $0.05 below entry. In
-                # practice the market bid is usually at or above entry so fills
-                # come in at breakeven or better. The old formula used
-                # entry + exit_slippage which made the trailing stop fire $0.05
-                # early and rendered trailing_stop_pct irrelevant on small moves.
+                # Trailing floor: HWM-based stop with breakeven protection.
+                # Floor never drops below entry_price — trailing stop never exits at a loss.
+                # max_loss_pct handles catastrophic losses below entry independently.
                 trailing_floor = high_water_mark * (1 - stop_pct)
                 breakeven_floor = entry_price
                 effective_floor = max(trailing_floor, breakeven_floor)
                 triggered = our_price <= effective_floor
 
                 if triggered:
-                    reason_detail = (
-                        "breakeven protect" if trailing_floor < breakeven_floor
-                        else f"drawdown {drawdown_from_hwm:.0%} ≥ {stop_pct:.0%}"
-                    )
+                    if trailing_floor < breakeven_floor:
+                        reason_detail = "breakeven protect"
+                    else:
+                        reason_detail = f"drawdown {drawdown_from_hwm:.0%} ≥ {stop_pct:.0%}"
                     console.print(
                         f"[bold yellow]TRAILING STOP: {'YES' if holding_yes else 'NO'} "
                         f"entry=${entry_price:.2f} → HWM=${high_water_mark:.2f} → "
                         f"now=${our_price:.2f} ({reason_detail}) "
-                        f"— locking in profit[/bold yellow]"
+                        f"— {'breakeven exit' if trailing_floor < breakeven_floor else 'locking in profit'}[/bold yellow]"
                     )
                     return MicroOpportunity(
                         market=market,

@@ -310,6 +310,11 @@ class MicroSniperConfig(BaseModel):
     take_profit_enabled: bool = True               # Master toggle
     take_profit_price: float = 0.90                # Exit when our token price >= this
 
+    # Max loss stop: exit if position loses X% from entry, regardless of momentum.
+    # Protects against trades that immediately go wrong and never recover.
+    # Trailing stop only arms after min_profit_pct gain — this fills the gap below entry.
+    max_loss_pct: float = 0.35                     # Exit if token drops 35% from entry price (0 = disabled)
+
     # --- Per-timeframe overrides ---
     # Maps timeframe keys ("5m", "15m", "1h", "1d") to partial config dicts.
     # Only override fields that differ from the base config above.

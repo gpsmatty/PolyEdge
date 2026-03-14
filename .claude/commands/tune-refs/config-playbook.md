@@ -134,6 +134,16 @@ This is the "if you see X, adjust Y" reference for the `/tune` command. Each sec
 **Note**: Currently catching good exits at 0.90. Would lower to 0.85 if consistent data shows 0.90 being missed.
 **Nudge**: ±0.02–0.05.
 
+### `max_loss_pct` (default 0.35, currently 0.45) ⚠️ NEW — under evaluation
+Exits position if token drops X% from entry price, regardless of momentum or time remaining.
+Fills the gap that trailing stop doesn't cover: trailing stop only arms after min_profit_pct gain.
+Without this, a trade that immediately goes wrong rides all the way to window close (floor_exit).
+**Raise** when: max_loss is triggering on trades that would have recovered (check post-exit MFE)
+**Lower** when: losses are still too large before max_loss fires, or a -$4+ loss occurs again
+**Set to 0** to disable entirely.
+**Do not tune aggressively** — new feature, needs a full session of data before conclusions.
+**Nudge**: ±0.05.
+
 ---
 
 ## Adaptive Bias
