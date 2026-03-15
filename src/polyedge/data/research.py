@@ -32,7 +32,7 @@ logger = logging.getLogger("polyedge.research")
 
 # Bump this when snapshot schema changes.
 # Stored with every row so backtests know which fields were available.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +208,16 @@ class SignalSnapshot:
     exit_reason: str = ""            # "trailing_stop", "reversal", "force_exit", "floor_exit", "faded"
     no_trade_reason: str = "none"    # NoTradeReason value
 
+    # Depth feed (leading indicator from order book)
+    depth_momentum: float = 0.0         # Composite depth signal [-1, 1]
+    depth_imbalance: float = 0.0        # Current near-touch imbalance [-1, 1]
+    depth_imbalance_velocity_1s: float = 0.0  # Rate of change of imbalance (1s)
+    depth_imbalance_velocity_3s: float = 0.0  # Rate of change of imbalance (3s)
+    depth_delta: float = 0.0            # Bid/ask growth differential
+    depth_large_order_signal: float = 0.0  # Sudden large order detection
+    depth_confidence: float = 0.0       # Agreement across depth sub-signals
+    depth_tick_count: int = 0           # How many depth snapshots accumulated
+
     # Near-threshold tracking (for candidate-event logging)
     near_threshold: bool = False     # Was momentum within 0.05 of entry threshold?
     distance_to_threshold: float = 0.0  # How far from firing
@@ -258,6 +268,14 @@ class SignalSnapshot:
             "trade_action": self.trade_action,
             "exit_reason": self.exit_reason,
             "no_trade_reason": self.no_trade_reason,
+            "depth_momentum": round(self.depth_momentum, 4),
+            "depth_imbalance": round(self.depth_imbalance, 4),
+            "depth_imbalance_velocity_1s": round(self.depth_imbalance_velocity_1s, 4),
+            "depth_imbalance_velocity_3s": round(self.depth_imbalance_velocity_3s, 4),
+            "depth_delta": round(self.depth_delta, 4),
+            "depth_large_order_signal": round(self.depth_large_order_signal, 4),
+            "depth_confidence": round(self.depth_confidence, 4),
+            "depth_tick_count": self.depth_tick_count,
             "near_threshold": self.near_threshold,
             "distance_to_threshold": round(self.distance_to_threshold, 4),
             "attribution": self.attribution,
@@ -407,6 +425,7 @@ class ResearchLogger:
         entry_price: float = 0.0,
         high_water_mark: float = 0.0,
         event_type: str = "periodic",
+        depth=None,  # Optional[DepthStructure]
     ) -> SignalSnapshot:
         """Build a complete SignalSnapshot from current state.
 
@@ -479,6 +498,25 @@ class ResearchLogger:
         if window_duration > 0 and seconds_remaining >= 0:
             elapsed_pct = max(0.0, min(1.0, 1.0 - seconds_remaining / window_duration))
 
+        # Depth feed metrics (leading indicator)
+        depth_momentum = 0.0
+        depth_imbalance = 0.0
+        depth_vel_1s = 0.0
+        depth_vel_3s = 0.0
+        depth_delta_val = 0.0
+        depth_large = 0.0
+        depth_conf = 0.0
+        depth_ticks = 0
+        if depth and depth.is_active:
+            depth_momentum = depth.depth_momentum
+            depth_imbalance = depth.imbalance
+            depth_vel_1s = depth.imbalance_velocity_1s
+            depth_vel_3s = depth.imbalance_velocity_3s
+            depth_delta_val = depth.depth_delta
+            depth_large = depth.large_order_signal
+            depth_conf = depth.confidence
+            depth_ticks = depth.tick_count
+
         return SignalSnapshot(
             timestamp=time.time(),
             session_id=self.session_id,
@@ -514,6 +552,14 @@ class ResearchLogger:
             spread=market.spread if market else 0.0,
             liquidity=market.liquidity if market else 0.0,
             event_type=event_type,
+            depth_momentum=depth_momentum,
+            depth_imbalance=depth_imbalance,
+            depth_imbalance_velocity_1s=depth_vel_1s,
+            depth_imbalance_velocity_3s=depth_vel_3s,
+            depth_delta=depth_delta_val,
+            depth_large_order_signal=depth_large,
+            depth_confidence=depth_conf,
+            depth_tick_count=depth_ticks,
         )
 
     async def log_snapshot(self, snap: SignalSnapshot):

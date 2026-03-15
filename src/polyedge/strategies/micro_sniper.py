@@ -36,6 +36,7 @@ from polyedge.core.config import Settings
 from polyedge.core.console import console
 from polyedge.core.models import Market, Signal, Side
 from polyedge.data.binance_aggtrade import MicroStructure, AggTrade
+from polyedge.data.binance_depth import DepthStructure
 from polyedge.data.book_analyzer import BookIntelligence
 from polyedge.data.research import NoTradeReason
 
@@ -138,6 +139,7 @@ class MicroSniperStrategy:
         entry_price: Optional[float] = None,       # For trailing stop
         high_water_mark: Optional[float] = None,   # For trailing stop
         flip_hold_remaining: float = 0.0,          # Seconds of flip hold protection left
+        depth: Optional[DepthStructure] = None,    # Binance order book depth (leading indicator)
     ) -> Optional[MicroOpportunity]:
         """Evaluate a single up/down market against current microstructure.
 
@@ -184,6 +186,25 @@ class MicroSniperStrategy:
                 # bullish momentum + bearish book = weaker signal.
                 poly_adj = self.config.poly_book_imbalance_weight * yes_book.imbalance_5c
                 momentum = max(-1.0, min(1.0, momentum + poly_adj))
+
+        # --- Blend Binance depth signal (leading indicator) ---
+        # When depth_enabled=True and depth_signal_weight > 0, blend the
+        # depth momentum (from limit order book changes) with aggTrade momentum.
+        # depth_signal_weight=0 means depth data is logged but doesn't affect trades.
+        self._last_depth_momentum = 0.0
+        if self.config.depth_enabled and depth and depth.is_active and self.config.depth_signal_weight > 0:
+            depth_mom = depth.depth_momentum
+            self._last_depth_momentum = depth_mom
+            # Weighted blend: final = aggtrade_weight * aggTrade + depth_weight * depth
+            w_agg = self.config.depth_aggtrade_weight
+            w_depth = self.config.depth_signal_weight
+            total_w = w_agg + w_depth
+            if total_w > 0:
+                momentum = (w_agg * momentum + w_depth * depth_mom) / total_w
+                momentum = max(-1.0, min(1.0, momentum))
+        elif depth and depth.is_active:
+            # Even when not blending, track depth momentum for research logging
+            self._last_depth_momentum = depth.depth_momentum
 
         abs_momentum = abs(momentum)
         is_bullish = momentum > 0

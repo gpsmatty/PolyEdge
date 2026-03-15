@@ -39,6 +39,7 @@ from polyedge.data.binance_aggtrade import (
     AggTrade,
     MicroStructure,
 )
+from polyedge.data.binance_depth import BinanceDepthFeed, DepthStructure
 from polyedge.data.binance_feed import BinanceFeed
 from polyedge.data.ws_feed import MarketFeed, EVENT_BEST_BID_ASK, EVENT_LAST_TRADE, EVENT_BOOK
 from polyedge.data.book_analyzer import analyze_book, BookIntelligence
@@ -180,6 +181,13 @@ class MicroRunner:
         # Also keep the regular ticker feed for price reference
         self.ticker_feed = BinanceFeed(symbols=self.config.symbols)
 
+        # Binance order book depth feed — LEADING indicator
+        # Tracks limit order changes (placement/cancellation) to detect
+        # buying/selling pressure BEFORE it hits market orders.
+        self.depth_feed = BinanceDepthFeed(symbols=self.config.symbols)
+        # Push ALL configurable params to each DepthStructure — nothing hardcoded
+        self._push_depth_config()
+
         # Polymarket price feed
         self.poly_feed = MarketFeed(settings)
         self._poly_task: Optional[asyncio.Task] = None
@@ -235,6 +243,24 @@ class MicroRunner:
         # Window hop cooldown — seconds since last hop before allowing entries.
         # Lets stale cross-window momentum flush out of the 15s/30s OFI windows.
         self._last_hop_time: float = 0.0  # time.time() of most recent hop
+
+    def _push_depth_config(self):
+        """Push all depth config params to DepthStructure instances. No hardcoded values."""
+        for depth in self.depth_feed.depth.values():
+            depth.imbalance_levels = self.config.depth_imbalance_levels
+            depth.velocity_window_s = self.config.depth_velocity_window_s
+            depth.large_order_threshold = self.config.depth_large_order_threshold
+            depth.weight_imbalance_velocity = self.config.depth_weight_imbalance_velocity
+            depth.weight_depth_delta = self.config.depth_weight_depth_delta
+            depth.weight_large_order = self.config.depth_weight_large_order
+            depth.velocity_scale = self.config.depth_velocity_scale
+            depth.pull_scale = self.config.depth_pull_scale
+            depth.confidence_weight_agreement = self.config.depth_confidence_weight_agreement
+            depth.confidence_weight_strength = self.config.depth_confidence_weight_strength
+            depth.confidence_weight_data = self.config.depth_confidence_weight_data
+            depth.confidence_min_snapshots = self.config.depth_confidence_min_snapshots
+            depth.confidence_data_ok_snapshots = self.config.depth_confidence_data_ok_snapshots
+            depth.gap_clear_seconds = self.config.depth_gap_clear_seconds
 
     async def _quick_sync(self):
         """Targeted API fetch for crypto 5-min markets.
@@ -505,6 +531,7 @@ class MicroRunner:
             )
             self.agg_feed = BinanceAggTradeFeed(symbols=active_symbols)
             self.ticker_feed = BinanceFeed(symbols=active_symbols)
+            self.depth_feed = BinanceDepthFeed(symbols=active_symbols)
 
         # --- Load persistent price context from DB ---
         # On startup, load the last 30 min of price snapshots so the bot
@@ -552,6 +579,7 @@ class MicroRunner:
         tasks = [
             asyncio.create_task(self.agg_feed.start()),
             asyncio.create_task(self.ticker_feed.start()),
+            asyncio.create_task(self.depth_feed.start()),
             asyncio.create_task(self._market_refresh_loop()),
             asyncio.create_task(self._status_loop()),
             asyncio.create_task(self._price_log_loop()),
@@ -576,6 +604,7 @@ class MicroRunner:
             self.running = False
             await self.agg_feed.stop()
             await self.ticker_feed.stop()
+            await self.depth_feed.stop()
             await self._stop_poly_feed()
             for t in tasks:
                 t.cancel()
@@ -584,6 +613,7 @@ class MicroRunner:
         self.running = False
         await self.agg_feed.stop()
         await self.ticker_feed.stop()
+        await self.depth_feed.stop()
         await self._stop_poly_feed()
 
     # ------------------------------------------------------------------
@@ -1095,6 +1125,9 @@ class MicroRunner:
                 elapsed = time.time() - flip_time
                 flip_hold_remaining = max(0.0, self.config.flip_min_hold_seconds - elapsed)
 
+        # Get depth state for this symbol (leading indicator from order book)
+        depth_state = self.depth_feed.get_depth(symbol)
+
         opp = self.strategy.evaluate(
             market=market,
             micro=micro,
@@ -1104,6 +1137,7 @@ class MicroRunner:
             entry_price=entry_price,
             high_water_mark=high_water_mark,
             flip_hold_remaining=flip_hold_remaining,
+            depth=depth_state,
         )
 
         # --- Research pipeline: periodic + event-driven snapshots ---
@@ -1123,6 +1157,7 @@ class MicroRunner:
                     entry_price=entry_price or 0.0,
                     high_water_mark=high_water_mark or 0.0,
                     event_type="periodic",
+                    depth=depth_state,
                 )
                 # Candidate detection: momentum near threshold but not crossing
                 abs_mom = abs(micro.momentum_signal)
@@ -1272,6 +1307,7 @@ class MicroRunner:
         # --- Research pipeline: log trade event with attribution ---
         if micro:
             try:
+                trade_depth = self.depth_feed.get_depth(opp.symbol) if self.config.depth_enabled else None
                 snap = self.research.build_snapshot(
                     micro=micro, market=opp.market,
                     seconds_remaining=opp.seconds_remaining,
@@ -1280,6 +1316,7 @@ class MicroRunner:
                     entry_price=entry_price_val or 0.0,
                     high_water_mark=high_water_mark_val or 0.0,
                     event_type="trade",
+                    depth=trade_depth,
                 )
                 # Compute intensity component for attribution
                 int_5 = micro.flow_5s.trade_intensity if micro.flow_5s.is_active else 0.0
@@ -2133,6 +2170,9 @@ class MicroRunner:
                     micro.dampener_disagree_factor = self.config.dampener_disagree_factor
                     micro.dampener_flat_factor = self.config.dampener_flat_factor
                     micro.dampener_price_deadzone = self.config.dampener_price_deadzone
+
+                # Push ALL depth params to DepthStructure instances
+                self._push_depth_config()
 
                 # Log any changes
                 changes = []
