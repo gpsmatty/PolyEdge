@@ -56,10 +56,11 @@ PolyEdge is an AI-powered trading bot for Polymarket prediction markets. It is a
 | `book_analyzer.py` | Order book microstructure analysis. Computes imbalance, depth, whale detection, wall detection. | `analyze_book()`, `get_book_intelligence()`, `format_book_for_ai()`, `BookIntelligence` |
 | `binance_feed.py` | Binance WebSocket feed for real-time crypto prices (BTC, ETH, SOL). No auth needed. Combined streams, auto-reconnect. | `BinanceFeed`, `PriceSnapshot`, `PriceWindow` |
 | `binance_aggtrade.py` | Binance aggTrade WebSocket feed — tick-level trade data with buy/sell classification (~10-50 tps for BTC). Maintains rolling flow windows (5s/15s/30s/5m) for OFI, VWAP drift, trade intensity. Flow-price agreement dampener with configurable score-shaping params. Gap detection resets stale data on reconnect. Confidence computed as `abs(sum(nonzero_signs)) / 3` (always divides by 3, the total window count) — a single active window gives 0.33, not 1.0. | `BinanceAggTradeFeed`, `AggTrade`, `MicroStructure`, `TradeFlowWindow` |
+| `binance_depth.py` | Binance @depth20@100ms WebSocket feed — order book depth as a LEADING indicator. Unlike aggTrade (lagging — past filled trades), depth captures limit order placement/cancellation BEFORE price moves. Key signal: imbalance velocity (rate of book tilt). | `BinanceDepthFeed`, `DepthStructure`, `DepthSnapshot`, `DepthLevel` |
 | `weather_feed.py` | Weather forecast feed from Open-Meteo (ensemble) and NOAA (official). Caches forecasts, supports multiple locations. No API key needed. | `WeatherFeed`, `EnsembleForecast`, `NOAAForecast`, `LOCATIONS`, `find_location()` |
 | `ws_feed.py` | WebSocket feed for real-time Polymarket data. Connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. No auth needed. Must send `PING` every 10s. | `MarketFeed` |
 | `signals.py` | External data sources (stub). | — |
-| `research.py` | Research pipeline for micro sniper. Signal snapshots (complete feature vectors every 2-3s + event-driven), regime tagging (deterministic state machine: trend_up/down, chop, vol_expansion, low_vol), no-trade reason logging, candidate-event logging (near-threshold almost-signals), attribution computation (per-component contribution breakdown), and OFI flip tracking. Buffer-based writes flush to DB every 5s. Schema-versioned rows (SCHEMA_VERSION=1). | `ResearchLogger`, `SignalSnapshot`, `Regime`, `NoTradeReason`, `classify_regime()`, `compute_attribution()`, `OFIFlipTracker` |
+| `research.py` | Research pipeline for micro sniper. Signal snapshots (complete feature vectors every 2-3s + event-driven), regime tagging (deterministic state machine: trend_up/down, chop, vol_expansion, low_vol), no-trade reason logging, candidate-event logging (near-threshold almost-signals), attribution computation (per-component contribution breakdown), and OFI flip tracking. Buffer-based writes flush to DB every 5s. Schema-versioned rows (SCHEMA_VERSION=2, adds 8 depth fields: depth_momentum, depth_imbalance, depth_imbalance_velocity_1s/3s, depth_delta, depth_large_order_signal, depth_confidence, depth_tick_count). | `ResearchLogger`, `SignalSnapshot`, `Regime`, `NoTradeReason`, `classify_regime()`, `compute_attribution()`, `OFIFlipTracker` |
 
 ### Strategies (`src/polyedge/strategies/`)
 
@@ -142,7 +143,7 @@ All tables in the `polyedge` schema (PostgreSQL). Defined in `core/db.py` as the
 | `reconcile_state` | Tracks last CLOB API sync cursor for incremental reconciliation. |
 | `micro_price_log` | Persistent price snapshots for micro sniper trend context. Logged every ~30s per symbol. Loaded on startup for cross-restart awareness. Auto-pruned to 60 min. |
 | `tuning_log` | Config change history. Each row records: key, old/new value, reason, data window, and win_rate/avg_pnl/trade_count at time of change. Written by `/tune` command (source='auto') or manually. Indexes on `ts` and `key`. |
-| `signal_snapshots` | Research pipeline data. Complete feature vector snapshots (~50 fields as JSONB) logged every 2-3s + event-driven (trades, candidates, threshold crossings). Denormalized columns for fast queries (regime, dampened_momentum, btc_price, yes_price, seconds_remaining, trade_fired, no_trade_reason, near_threshold). Outcome labels (btc/token moves at 5/10/20/30s + MFE/MAE) added offline by `label_outcomes.py`. Schema-versioned (version=1). Pruned: periodic snapshots 72h, trade/candidate 7 days. |
+| `signal_snapshots` | Research pipeline data. Complete feature vector snapshots (~58 fields as JSONB) logged every 2-3s + event-driven (trades, candidates, threshold crossings). Denormalized columns for fast queries (regime, dampened_momentum, btc_price, yes_price, seconds_remaining, trade_fired, no_trade_reason, near_threshold). Outcome labels (btc/token moves at 5/10/20/30s + MFE/MAE) added offline by `label_outcomes.py`. Schema-versioned (version=2, adds 8 depth fields: depth_momentum, depth_imbalance, depth_imbalance_velocity_1s/3s, depth_delta, depth_large_order_signal, depth_confidence, depth_tick_count). Pruned: periodic snapshots 72h, trade/candidate 7 days. |
 
 ## Polymarket API Details
 
@@ -175,7 +176,14 @@ All tables in the `polyedge` schema (PostgreSQL). Defined in `core/db.py` as the
 - Ping interval: 20 seconds (handled by websockets library)
 - Auto-reconnect with exponential backoff (2s base, 30s max)
 
-Used exclusively by the crypto sniper strategy as a price oracle to compare against Polymarket's short-duration crypto markets.
+**Depth stream** (`@depth20@100ms`):
+- Top 20 bid/ask levels every 100ms — no REST snapshot needed (self-contained)
+- Stream name: `btcusdt@depth20@100ms`
+- Format: `{"lastUpdateId": ..., "bids": [["price", "qty"], ...], "asks": [["price", "qty"], ...]}`
+- No authentication needed — same base URL as other streams
+- Used by `BinanceDepthFeed` for LEADING indicator signals (order placement/cancellation before price moves)
+
+Used by the crypto sniper strategy as a price oracle and by the micro sniper's depth feed for order book momentum signals.
 
 ## Agent Scan Cycle (How It Works)
 
@@ -222,7 +230,7 @@ Defined in `micro_runner.py` `MicroRunner.run()`. Runs as a persistent async pro
 
 1. **Start** — Loads markets from DB/API, narrows Binance feeds to only matched symbols (e.g., only `btcusdt@aggTrade` when `--market btc 5m`), connects Binance aggTrade + Polymarket WebSocket. Loads persistent price context from `micro_price_log` DB table (last 30 min) so the bot immediately knows the macro trend on startup. Skips the first partial window to warm up microstructure data — waits for the next fresh window before trading.
 2. **aggTrade callback** (every 5th trade tick, ~2-10 evals/sec) — On each Binance aggTrade, updates `MicroStructure` rolling flow windows (5s/15s/30s/5m OFI, VWAP drift, trade intensity). The 5m window is persistent — does NOT reset on window hops, providing cross-window context. Evaluates only the current (first) window — rest are pre-loaded for seamless hopping.
-3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy): 10% OFI_5s + 50% OFI_15s + 25% VWAP drift + 15% intensity surge. The raw composite is then multiplied by a **flow-price agreement dampener** — a continuous factor from 0.4 (flow opposed price movement) through 0.65 (price flat despite flow) to 1.0 (flow confirmed by price). This kills false signals where aggressive order flow gets absorbed by the book without displacing price. VWAP drift is scaled by `vwap_drift_scale` (default 2000) to normalize BTC dollar moves into the [-1, 1] signal range.
+3. **Momentum signal** — Composite score from -1 (strong sell) to +1 (strong buy). **Primary signal source: Binance order book depth** (`depth_signal_weight=1.0`). Depth momentum = 50% imbalance velocity (rate of book tilt change) + 30% depth delta (bid/ask growth rate) + 20% large order detection. This is a LEADING indicator — captures limit order placement/cancellation BEFORE price moves. **Legacy aggTrade signal** (`depth_aggtrade_weight=0.0`): 10% OFI_5s + 50% OFI_15s + 25% VWAP drift + 15% intensity surge, multiplied by flow-price agreement dampener. aggTrade still runs for trend/price tracking but does not drive trades when `depth_aggtrade_weight=0`. Final momentum = `depth_signal_weight * depth_momentum + depth_aggtrade_weight * aggtrade_momentum`. The weights are DB-configurable and hot-reloadable, allowing gradual blending (e.g., 0.7 depth + 0.3 aggTrade) or instant rollback to pure aggTrade (`depth_signal_weight=0, depth_aggtrade_weight=1`).
 4. **Entry** — When `|momentum| > 0.50` (entry_threshold), confidence > 0.40, at least 10 trades in the 15s window, and market price between 0.35-0.65, enter a position (BUY YES if bullish, BUY NO if bearish). **Entry persistence filter**: signal must sustain for 2 seconds in the same direction (time-based, not count-based). **5-minute trend bias**: if BTC has moved >0.15% in 5 min (from persistent 5m flow window or DB history), blocks or penalizes counter-trend entries. >0.30% = hard block, 0.15%-0.30% = boosts entry_threshold by 0.10. Survives window hops and restarts. DB fallback uses the oldest snapshot within the last 5 minutes (not the full 30-minute history, which would make the threshold fire too aggressively). Both the hard block and threshold boost are gated on `trend_trusted` (60s warmup OR DB context available). **30s trend filter**: if entry direction disagrees with the 30-second OFI trend, requires higher threshold of 0.55 (counter_trend_threshold) instead of 0.50. This kills counter-trend entries that are the #1 source of losses. **Adaptive directional bias**: shifts entry thresholds per-side based on 30m macro trend from `micro_price_log`. Bearish 30m (>0.30% down) → YES threshold += spread/2, NO threshold -= spread/2. Bullish → opposite. Default 0.10 spread (±0.05). Hot-reloadable via DB config. **High intensity blocker**: blocks entries when 30s trade intensity > 50 tps (configurable). Data shows losers avg ~61 tps vs winners ~40 tps — high intensity = chaotic book where OFI signals are noise.
 5. **Exit** — Four triggers: (a) take-profit when our token price >= 0.90 (configurable, checked first), (b) momentum reverses past exit_threshold (0.30) against our position, (c) trailing stop triggers at 18% drawdown from high water mark (pure HWM-based, no breakeven floor — max_loss_pct handles downside protection below entry), (d) force exit with <8s remaining. Hold threshold is disabled (set to 0) — caused premature exits on momentum pauses. **Chop-aware exit threshold**: in high-chop conditions (large price range but no net direction), the exit_threshold is raised by the same scaling used for entry — at CHOP:33 (chop_index=3.3 with defaults), exit threshold rises from 0.30 to 0.40, requiring deeper momentum reversal before dumping a position. Reuses `chop_filter_enabled`, `chop_threshold`, `chop_scale`, `chop_max_boost` config with no additional parameters. Prevents jetting profitable positions on momentum noise during choppy windows.
 5a. **Exit escalation** — Each failed FOK sell attempt adds 3 cents to the floor price slippage, preventing stuck exit loops where the bot tries to sell 7+ times while the price drops.
@@ -317,6 +325,24 @@ The `micro` CLI command runs the micro sniper: `polyedge micro --dry --market "b
 - `take_profit_price` (float, default 0.90) — take-profit trigger price. Prevents watching winners touch 0.90+ then selling on the way back down in the 70s-80s
 - `max_loss_pct` (float, default 0.35) — exit if token drops 35% from entry price regardless of momentum. Fills the downside gap that trailing stop doesn't cover (trailing stop only arms after min_profit_pct gain — if a trade goes immediately wrong and never recovers, nothing exits it without this). Set to 0 to disable. Hot-reloadable.
 - `timeframes` (dict[str, dict], default {}) — per-timeframe config overrides. Maps timeframe keys ("5m", "15m", "1h", "1d") to partial config dicts. Only override fields that differ from the base config. At runtime, the runner merges base + timeframe overrides for the active window duration. Set via DB: `strategies.micro_sniper.timeframes.15m.entry_threshold = 0.55`. Hot-reloadable every 30s.
+- `depth_enabled` (bool, default true) — master toggle for Binance order book depth feed
+- `depth_signal_weight` (float, default 1.0) — weight of depth_momentum in final composite (1.0 = depth only)
+- `depth_aggtrade_weight` (float, default 0.0) — weight of aggTrade momentum in final composite (0 = disabled, aggTrade still runs for trend tracking)
+- `depth_weight_imbalance_velocity` (float, default 0.50) — imbalance velocity component weight (the leading signal — rate of book tilt change)
+- `depth_weight_depth_delta` (float, default 0.30) — bid/ask depth growth rate weight
+- `depth_weight_large_order` (float, default 0.20) — sudden large order detection weight
+- `depth_imbalance_levels` (int, default 5) — number of price levels for near-touch imbalance calculation
+- `depth_velocity_window_s` (float, default 3.0) — primary velocity window in seconds
+- `depth_large_order_threshold` (float, default 3.0) — multiple of mean level size to flag as "large" order
+- `depth_velocity_scale` (float, default 2.0) — multiplier to normalize velocity into [-1,1]
+- `depth_pull_scale` (float, default 5.0) — multiplier to scale pull signal (pulls are small %)
+- `depth_confidence_weight_agreement` (float, default 0.4) — confidence: weight of sub-signal agreement
+- `depth_confidence_weight_strength` (float, default 0.4) — confidence: weight of signal magnitude
+- `depth_confidence_weight_data` (float, default 0.2) — confidence: weight of data sufficiency
+- `depth_confidence_min_snapshots` (int, default 10) — min depth snapshots before confidence > 0
+- `depth_confidence_data_ok_snapshots` (int, default 30) — snapshots at which data_ok = 1.0
+- `depth_gap_clear_seconds` (float, default 2.0) — seconds of gap before clearing depth history (WebSocket disconnect)
+- `depth_max_snapshots` (int, default 200) — max snapshot history (100ms each, 200 = 20s of book state)
 
 ### Per-Timeframe Config System
 
@@ -434,6 +460,7 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 - **Flow-price agreement dampener** — Core signal quality innovation. Aggressive order flow that doesn't displace price was absorbed by the book — not tradeable edge. Continuous dampener scales momentum by how well OFI direction is confirmed by actual VWAP movement. Biggest single improvement to signal quality.
 - **FOK as natural filter** — Fill-or-Kill orders on thin Polymarket liquidity act as an accidental risk filter. When the market moves fast, FOK rejections prevent entries into adverse conditions. However, FOK rejections on strong signals (OFI +0.99) were identified as a source of missed profitable positions — market makers pull asks during fast moves, then repost after repricing. The entry FOK retry escalation (step 5b) addresses this by retrying with increasing slippage, using signal threshold as the natural gate.
 - **No cooldown on FOK entry rejection** — FOK rejections do not start the trade cooldown timer. Signal evaluation is the only gate. If momentum holds, the bot retries immediately with escalating slippage. If momentum fades, retries stop naturally. The old 30-second post-FOK cooldown was locking out entire moves.
+- **Depth over aggTrade** — aggTrade OFI was proven non-predictive (49.2% directional accuracy at 30s = coin flip). aggTrade measures past filled trades (lagging). Depth measures limit order placement/cancellation (leading) — shows WHERE orders are being placed BEFORE price moves. Key metric is imbalance velocity (rate of change), not static imbalance level. Three-level toggle: `depth_enabled` (feed on/off), `depth_signal_weight=0` (log only), `depth_signal_weight>0` (active). All params DB-configurable and hot-reloadable.
 - **Micro sniper focus** — Project started broader (AI agent, crypto sniper, weather sniper, cheap hunter) but the micro sniper is now the primary active strategy and main development focus.
 
 ## Testing
@@ -455,6 +482,7 @@ CLI: `polyedge vault store|list|remove [key] [value]` — manages Keychain entri
 | `test_crypto_sniper.py` | Normal CDF accuracy, market type classification (up/down, threshold, bucket), symbol extraction (BTC/ETH/SOL/XRP/DOGE), threshold probability (log-normal), bucket probability (range CDF), direction probability, regex patterns, strike extraction, arrow/range bucket parsing |
 | `test_weather_sniper.py` | Ensemble probability (in-range, above, below, boundary), location matching, market parsing (bucket ranges, below/above, precipitation), weather identification, event grouping, evaluate with forecast, neg-risk detection, confidence scoring, config defaults, signal conversion |
 | `test_micro_sniper.py` | Momentum entry/exit/flip logic, threshold validation, sparse data guard, min_entry_price guard, confidence filtering, force exit, config defaults, trade count requirements for flips |
+| `test_binance_depth.py` | Order book depth signal: imbalance velocity, depth delta, large order detection, composite momentum, confidence, gap detection, leading signal properties |
 
 ## Common Modification Patterns
 
