@@ -202,6 +202,9 @@ class MicroSniperStrategy:
             if total_w > 0:
                 momentum = (w_agg * momentum + w_depth * depth_mom) / total_w
                 momentum = max(-1.0, min(1.0, momentum))
+                # Blend confidence too — aggTrade confidence is meaningless
+                # when depth is the primary signal (low tps ≠ low confidence)
+                confidence = (w_agg * confidence + w_depth * depth.confidence) / total_w
         elif depth and depth.is_active:
             # Even when not blending, track depth momentum for research logging
             self._last_depth_momentum = depth.depth_momentum
