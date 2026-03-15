@@ -317,6 +317,30 @@ class MicroSniperConfig(BaseModel):
     # Trailing stop only arms after min_profit_pct gain — this fills the gap below entry.
     max_loss_pct: float = 0.35                     # Exit if token drops 35% from entry price (0 = disabled)
 
+    # --- Binance order book depth integration ---
+    # Uses @depth20@100ms stream for LEADING indicators (limit order changes).
+    # Unlike aggTrade (lagging — past trades), depth shows intent (orders being
+    # placed/pulled) BEFORE price moves. The key metric is imbalance velocity:
+    # how fast the book is tilting toward one side.
+    depth_enabled: bool = True                     # Master toggle — uses order book depth (leading indicator)
+    depth_weight_imbalance_velocity: float = 0.50  # Imbalance velocity (the leading signal)
+    depth_weight_depth_delta: float = 0.30         # Bid/ask depth growth rate
+    depth_weight_large_order: float = 0.20         # Sudden large order detection
+    depth_imbalance_levels: int = 5                # Number of levels for near-touch imbalance
+    depth_velocity_window_s: float = 3.0           # Primary velocity window in seconds
+    depth_large_order_threshold: float = 3.0       # Multiple of mean level size to flag as "large"
+    depth_signal_weight: float = 1.0               # Weight of depth_momentum in final composite (1.0 = depth only)
+    depth_aggtrade_weight: float = 0.0             # Weight of existing momentum_signal (0 = disabled)
+    depth_velocity_scale: float = 2.0              # Multiplier to normalize velocity into [-1,1] range
+    depth_pull_scale: float = 5.0                  # Multiplier to scale pull signal (pulls are small %)
+    depth_confidence_weight_agreement: float = 0.4 # Confidence: weight of sub-signal agreement
+    depth_confidence_weight_strength: float = 0.4  # Confidence: weight of signal magnitude
+    depth_confidence_weight_data: float = 0.2      # Confidence: weight of data sufficiency
+    depth_confidence_min_snapshots: int = 10        # Min snapshots before confidence > 0
+    depth_confidence_data_ok_snapshots: int = 30    # Snapshots at which data_ok = 1.0
+    depth_gap_clear_seconds: float = 2.0           # Seconds of gap before clearing depth history
+    depth_max_snapshots: int = 200                  # Max snapshot history (100ms each, 200 = 20s)
+
     # --- Per-timeframe overrides ---
     # Maps timeframe keys ("5m", "15m", "1h", "1d") to partial config dicts.
     # Only override fields that differ from the base config above.
