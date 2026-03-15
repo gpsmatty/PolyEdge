@@ -461,8 +461,15 @@ class MicroRunner:
                 console.print(f"[bold cyan]Timeframe config: {_active} ({_n} overrides active)[/bold cyan]")
             else:
                 console.print(f"[dim]Timeframe config: {_active} (using base defaults, available: {_tf_keys})[/dim]")
+        if self.config.depth_enabled:
+            if self.config.depth_aggtrade_weight > 0:
+                signal_src = f"Depth({self.config.depth_signal_weight:.0%}) + aggTrade({self.config.depth_aggtrade_weight:.0%})"
+            else:
+                signal_src = "Depth ONLY (@depth20@100ms)"
+        else:
+            signal_src = "aggTrade ONLY (depth OFF)"
         console.print(
-            f"[dim]Feed: Binance aggTrade (~10-50 tps) + Polymarket WS{filter_str}[/dim]"
+            f"[dim]Signal: {signal_src} | Feed: Binance + Polymarket WS{filter_str}[/dim]"
         )
 
         # --- Diagnostic: show book override config ---
@@ -1293,6 +1300,12 @@ class MicroRunner:
             # Show threshold breakdown
             thr_detail = getattr(self.strategy, '_last_threshold_detail', '')
             thr_str = f" | Thr: {thr_detail}" if thr_detail else ""
+            # Depth signal at trade time
+            depth_str = ""
+            if self.config.depth_enabled:
+                ds = self.depth_feed.get_depth(opp.symbol)
+                if ds and ds.is_active:
+                    depth_str = f" | Depth: {ds.depth_momentum:+.2f}(v{ds.imbalance_velocity_3s:+.2f})"
             console.print(
                 f"[bold {action_color}]MICRO [{action_str}][/bold {action_color}] "
                 f"{opp.symbol.replace('usdt','').upper()} "
@@ -1301,7 +1314,7 @@ class MicroRunner:
                 f"| Mkt: {opp.market_price:.2f} ({price_source}) "
                 f"| ${opp.binance_price:,.2f} "
                 f"| {opp.seconds_remaining:.0f}s left"
-                f"{book_str}{thr_str}"
+                f"{depth_str}{book_str}{thr_str}"
             )
 
         # --- Research pipeline: log trade event with attribution ---
@@ -2062,10 +2075,21 @@ class MicroRunner:
                         # Bearish momentum — NO gap is meaningful, YES is dormant
                         thr_str = f" Y:{yes_thr:.2f} N:{no_thr:.2f}(gap {no_thr - abs_mom:+.2f})"
 
+                # Depth feed indicator
+                depth_str = ""
+                if self.config.depth_enabled:
+                    ds = self.depth_feed.get_depth(sym)
+                    if ds and ds.is_active:
+                        dm = ds.depth_momentum
+                        dv = ds.imbalance_velocity_3s
+                        depth_str = f" Depth:{dm:+.2f}(v{dv:+.2f})"
+                    else:
+                        depth_str = " Depth:--"
+
                 micro_lines.append(
                     f"{sym_short}: ${price:,.2f} {arrow} "
                     f"Mom:{momentum:+.2f} OFI:{ofi:+.2f} "
-                    f"{intensity:.0f}tps{trend_str}{bias_str}{chop_str}{thr_str}"
+                    f"{intensity:.0f}tps{trend_str}{bias_str}{chop_str}{depth_str}{thr_str}"
                 )
 
             n_pos = len(self._positions)
