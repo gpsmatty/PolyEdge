@@ -659,6 +659,9 @@ class MakerRunner:
                 if self.config.cancel_before_requote:
                     await self._cancel_market_quotes(condition_id, yes_token_id)
                     await self._cancel_market_quotes(condition_id, no_token_id)
+                    # Brief pause for cancel propagation — prevents race where
+                    # new orders post before old ones are fully removed
+                    await asyncio.sleep(0.1)
 
                 # Build batch
                 orders = [q.as_order_dict() for q in qs.all_quotes()]
@@ -694,12 +697,26 @@ class MakerRunner:
                 logger.warning(f"Post quotes failed: {e}")
 
     async def _cancel_market_quotes(self, condition_id: str, token_id: str):
-        """Cancel all our orders on a market."""
+        """Cancel all our orders on a market.
+
+        Uses both tracked order IDs AND blanket cancel for belt-and-suspenders.
+        """
         try:
+            # First: cancel by tracked order IDs (most reliable)
+            tracked_ids = self.live_order_ids.get(condition_id, [])
+            if tracked_ids:
+                try:
+                    self.client.cancel_orders_batch(tracked_ids)
+                except Exception:
+                    pass  # Fall through to blanket cancel
+
+            # Second: blanket cancel by token (catches any we lost track of)
             self.client.cancel_market_orders(asset_id=token_id)
             self.live_order_ids.pop(condition_id, None)
         except Exception as e:
             logger.warning(f"Cancel market orders failed: {e}")
+            # Still clear tracking — stale IDs cause problems
+            self.live_order_ids.pop(condition_id, None)
 
     def _log_dry_quotes(self, market, qs: QuoteSet, depth_momentum: float = 0.0):
         """Log quotes in dry-run mode."""
