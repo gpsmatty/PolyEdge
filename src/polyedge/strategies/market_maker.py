@@ -13,6 +13,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -162,17 +163,51 @@ class MarketMakerStrategy:
         self,
         yes_price: float,
         no_price: float,
+        btc_price: float = 0.0,
+        btc_open_price: float = 0.0,
+        seconds_remaining: float = 900.0,
     ) -> float:
         """Compute fair value for the YES token.
 
-        For now, uses the midpoint of best bid/ask from the Polymarket book.
-        Future: incorporate Binance-implied probability.
+        Primary signal: Binance BTC price → P(UP) via normal CDF.
+        Fallback: Polymarket midpoint when Binance data unavailable.
 
-        Returns a value between 0.01 and 0.99.
+        The Binance-derived probability is the LEADING indicator — it
+        updates every 100ms vs Polymarket book which lags by seconds.
+        Poly mid is blended in at low weight for stability.
         """
-        # Simple midpoint of YES best bid/ask
-        mid = (yes_price + (1.0 - no_price)) / 2.0
-        return max(0.01, min(0.99, round(mid, 2)))
+        poly_mid = (yes_price + (1.0 - no_price)) / 2.0
+        poly_mid = max(0.01, min(0.99, poly_mid))
+
+        if btc_price <= 0 or btc_open_price <= 0:
+            return round(poly_mid, 2)
+
+        # Compute P(UP) from Binance price change
+        change_pct = (btc_price - btc_open_price) / btc_open_price
+        abs_change = abs(change_pct)
+
+        # BTC 15-minute base volatility ~0.3% (annualized ~50%)
+        base_vol = 0.003
+        effective_remaining = seconds_remaining + 15.0  # Buffer for resolution delay
+        remaining_fraction = max(effective_remaining / 300, 0.05)
+        remaining_vol = base_vol * math.sqrt(remaining_fraction)
+
+        if remaining_vol > 0 and abs_change > 0:
+            z_score = abs_change / remaining_vol
+            p_direction_holds = _normal_cdf(z_score)
+            p_direction_holds = max(0.50, min(0.99, p_direction_holds))
+        else:
+            p_direction_holds = 0.50
+
+        # P(UP) = P(direction holds) if BTC is up, else 1 - P(direction holds)
+        if change_pct >= 0:
+            binance_fv = p_direction_holds
+        else:
+            binance_fv = 1.0 - p_direction_holds
+
+        # Blend: 80% Binance (leading), 20% Poly (stability)
+        fv = 0.80 * binance_fv + 0.20 * poly_mid
+        return max(0.01, min(0.99, round(fv, 2)))
 
     def compute_spread(
         self,
@@ -271,6 +306,8 @@ class MarketMakerStrategy:
         tick_size: float = 0.01,
         yes_best_bid: float = 0.0,
         no_best_bid: float = 0.0,
+        btc_price: float = 0.0,
+        btc_open_price: float = 0.0,
     ) -> QuoteSet:
         """Compute the full quote set for a market — both YES and NO sides.
 
@@ -304,7 +341,11 @@ class MarketMakerStrategy:
         now = time.monotonic()
         last_quote = self._last_quote_time.get(condition_id, 0)
         last_fv = self._last_fair_value.get(condition_id, 0)
-        fair_value = self.compute_fair_value(yes_price, no_price)
+        fair_value = self.compute_fair_value(
+            yes_price, no_price,
+            btc_price=btc_price, btc_open_price=btc_open_price,
+            seconds_remaining=seconds_remaining,
+        )
         qs.fair_value = fair_value
         no_fair_value = round(1.0 - fair_value, 2)
 
@@ -482,3 +523,19 @@ class MarketMakerStrategy:
         self._last_quote_time.clear()
         self._pulled_until.clear()
         self._window_pnl.clear()
+
+
+def _normal_cdf(x: float) -> float:
+    """Approximate the standard normal CDF (Abramowitz & Stegun 7.1.26)."""
+    if x < 0:
+        return 1.0 - _normal_cdf(-x)
+    b0 = 0.2316419
+    b1 = 0.319381530
+    b2 = -0.356563782
+    b3 = 1.781477937
+    b4 = -1.821255978
+    b5 = 1.330274429
+    t = 1.0 / (1.0 + b0 * x)
+    t2, t3, t4, t5 = t * t, t * t * t, t**4, t**5
+    inner = b1 * t + b2 * t2 + b3 * t3 + b4 * t4 + b5 * t5
+    return 1.0 - (math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)) * inner

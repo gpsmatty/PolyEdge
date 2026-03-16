@@ -117,8 +117,9 @@ class MakerRunner:
         self.no_best_bids: dict[str, float] = {}  # condition_id -> actual NO best bid
         self._token_to_market: dict[str, tuple[Market, str]] = {}  # token_id -> (Market, "yes"|"no")
 
-        # Depth feed
+        # Depth feed + BTC price tracking
         self.depth_feed: Optional[BinanceDepthFeed] = None
+        self._btc_open_prices: dict[str, float] = {}  # condition_id -> BTC price at window start
 
         # Polymarket WebSocket
         self.poly_feed: Optional[MarketFeed] = None
@@ -412,6 +413,7 @@ class MakerRunner:
 
                 # Reset strategy state for old window (also clears inventory)
                 self.strategy.reset_window(old_cid)
+                self._btc_open_prices.pop(old_cid, None)
 
                 # Promote next window
                 market_list.pop(0)
@@ -545,6 +547,17 @@ class MakerRunner:
                 return ds.depth_momentum
         return 0.0
 
+    def _get_btc_mid_price(self) -> float:
+        """Get current BTC mid price from Binance depth feed."""
+        if not self.depth_feed:
+            return 0.0
+        symbols = self._get_symbols()
+        for sym in symbols:
+            ds = self.depth_feed.depth.get(sym)
+            if ds and ds.is_active and ds.mid_price > 0:
+                return ds.mid_price
+        return 0.0
+
     # --- Quote Loop ---
 
     async def _quote_loop(self):
@@ -610,6 +623,14 @@ class MakerRunner:
         yes_best_bid = self.yes_best_bids.get(condition_id, 0)
         no_best_bid = self.no_best_bids.get(condition_id, 0)
 
+        # Get BTC price from depth feed for Binance-informed fair value
+        btc_price = self._get_btc_mid_price()
+        btc_open = self._btc_open_prices.get(condition_id, 0)
+        # Record BTC open price on first quote of each window
+        if btc_open <= 0 and btc_price > 0:
+            self._btc_open_prices[condition_id] = btc_price
+            btc_open = btc_price
+
         # Compute quotes
         qs = self.strategy.compute_quotes(
             condition_id=condition_id,
@@ -621,6 +642,8 @@ class MakerRunner:
             depth_momentum=depth_momentum,
             yes_best_bid=yes_best_bid,
             no_best_bid=no_best_bid,
+            btc_price=btc_price,
+            btc_open_price=btc_open,
         )
 
         if qs.reason_pulled:
