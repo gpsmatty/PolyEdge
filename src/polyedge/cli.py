@@ -1541,6 +1541,77 @@ def price_logger(symbols, interval):
     run_async(_price_logger())
 
 
+# --- Market Maker ---
+
+
+@cli.command()
+@click.option("--auto", is_flag=True, help="Auto-execute (post real orders)")
+@click.option("--dry", is_flag=True, help="Dry run — compute quotes but don't post")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
+@click.option("-q", "--quiet", is_flag=True, help="Minimal output")
+@click.option("--market", default=None, help='Filter markets (e.g. "btc 15m")')
+def maker(auto, dry, verbose, quiet, market):
+    """Start the market maker — post-only limit orders on crypto up/down markets.
+
+    \b
+    Posts bids and asks on both sides of the book to capture the spread.
+    ALL orders are post-only (maker-only) — zero taker fees + rebates.
+    Uses Binance depth as a DEFENSIVE signal to pull quotes during
+    momentum spikes, preventing adverse selection.
+
+    \b
+    Includes a dead-man switch (heartbeat) — if the bot crashes, the
+    exchange automatically cancels all orders within 10 seconds.
+
+    \b
+    Examples:
+      polyedge maker --dry --market "btc"     # Watch BTC markets
+      polyedge maker --auto --market "btc 15m" # Auto-trade BTC 15-min
+      polyedge maker --dry                     # All up/down markets
+
+    No AI needed — pure spread capture with inventory management.
+    """
+
+    async def _maker():
+        from polyedge.core.client import PolyClient
+        from polyedge.core.db import Database
+        from polyedge.core.config import apply_db_config
+        from polyedge.strategies.maker_runner import MakerRunner
+
+        settings = get_settings()
+
+        if not settings.poly_private_key:
+            console.print("[red]POLY_PRIVATE_KEY not set. Run: polyedge vault store poly_private_key[/red]")
+            return
+
+        db = Database(settings.database_url)
+        await db.connect()
+        await apply_db_config(settings, db)
+
+        client = PolyClient(settings)
+        client.initialize()
+
+        runner = MakerRunner(
+            settings=settings,
+            client=client,
+            db=db,
+            auto=auto,
+            dry=dry,
+            market_filter=market,
+            verbose=verbose,
+            quiet=quiet,
+        )
+
+        try:
+            await runner.run()
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Market Maker stopped[/yellow]")
+        finally:
+            await db.close()
+
+    run_async(_maker())
+
+
 # --- Weather Sniper ---
 
 

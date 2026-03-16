@@ -11,8 +11,10 @@ from py_clob_client.clob_types import (
     ApiCreds,
     AssetType,
     BalanceAllowanceParams,
+    OpenOrderParams,
     OrderArgs,
     OrderType,
+    PostOrdersArgs,
     TradeParams,
 )
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -152,12 +154,19 @@ class PolyClient:
         price: float,
         size: float,
         order_type: str = "GTC",
+        post_only: bool = False,
+        expiration: int = 0,
     ) -> dict:
         """Place a limit order on Polymarket.
 
         Args:
             order_type: "GTC" (rests on book), "FOK" (fill all or cancel),
-                        "FAK" (fill what you can, cancel rest).
+                        "FAK" (fill what you can, cancel rest), "GTD" (good til date).
+            post_only: If True, order is rejected if it would immediately match
+                       (cross the spread). Guarantees maker status — zero fees + rebate.
+                       Only valid with GTC or GTD order types.
+            expiration: Unix timestamp (seconds) after which the order expires.
+                        Required for GTD orders. Ignored for other types.
         """
         self.ensure_ready()
         order_args = OrderArgs(
@@ -165,12 +174,16 @@ class PolyClient:
             price=price,
             size=size,
             side=get_poly_side(side),
+            expiration=expiration,
         )
         signed_order = self.client.create_order(order_args)
-        otype = {"GTC": OrderType.GTC, "FOK": OrderType.FOK, "FAK": OrderType.FAK}.get(
-            order_type.upper(), OrderType.GTC
-        )
-        return self.client.post_order(signed_order, otype)
+        otype = {
+            "GTC": OrderType.GTC,
+            "FOK": OrderType.FOK,
+            "FAK": OrderType.FAK,
+            "GTD": OrderType.GTD,
+        }.get(order_type.upper(), OrderType.GTC)
+        return self.client.post_order(signed_order, otype, post_only=post_only)
 
     def place_fok_order(
         self,
@@ -245,10 +258,145 @@ class PolyClient:
         self.ensure_ready()
         return self.client.get_orders()
 
+    def get_open_orders_for_market(
+        self,
+        market: str | None = None,
+        asset_id: str | None = None,
+    ) -> list[dict]:
+        """Get open orders filtered by market (condition_id) or asset (token_id).
+
+        At least one of market or asset_id should be provided.
+        """
+        self.ensure_ready()
+        params = OpenOrderParams(market=market, asset_id=asset_id)
+        return self.client.get_orders(params)
+
     def get_order(self, order_id: str) -> dict:
         """Get a specific order by ID. Requires L2 auth."""
         self.ensure_ready()
         return self.client.get_order(order_id)
+
+    # --- Market Making (auth required) ---
+
+    def place_maker_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        expiration: int = 0,
+    ) -> dict:
+        """Place a post-only limit order. Guarantees maker status.
+
+        The order is REJECTED if it would immediately match (cross the spread).
+        This ensures zero taker fees and eligibility for maker rebates.
+
+        Uses GTD if expiration > 0, otherwise GTC.
+
+        Args:
+            token_id: The conditional token to trade.
+            side: "BUY" or "SELL".
+            price: Limit price (0.01 to 0.99).
+            size: Number of contracts.
+            expiration: Unix timestamp for auto-expiry. 0 = no expiry (GTC).
+        """
+        order_type = "GTD" if expiration > 0 else "GTC"
+        return self.place_limit_order(
+            token_id=token_id,
+            side=side,
+            price=price,
+            size=size,
+            order_type=order_type,
+            post_only=True,
+            expiration=expiration,
+        )
+
+    def post_orders_batch(
+        self,
+        orders: list[dict],
+    ) -> dict:
+        """Post multiple orders in a single API call (up to 15).
+
+        Each order dict must have:
+            token_id: str
+            side: "BUY" or "SELL"
+            price: float
+            size: float
+            post_only: bool (default True)
+            expiration: int (default 0, unix timestamp)
+
+        Returns the CLOB API response for the batch.
+        """
+        self.ensure_ready()
+        batch_args = []
+        for o in orders:
+            expiration = o.get("expiration", 0)
+            order_args = OrderArgs(
+                token_id=o["token_id"],
+                price=o["price"],
+                size=o["size"],
+                side=get_poly_side(o["side"]),
+                expiration=expiration,
+            )
+            signed_order = self.client.create_order(order_args)
+            order_type = OrderType.GTD if expiration > 0 else OrderType.GTC
+            batch_args.append(PostOrdersArgs(
+                order=signed_order,
+                orderType=order_type,
+                postOnly=o.get("post_only", True),
+            ))
+        return self.client.post_orders(batch_args)
+
+    def cancel_orders_batch(self, order_ids: list[str]) -> dict:
+        """Cancel multiple orders by ID in a single API call."""
+        self.ensure_ready()
+        return self.client.cancel_orders(order_ids)
+
+    def cancel_market_orders(
+        self,
+        market: str = "",
+        asset_id: str = "",
+    ) -> dict:
+        """Cancel all orders on a specific market or asset.
+
+        Args:
+            market: Condition ID — cancels all orders on this market.
+            asset_id: Token ID — cancels all orders on this specific token.
+        """
+        self.ensure_ready()
+        return self.client.cancel_market_orders(market=market, asset_id=asset_id)
+
+    def post_heartbeat(self, heartbeat_id: str | None = None) -> dict:
+        """Send a heartbeat to the CLOB. Dead-man switch for market makers.
+
+        Once started, if a heartbeat is not sent within 10 seconds, the exchange
+        automatically cancels ALL open orders. This is a safety net — if the bot
+        crashes or loses connectivity, stale quotes are pulled automatically.
+
+        Args:
+            heartbeat_id: Optional identifier for this heartbeat session.
+                          Pass None to start a new session.
+        """
+        self.ensure_ready()
+        return self.client.post_heartbeat(heartbeat_id)
+
+    def get_tick_size(self, token_id: str) -> str:
+        """Get the minimum tick size for a token.
+
+        Returns the tick size as a string (e.g., "0.01", "0.001").
+        Important for market making — prices must be multiples of the tick size.
+        """
+        self.ensure_ready()
+        return self.client.get_tick_size(token_id)
+
+    def get_neg_risk(self, token_id: str) -> bool:
+        """Check if a token is neg-risk (e.g., multi-outcome event).
+
+        Neg-risk markets use a different exchange contract. Important for
+        approval checks and order routing.
+        """
+        self.ensure_ready()
+        return self.client.get_neg_risk(token_id)
 
     # --- Trade History (auth required) ---
 

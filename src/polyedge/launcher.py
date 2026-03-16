@@ -134,6 +134,23 @@ class Launcher:
         )
         await runner.run()
 
+    async def _run_maker(self):
+        """Run the market maker strategy."""
+        from polyedge.strategies.maker_runner import MakerRunner
+
+        args = self.strategy_args
+        runner = MakerRunner(
+            settings=self._settings,
+            client=self._client,
+            db=self._db,
+            auto=args.get("auto", True),
+            dry=args.get("dry", False),
+            market_filter=args.get("market"),
+            verbose=args.get("verbose", False),
+            quiet=args.get("quiet", False),
+        )
+        await runner.run()
+
     async def start_strategy(self) -> str:
         """Start the trading strategy. Returns status message."""
         if self.is_running:
@@ -150,6 +167,7 @@ class Launcher:
             "micro": self._run_micro,
             "sniper": self._run_sniper,
             "weather": self._run_weather,
+            "maker": self._run_maker,
         }
 
         runner_fn = strategy_map.get(self.strategy)

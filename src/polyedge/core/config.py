@@ -382,10 +382,62 @@ class MicroSniperConfig(BaseModel):
 
 
 class MarketMakerConfig(BaseModel):
+    """Market maker strategy config — post-only limit orders, zero taker fees.
+
+    The market maker posts bids and asks on both sides of Polymarket crypto
+    up/down markets, capturing the spread. Uses Binance depth as a DEFENSIVE
+    signal (pull quotes when momentum spikes) not an offensive one.
+    """
+
     enabled: bool = False
-    min_spread: float = 0.05
-    max_inventory_pct: float = 0.20
-    requote_threshold: float = 0.02
+
+    # --- Market selection ---
+    symbols: list[str] = ["btcusdt"]
+    min_liquidity: float = 500.0
+    min_entry_price: float = 0.30
+    max_entry_price: float = 0.70
+    min_seconds_remaining: float = 120.0
+
+    # --- Spread & pricing ---
+    min_spread: float = 0.04  # Minimum full spread (bid-ask gap)
+    base_spread: float = 0.06  # Normal calm-market spread
+    max_spread: float = 0.12  # Widest allowed spread
+    spread_vol_scale: float = 2.0  # spread = base + vol_scale * recent_vol
+    time_decay_widen_seconds: float = 60.0  # Widen in last N seconds of window
+    time_decay_spread_mult: float = 1.5  # Spread multiplier during time decay
+
+    # --- Sizing ---
+    quote_size_usd: float = 3.0  # USD per side per quote level
+    max_inventory_usd: float = 15.0  # Max total inventory both sides
+    max_inventory_imbalance: float = 0.70  # Max fraction on one side (0.5=balanced)
+    inventory_skew_factor: float = 0.02  # Price offset per 10% imbalance
+
+    # --- Quote management ---
+    requote_threshold: float = 0.02  # Requote when fair value moves this much
+    requote_interval_seconds: float = 5.0  # Min seconds between requotes
+    cancel_before_requote: bool = True
+    use_gtd: bool = True  # Auto-expire orders at window end
+    gtd_buffer_seconds: float = 10.0  # Expire orders N seconds before window end
+
+    # --- Heartbeat (dead-man switch) ---
+    heartbeat_enabled: bool = True
+    heartbeat_interval_seconds: float = 5.0  # Must be <10s
+
+    # --- Depth defense (Binance order book) ---
+    depth_enabled: bool = True
+    depth_pull_threshold: float = 0.40  # Pull quotes when depth momentum > this
+    depth_widen_threshold: float = 0.25  # Widen spread when depth momentum > this
+    depth_widen_factor: float = 1.5  # Spread multiplier during depth widen
+    depth_recovery_seconds: float = 3.0  # Wait after pull before re-quoting
+
+    # --- Risk ---
+    max_loss_per_window_usd: float = 2.0  # Stop quoting if net loss exceeds this
+    max_open_orders: int = 8  # Max simultaneous open orders
+    window_hop_pause_seconds: float = 15.0  # Pause quoting after window hop
+
+    # --- Fill tracking ---
+    fill_check_interval_seconds: float = 2.0
+    inventory_rebalance_threshold: float = 0.60
 
 
 class StrategiesConfig(BaseModel):
