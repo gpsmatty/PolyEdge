@@ -153,6 +153,11 @@ class MakerRunner:
             logger.error("No active crypto up/down markets found. Exiting.")
             return
 
+        # Reconcile inventory — check actual CLOB token balances so we know
+        # what we're holding even after a restart/redeploy
+        if not self.dry:
+            await self._reconcile_inventory()
+
         # Connect Binance depth feed for adverse selection defense
         symbols = self._get_symbols()
         logger.info(f"Tracking symbols: {symbols}")
@@ -182,6 +187,43 @@ class MakerRunner:
             logger.info("Market Maker shutting down...")
         finally:
             await self._shutdown()
+
+    async def _reconcile_inventory(self):
+        """Check actual CLOB token balances on startup and seed inventory.
+
+        Prevents orphaned positions after restart/redeploy — if we hold
+        tokens, we need to know about them to post sell orders.
+        """
+        for cid, m in self.active_markets.items():
+            if not m.clob_token_ids or len(m.clob_token_ids) < 2:
+                continue
+            try:
+                yes_bal = self.client.get_token_balance(m.clob_token_ids[0])
+                no_bal = self.client.get_token_balance(m.clob_token_ids[1])
+
+                actual_yes = float(yes_bal.get("balance", 0)) if isinstance(yes_bal, dict) else 0.0
+                actual_no = float(no_bal.get("balance", 0)) if isinstance(no_bal, dict) else 0.0
+
+                if actual_yes > 0.5 or actual_no > 0.5:
+                    inv = self.strategy.get_inventory(cid)
+                    if actual_yes > 0.5:
+                        inv.yes_tokens = actual_yes
+                        # Estimate cost basis from current market price
+                        est_price = 0.50  # Conservative estimate
+                        inv.yes_cost_basis = actual_yes * est_price
+                    if actual_no > 0.5:
+                        inv.no_tokens = actual_no
+                        est_price = 0.50
+                        inv.no_cost_basis = actual_no * est_price
+
+                    q = m.question[:50]
+                    console.print(
+                        f"  [yellow]♻ RECONCILE[/yellow] {q} | "
+                        f"YES={actual_yes:.1f} NO={actual_no:.1f}"
+                    )
+                    logger.info(f"Reconciled inventory: {q} YES={actual_yes:.1f} NO={actual_no:.1f}")
+            except Exception as e:
+                logger.warning(f"Reconcile failed for {cid[:8]}: {e}")
 
     async def _shutdown(self):
         """Clean shutdown — cancel all orders."""
@@ -787,35 +829,100 @@ class MakerRunner:
             await asyncio.sleep(self.config.fill_check_interval_seconds)
 
     async def _check_fills(self):
-        """Check for new fills across all markets."""
+        """Check actual CLOB token balances and sync inventory.
+
+        Source-of-truth approach: reads real balances from the CLOB API
+        instead of trying to detect fills by watching order IDs disappear
+        (which has race conditions with cancel-before-requote).
+        """
         for cid, m in list(self.active_markets.items()):
             if not m.clob_token_ids or len(m.clob_token_ids) < 2:
                 continue
 
-            # Check open orders — if any disappeared, they were filled
-            order_ids = self.live_order_ids.get(cid, [])
-            if not order_ids:
-                continue
-
             try:
-                # Check orders for BOTH YES and NO tokens
-                yes_orders = self.client.get_open_orders_for_market(
-                    asset_id=m.clob_token_ids[0]
-                )
-                no_orders = self.client.get_open_orders_for_market(
-                    asset_id=m.clob_token_ids[1]
-                )
-                current_orders = yes_orders + no_orders
-                current_ids = {o.get("id", o.get("order_id", "")) for o in current_orders}
+                yes_token_id = m.clob_token_ids[0]
+                no_token_id = m.clob_token_ids[1]
 
-                # Find filled orders (were live, now gone)
-                for oid in order_ids:
-                    if oid and oid not in current_ids:
-                        # Order was filled or cancelled — check via API
-                        await self._process_potential_fill(cid, oid)
+                # Get actual balances from CLOB
+                yes_bal_resp = self.client.get_token_balance(yes_token_id)
+                no_bal_resp = self.client.get_token_balance(no_token_id)
 
-                # Update live order list
-                self.live_order_ids[cid] = [oid for oid in order_ids if oid in current_ids]
+                actual_yes = float(yes_bal_resp.get("balance", 0)) if isinstance(yes_bal_resp, dict) else 0.0
+                actual_no = float(no_bal_resp.get("balance", 0)) if isinstance(no_bal_resp, dict) else 0.0
+
+                inv = self.strategy.get_inventory(cid)
+                old_yes = inv.yes_tokens
+                old_no = inv.no_tokens
+
+                # Detect new buys (balance increased)
+                if actual_yes > old_yes + 0.5:
+                    delta = actual_yes - old_yes
+                    # Estimate fill price from current market
+                    est_price = self.yes_prices.get(cid, 0.50)
+                    inv.yes_tokens = actual_yes
+                    inv.yes_cost_basis += delta * est_price
+                    self._total_fills += 1
+                    q_short = m.question[:40] if m else cid[:8]
+                    console.print(
+                        f"  [green bold]💰 FILL[/green bold] BUY {delta:.1f} YES @ ~${est_price:.2f} | "
+                        f"{q_short} | Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
+                    )
+                    logger.info(f"Fill: BUY {delta:.1f} YES @ ~${est_price:.2f} | "
+                                f"Inventory: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}")
+
+                # Detect new NO buys
+                if actual_no > old_no + 0.5:
+                    delta = actual_no - old_no
+                    est_price = self.no_prices.get(cid, 0.50)
+                    inv.no_tokens = actual_no
+                    inv.no_cost_basis += delta * est_price
+                    self._total_fills += 1
+                    q_short = m.question[:40] if m else cid[:8]
+                    console.print(
+                        f"  [green bold]💰 FILL[/green bold] BUY {delta:.1f} NO @ ~${est_price:.2f} | "
+                        f"{q_short} | Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
+                    )
+                    logger.info(f"Fill: BUY {delta:.1f} NO @ ~${est_price:.2f} | "
+                                f"Inventory: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}")
+
+                # Detect sells (balance decreased)
+                if actual_yes < old_yes - 0.5:
+                    delta = old_yes - actual_yes
+                    est_price = self.yes_prices.get(cid, 0.50)
+                    avg_entry = inv.avg_cost("YES")
+                    if avg_entry > 0:
+                        pnl = (est_price - avg_entry) * delta
+                        self.strategy._window_pnl[cid] = self.strategy._window_pnl.get(cid, 0) + pnl
+                    sell_frac = min(delta / old_yes, 1.0) if old_yes > 0 else 1.0
+                    inv.yes_cost_basis *= (1.0 - sell_frac)
+                    inv.yes_tokens = actual_yes
+                    self._total_fills += 1
+                    console.print(
+                        f"  [green bold]💰 FILL[/green bold] SELL {delta:.1f} YES @ ~${est_price:.2f} | "
+                        f"Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
+                    )
+
+                if actual_no < old_no - 0.5:
+                    delta = old_no - actual_no
+                    est_price = self.no_prices.get(cid, 0.50)
+                    avg_entry = inv.avg_cost("NO")
+                    if avg_entry > 0:
+                        pnl = (est_price - avg_entry) * delta
+                        self.strategy._window_pnl[cid] = self.strategy._window_pnl.get(cid, 0) + pnl
+                    sell_frac = min(delta / old_no, 1.0) if old_no > 0 else 1.0
+                    inv.no_cost_basis *= (1.0 - sell_frac)
+                    inv.no_tokens = actual_no
+                    self._total_fills += 1
+                    console.print(
+                        f"  [green bold]💰 FILL[/green bold] SELL {delta:.1f} NO @ ~${est_price:.2f} | "
+                        f"Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
+                    )
+
+                # Sync even without threshold change (handles manual trades, startup, etc.)
+                if abs(actual_yes - inv.yes_tokens) > 0.1:
+                    inv.yes_tokens = actual_yes
+                if abs(actual_no - inv.no_tokens) > 0.1:
+                    inv.no_tokens = actual_no
 
             except Exception as e:
                 if self.verbose:
