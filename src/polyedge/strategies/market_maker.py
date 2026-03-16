@@ -46,20 +46,22 @@ class Quote:
 
 @dataclass
 class QuoteSet:
-    """A pair of bid/ask quotes for one market."""
+    """Bid/ask quotes for both YES and NO tokens in a market."""
 
     yes_bid: Quote | None = None
     yes_ask: Quote | None = None
+    no_bid: Quote | None = None
+    no_ask: Quote | None = None
     fair_value: float = 0.50
     spread: float = 0.06
     reason_pulled: str | None = None  # Why quotes were pulled (depth, risk, etc.)
 
     @property
     def is_active(self) -> bool:
-        return self.yes_bid is not None or self.yes_ask is not None
+        return any([self.yes_bid, self.yes_ask, self.no_bid, self.no_ask])
 
     def all_quotes(self) -> list[Quote]:
-        return [q for q in [self.yes_bid, self.yes_ask] if q]
+        return [q for q in [self.yes_bid, self.yes_ask, self.no_bid, self.no_ask] if q]
 
 
 @dataclass
@@ -241,16 +243,17 @@ class MarketMakerStrategy:
         depth_momentum: float = 0.0,
         tick_size: float = 0.01,
         yes_best_bid: float = 0.0,
+        no_best_bid: float = 0.0,
     ) -> QuoteSet:
-        """Compute the full quote set for a market.
+        """Compute the full quote set for a market — both YES and NO sides.
 
-        Returns a QuoteSet with bid/ask for YES token.
-        Quotes may be None if pulled or conditions don't warrant quoting.
+        Quotes both tokens so the maker profits regardless of BTC direction:
+        - BTC dips → YES drops, NO rises → sell NO at profit
+        - BTC rips → YES rises, NO drops → sell YES at profit
 
         Args:
-            yes_best_bid: The actual best bid on Polymarket for the YES token.
-                          Used to floor ask price above it (post_only would reject
-                          any ask at or below the best bid).
+            yes_best_bid: Actual best bid on Polymarket for YES token.
+            no_best_bid: Actual best bid on Polymarket for NO token.
         """
         qs = QuoteSet()
 
@@ -260,21 +263,14 @@ class MarketMakerStrategy:
             qs.reason_pulled = pull_reason
             return qs
 
-        # Price gate — only block NEW buys when price is extreme.
-        # If we hold inventory, always allow asks (sells) to offload.
         inv = self.get_inventory(condition_id)
-        price_too_low = yes_price < self.config.min_entry_price
-        price_too_high = yes_price > self.config.max_entry_price
         has_yes_inventory = inv.yes_tokens > 0
+        has_no_inventory = inv.no_tokens > 0
+        has_any_inventory = has_yes_inventory or has_no_inventory
 
         # Time gate — but ALWAYS allow sells to offload inventory near expiry
-        if seconds_remaining < self.config.min_seconds_remaining and not has_yes_inventory:
+        if seconds_remaining < self.config.min_seconds_remaining and not has_any_inventory:
             qs.reason_pulled = "near_expiry"
-            return qs
-
-        # If price is out of range AND we have no inventory to sell, pull everything
-        if (price_too_low or price_too_high) and not has_yes_inventory:
-            qs.reason_pulled = f"price_range_{yes_price:.2f}"
             return qs
 
         # Rate limit requotes (but always allow if we have inventory to offload)
@@ -283,100 +279,123 @@ class MarketMakerStrategy:
         last_fv = self._last_fair_value.get(condition_id, 0)
         fair_value = self.compute_fair_value(yes_price, no_price)
         qs.fair_value = fair_value
+        no_fair_value = round(1.0 - fair_value, 2)
 
         fv_moved = abs(fair_value - last_fv) >= self.config.requote_threshold
         time_elapsed = (now - last_quote) >= self.config.requote_interval_seconds
 
-        if not fv_moved and not time_elapsed and last_fv > 0 and not has_yes_inventory:
+        if not fv_moved and not time_elapsed and last_fv > 0 and not has_any_inventory:
             qs.reason_pulled = "no_requote_needed"
             return qs
 
-        # Compute spread
+        # Compute spread (same for both sides)
         spread = self.compute_spread(condition_id, seconds_remaining, depth_momentum)
         qs.spread = spread
         half_spread = spread / 2.0
-
-        # Inventory skew — shift BID down to discourage more buying
-        # when we're overweight. Does NOT shift ask — we want to sell at
-        # fair value + half_spread or better.
-        imbalance = inv.imbalance  # 0.5 = balanced, 1.0 = all YES
-        bid_skew = (imbalance - 0.5) * self.config.inventory_skew_factor * 10
-        # Positive bid_skew (too much YES) → lower bid (buy less YES)
-
-        # Compute bid/ask prices
-        bid_price = fair_value - half_spread - bid_skew
-        ask_price = fair_value + half_spread
-
-        # Profit floor: don't sell until price is min_profit_pct above avg cost.
-        # Buy at $0.31 with 20% min_profit → don't sell below $0.37.
-        # This lets winners run instead of dumping for 3 cents.
-        # Override: in the last force_sell_seconds, sell at any price to avoid
-        # stranded inventory at window end.
-        avg_cost = inv.avg_cost("YES") if has_yes_inventory else 0
-        near_window_end = seconds_remaining < self.config.force_sell_seconds
-        if avg_cost > 0 and not near_window_end:
-            min_sell_price = avg_cost * (1.0 + self.config.min_profit_pct)
-            ask_price = max(ask_price, min_sell_price)
-
-        # Floor ask above the actual Polymarket best bid to prevent post_only rejection.
-        # post_only orders that would immediately match get silently rejected.
-        if yes_best_bid > 0:
-            ask_price = max(ask_price, yes_best_bid + tick_size)
-
-        # Round to tick size
         tick = tick_size
-        bid_price = max(tick, min(1.0 - tick, round(bid_price / tick) * tick))
-        ask_price = max(tick, min(1.0 - tick, round(ask_price / tick) * tick))
-        bid_price = round(bid_price, 2)
-        ask_price = round(ask_price, 2)
-
-        # Ensure bid < ask
-        if bid_price >= ask_price:
-            ask_price = round(bid_price + tick, 2)
-
-        # Check inventory capacity for NEW buys
-        max_inv = self.config.max_inventory_usd
-        can_buy_yes = inv.yes_tokens * fair_value < max_inv * self.config.max_inventory_imbalance
-
-        # Compute sizes in contracts
-        bid_size = round(self.config.quote_size_usd / bid_price, 1) if bid_price > 0 else 0
-
-        # Ask size: sell ALL inventory, not just a tiny $3 chunk.
-        # Bids accumulate slowly (small controlled entries).
-        # Asks should offload everything — no reason to hold profitable
-        # tokens and dribble them out 1 share at a time while the price tanks.
-        ask_size = round(inv.yes_tokens, 1) if has_yes_inventory else 0
+        near_window_end = seconds_remaining < self.config.force_sell_seconds
 
         # GTD expiration
         expiration = 0
         if self.config.use_gtd and seconds_remaining > self.config.gtd_buffer_seconds:
             expiration = int(time.time() + seconds_remaining - self.config.gtd_buffer_seconds)
 
-        # Suppress bids when price is extreme (either direction) or near expiry
-        suppress_bid = price_too_low or price_too_high or seconds_remaining < self.config.min_seconds_remaining
+        # Total inventory check — don't exceed max across BOTH sides combined
+        max_inv = self.config.max_inventory_usd
+        total_inv_usd = inv.yes_tokens * fair_value + inv.no_tokens * no_fair_value
 
-        # --- BID side: only when we have capacity and conditions allow ---
-        if can_buy_yes and bid_size >= 1 and not suppress_bid:
+        # Suppress new bids near expiry (but allow sells)
+        suppress_new_bids = seconds_remaining < self.config.min_seconds_remaining
+
+        # ===================== YES SIDE =====================
+        yes_price_ok = self.config.min_entry_price <= yes_price <= self.config.max_entry_price
+
+        # YES bid — buy YES when it's cheap (BTC dipping)
+        yes_bid_price = fair_value - half_spread
+        # Skew YES bid down when overweight YES
+        yes_skew = (inv.imbalance - 0.5) * self.config.inventory_skew_factor * 10
+        yes_bid_price -= yes_skew
+
+        yes_bid_price = max(tick, min(1.0 - tick, round(yes_bid_price / tick) * tick))
+        yes_bid_price = round(yes_bid_price, 2)
+        yes_bid_size = round(self.config.quote_size_usd / yes_bid_price, 1) if yes_bid_price > 0 else 0
+
+        can_buy_yes = yes_price_ok and not suppress_new_bids and total_inv_usd < max_inv
+        if can_buy_yes and yes_bid_size >= 1:
             qs.yes_bid = Quote(
-                token_id=yes_token_id,
-                side="BUY",
-                price=bid_price,
-                size=bid_size,
-                expiration=expiration,
+                token_id=yes_token_id, side="BUY",
+                price=yes_bid_price, size=yes_bid_size, expiration=expiration,
             )
 
-        # --- ASK side: ONLY when we hold YES inventory ---
-        # We never sell YES we don't have. That would be a naked short
-        # (Polymarket treats it as minting NO, committing collateral
-        # the code doesn't track).
-        if has_yes_inventory and ask_size >= 1:
-            qs.yes_ask = Quote(
-                token_id=yes_token_id,
-                side="SELL",
-                price=ask_price,
-                size=ask_size,  # Sell full inventory
-                expiration=expiration,
+        # YES ask — sell YES when we hold it and price is up
+        if has_yes_inventory:
+            yes_ask_price = fair_value + half_spread
+            # Profit floor
+            yes_avg_cost = inv.avg_cost("YES")
+            if yes_avg_cost > 0 and not near_window_end:
+                yes_ask_price = max(yes_ask_price, yes_avg_cost * (1.0 + self.config.min_profit_pct))
+            # Floor above best bid (post_only protection)
+            if yes_best_bid > 0:
+                yes_ask_price = max(yes_ask_price, yes_best_bid + tick)
+
+            yes_ask_price = max(tick, min(1.0 - tick, round(yes_ask_price / tick) * tick))
+            yes_ask_price = round(yes_ask_price, 2)
+            yes_ask_size = round(inv.yes_tokens, 1)
+
+            # Ensure bid < ask
+            if qs.yes_bid and yes_bid_price >= yes_ask_price:
+                yes_ask_price = round(yes_bid_price + tick, 2)
+
+            if yes_ask_size >= 1:
+                qs.yes_ask = Quote(
+                    token_id=yes_token_id, side="SELL",
+                    price=yes_ask_price, size=yes_ask_size, expiration=expiration,
+                )
+
+        # ===================== NO SIDE =====================
+        no_price_ok = self.config.min_entry_price <= no_price <= self.config.max_entry_price
+
+        # NO bid — buy NO when it's cheap (BTC ripping, so NO drops)
+        no_bid_price = no_fair_value - half_spread
+        # Skew NO bid down when overweight NO (imbalance < 0.5 = heavy NO)
+        no_skew = (0.5 - inv.imbalance) * self.config.inventory_skew_factor * 10
+        no_bid_price -= no_skew
+
+        no_bid_price = max(tick, min(1.0 - tick, round(no_bid_price / tick) * tick))
+        no_bid_price = round(no_bid_price, 2)
+        no_bid_size = round(self.config.quote_size_usd / no_bid_price, 1) if no_bid_price > 0 else 0
+
+        can_buy_no = no_price_ok and not suppress_new_bids and total_inv_usd < max_inv
+        if can_buy_no and no_bid_size >= 1:
+            qs.no_bid = Quote(
+                token_id=no_token_id, side="BUY",
+                price=no_bid_price, size=no_bid_size, expiration=expiration,
             )
+
+        # NO ask — sell NO when we hold it and price is up
+        if has_no_inventory:
+            no_ask_price = no_fair_value + half_spread
+            # Profit floor
+            no_avg_cost = inv.avg_cost("NO")
+            if no_avg_cost > 0 and not near_window_end:
+                no_ask_price = max(no_ask_price, no_avg_cost * (1.0 + self.config.min_profit_pct))
+            # Floor above best bid (post_only protection)
+            if no_best_bid > 0:
+                no_ask_price = max(no_ask_price, no_best_bid + tick)
+
+            no_ask_price = max(tick, min(1.0 - tick, round(no_ask_price / tick) * tick))
+            no_ask_price = round(no_ask_price, 2)
+            no_ask_size = round(inv.no_tokens, 1)
+
+            # Ensure bid < ask
+            if qs.no_bid and no_bid_price >= no_ask_price:
+                no_ask_price = round(no_bid_price + tick, 2)
+
+            if no_ask_size >= 1:
+                qs.no_ask = Quote(
+                    token_id=no_token_id, side="SELL",
+                    price=no_ask_price, size=no_ask_size, expiration=expiration,
+                )
 
         # Update tracking
         self._last_fair_value[condition_id] = fair_value

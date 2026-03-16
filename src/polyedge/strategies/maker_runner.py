@@ -114,6 +114,7 @@ class MakerRunner:
         self.yes_prices: dict[str, float] = {}  # condition_id -> YES midpoint price
         self.no_prices: dict[str, float] = {}  # condition_id -> NO price
         self.yes_best_bids: dict[str, float] = {}  # condition_id -> actual YES best bid
+        self.no_best_bids: dict[str, float] = {}  # condition_id -> actual NO best bid
         self._token_to_market: dict[str, tuple[Market, str]] = {}  # token_id -> (Market, "yes"|"no")
 
         # Depth feed
@@ -482,6 +483,8 @@ class MakerRunner:
                     self.yes_best_bids[cid] = bid
             else:
                 self.no_prices[cid] = price
+                if bid > 0:
+                    self.no_best_bids[cid] = bid
 
         async def _on_last_trade(event: dict):
             """last_trade_price events have 'price' or 'last_trade_price' field."""
@@ -603,8 +606,9 @@ class MakerRunner:
         yes_token_id = m.clob_token_ids[0]
         no_token_id = m.clob_token_ids[1]
 
-        # Get actual best bid for ask floor
+        # Get actual best bids for ask floor
         yes_best_bid = self.yes_best_bids.get(condition_id, 0)
+        no_best_bid = self.no_best_bids.get(condition_id, 0)
 
         # Compute quotes
         qs = self.strategy.compute_quotes(
@@ -616,13 +620,15 @@ class MakerRunner:
             seconds_remaining=seconds_remaining,
             depth_momentum=depth_momentum,
             yes_best_bid=yes_best_bid,
+            no_best_bid=no_best_bid,
         )
 
         if qs.reason_pulled:
-            # Cancel existing orders if we're pulling
+            # Cancel existing orders if we're pulling (both YES and NO)
             if condition_id in self.live_order_ids and self.live_order_ids[condition_id]:
                 if not self.dry:
                     await self._cancel_market_quotes(condition_id, yes_token_id)
+                    await self._cancel_market_quotes(condition_id, no_token_id)
             # Always log pulls — need to see defense working
             if qs.reason_pulled not in ("no_requote_needed",):
                 self._total_pulls += 1
@@ -638,18 +644,21 @@ class MakerRunner:
 
         # Post quotes
         self._total_quotes_posted += 1
+        yes_token_id = m.clob_token_ids[0]
+        no_token_id = m.clob_token_ids[1]
         if self.dry:
             self._log_dry_quotes(m, qs, depth_momentum)
         else:
-            await self._post_quotes(condition_id, yes_token_id, qs)
+            await self._post_quotes(condition_id, yes_token_id, no_token_id, qs)
 
-    async def _post_quotes(self, condition_id: str, yes_token_id: str, qs: QuoteSet):
-        """Cancel old quotes and post new ones."""
+    async def _post_quotes(self, condition_id: str, yes_token_id: str, no_token_id: str, qs: QuoteSet):
+        """Cancel old quotes and post new ones for both YES and NO tokens."""
         async with self._quote_lock:  # Prevent race between concurrent cancel+post
             try:
-                # Cancel existing orders for this market
+                # Cancel existing orders for BOTH tokens
                 if self.config.cancel_before_requote:
                     await self._cancel_market_quotes(condition_id, yes_token_id)
+                    await self._cancel_market_quotes(condition_id, no_token_id)
 
                 # Build batch
                 orders = [q.as_order_dict() for q in qs.all_quotes()]
@@ -672,7 +681,10 @@ class MakerRunner:
                 if not self.quiet:
                     parts = []
                     for q in qs.all_quotes():
-                        parts.append(f"{'BID' if q.side == 'BUY' else 'ASK'} ${q.price:.2f}×{q.size:.0f}")
+                        # Label YES vs NO quotes
+                        token_label = "Y" if q.token_id == yes_token_id else "N"
+                        side_label = "BID" if q.side == "BUY" else "ASK"
+                        parts.append(f"{token_label}:{side_label} ${q.price:.2f}×{q.size:.0f}")
                     console.print(
                         f"  [cyan]📋 POST[/cyan] {' | '.join(parts)} | "
                         f"FV={qs.fair_value:.2f} spread={qs.spread:.3f}"
@@ -695,9 +707,13 @@ class MakerRunner:
             return
         parts = []
         if qs.yes_bid:
-            parts.append(f"BID ${qs.yes_bid.price:.2f}×{qs.yes_bid.size:.0f}")
+            parts.append(f"Y:BID ${qs.yes_bid.price:.2f}×{qs.yes_bid.size:.0f}")
         if qs.yes_ask:
-            parts.append(f"ASK ${qs.yes_ask.price:.2f}×{qs.yes_ask.size:.0f}")
+            parts.append(f"Y:ASK ${qs.yes_ask.price:.2f}×{qs.yes_ask.size:.0f}")
+        if qs.no_bid:
+            parts.append(f"N:BID ${qs.no_bid.price:.2f}×{qs.no_bid.size:.0f}")
+        if qs.no_ask:
+            parts.append(f"N:ASK ${qs.no_ask.price:.2f}×{qs.no_ask.size:.0f}")
         spread_str = f"spread={qs.spread:.3f}"
         q = market.question[:60] if hasattr(market, 'question') else "?"
         depth_str = f"d={depth_momentum:+.2f}" if depth_momentum else ""
@@ -742,9 +758,14 @@ class MakerRunner:
                 continue
 
             try:
-                current_orders = self.client.get_open_orders_for_market(
+                # Check orders for BOTH YES and NO tokens
+                yes_orders = self.client.get_open_orders_for_market(
                     asset_id=m.clob_token_ids[0]
                 )
+                no_orders = self.client.get_open_orders_for_market(
+                    asset_id=m.clob_token_ids[1]
+                )
+                current_orders = yes_orders + no_orders
                 current_ids = {o.get("id", o.get("order_id", "")) for o in current_orders}
 
                 # Find filled orders (were live, now gone)

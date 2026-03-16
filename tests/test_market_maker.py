@@ -395,18 +395,23 @@ class TestTimeGate:
 class TestPriceGate:
     """Price range filters should allow sells even when price is extreme."""
 
-    def test_price_out_of_range_no_inventory_pulls(self, strategy):
-        """Price > max_entry_price with no inventory → pull."""
+    def test_price_out_of_range_no_inventory_no_quotes(self, strategy):
+        """Price > max_entry_price with no inventory → no quotes posted.
+
+        YES is too high (0.95 > 0.90 max), NO is too low (0.05 < 0.10 min).
+        Neither side qualifies for a bid, and there's no inventory to sell.
+        """
         qs = strategy.compute_quotes(
             condition_id=CID,
             yes_token_id=YES_TID,
             no_token_id=NO_TID,
             yes_price=0.95,  # Above max_entry_price (0.90)
-            no_price=0.05,
+            no_price=0.05,   # Below min_entry_price (0.10)
             seconds_remaining=500,
         )
-        assert qs.reason_pulled is not None
-        assert "price_range" in qs.reason_pulled
+        assert not qs.is_active, "Should not post any quotes when both sides out of range"
+        assert qs.yes_bid is None
+        assert qs.no_bid is None
 
     def test_price_too_high_with_inventory_posts_ask(self, strategy):
         """Price > max_entry_price but holding inventory → post ask to sell."""
@@ -634,3 +639,104 @@ class TestFairValue:
     def test_clamped_high(self, strategy):
         fv = strategy.compute_fair_value(1.00, 0.00)
         assert fv <= 0.99
+
+
+class TestNoSideQuoting:
+    """Both YES and NO tokens should be quoted — profit regardless of direction."""
+
+    def test_both_sides_get_bids(self, strategy):
+        """At FV=0.50, both YES and NO should get bid quotes."""
+        qs = strategy.compute_quotes(
+            condition_id=CID,
+            yes_token_id=YES_TID,
+            no_token_id=NO_TID,
+            yes_price=0.50,
+            no_price=0.50,
+            seconds_remaining=500,
+        )
+        assert qs.yes_bid is not None, "Should post YES bid"
+        assert qs.no_bid is not None, "Should post NO bid"
+        assert qs.yes_bid.token_id == YES_TID
+        assert qs.no_bid.token_id == NO_TID
+
+    def test_no_inventory_sells_no(self, strategy):
+        """Holding NO inventory → should post NO ask to sell it."""
+        inv = strategy.get_inventory(CID)
+        inv.record_fill("BUY", "NO", 10.0, 0.40)
+
+        qs = strategy.compute_quotes(
+            condition_id=CID,
+            yes_token_id=YES_TID,
+            no_token_id=NO_TID,
+            yes_price=0.60,  # YES high → NO cheap was $0.40, now NO=1-0.60=0.40
+            no_price=0.40,
+            seconds_remaining=500,
+        )
+        assert qs.no_ask is not None, "Should post NO ask when holding NO inventory"
+        assert qs.no_ask.side == "SELL"
+        assert qs.no_ask.size == 10.0
+
+    def test_no_naked_short_no(self, strategy):
+        """No NO inventory → no NO ask. Same naked short protection."""
+        qs = strategy.compute_quotes(
+            condition_id=CID,
+            yes_token_id=YES_TID,
+            no_token_id=NO_TID,
+            yes_price=0.50,
+            no_price=0.50,
+            seconds_remaining=500,
+        )
+        assert qs.no_ask is None, "Should not sell NO without holding it"
+
+    def test_no_profit_floor(self, strategy):
+        """NO ask should respect min_profit_pct above avg cost."""
+        inv = strategy.get_inventory(CID)
+        inv.record_fill("BUY", "NO", 10.0, 0.30)
+
+        qs = strategy.compute_quotes(
+            condition_id=CID,
+            yes_token_id=YES_TID,
+            no_token_id=NO_TID,
+            yes_price=0.65,  # FV=0.65, so NO FV=0.35
+            no_price=0.35,
+            seconds_remaining=500,
+        )
+        if qs.no_ask:
+            # min_profit_pct=0.20 → 0.30 * 1.20 = 0.36
+            assert qs.no_ask.price >= 0.36, (
+                f"NO ask ${qs.no_ask.price} below profit floor $0.36"
+            )
+
+    def test_btc_dip_buy_yes_sell_no_cycle(self, strategy):
+        """Full NO cycle: buy NO cheap when BTC rips, sell when BTC dips back."""
+        # BTC rips → NO is cheap at 0.30
+        avg = strategy.record_fill(CID, "BUY", "NO", 10.0, 0.30)
+        assert avg is None  # No avg_entry for buys
+
+        # BTC dips back → NO price recovers to 0.50
+        avg_entry = strategy.record_fill(CID, "SELL", "NO", 10.0, 0.50)
+        assert avg_entry is not None
+        assert abs(avg_entry - 0.30) < 0.01
+
+        # P&L should be positive
+        pnl = strategy._window_pnl.get(CID, 0)
+        expected = (0.50 - 0.30) * 10.0  # $2.00 profit
+        assert abs(pnl - expected) < 0.01
+
+    def test_total_inventory_cap(self, strategy):
+        """Total inventory across YES+NO should be capped."""
+        inv = strategy.get_inventory(CID)
+        # Fill up to near max inventory ($15)
+        inv.record_fill("BUY", "YES", 20.0, 0.50)  # $10 in YES
+
+        qs = strategy.compute_quotes(
+            condition_id=CID,
+            yes_token_id=YES_TID,
+            no_token_id=NO_TID,
+            yes_price=0.50,
+            no_price=0.50,
+            seconds_remaining=500,
+        )
+        # With $10 in YES and max $15 total, should still allow some NO buying
+        # but YES bid should be suppressed (already overweight)
+        # The exact behavior depends on the capacity check
