@@ -1306,7 +1306,13 @@ class MicroRunner:
             if self.config.depth_enabled:
                 ds = self.depth_feed.get_depth(opp.symbol)
                 if ds and ds.is_active:
-                    depth_str = f" | Depth: {ds.depth_momentum:+.2f}(v{ds.imbalance_velocity_3s:+.2f})"
+                    fast_mom = ds.depth_momentum
+                    slow_mom = ds.exit_depth_momentum
+                    if action_str == "EXIT":
+                        # Show both fast and slow exit momentum for debugging
+                        depth_str = f" | Depth: {fast_mom:+.2f} ExitSlow:{slow_mom:+.2f}"
+                    else:
+                        depth_str = f" | Depth: {fast_mom:+.2f}(v{ds.imbalance_velocity_3s:+.2f})"
             console.print(
                 f"[bold {action_color}]MICRO [{action_str}][/bold {action_color}] "
                 f"{opp.symbol.replace('usdt','').upper()} "
@@ -2082,8 +2088,13 @@ class MicroRunner:
                     ds = self.depth_feed.get_depth(sym)
                     if ds and ds.is_active:
                         dm = ds.depth_momentum
-                        dv = ds.imbalance_velocity_3s
-                        depth_str = f" Depth:{dm:+.2f}(v{dv:+.2f})"
+                        slow = ds.exit_depth_momentum
+                        # Show slow exit momentum when in position
+                        if self._positions:
+                            depth_str = f" Depth:{dm:+.2f} Ex:{slow:+.2f}"
+                        else:
+                            dv = ds.imbalance_velocity_3s
+                            depth_str = f" Depth:{dm:+.2f}(v{dv:+.2f})"
                     else:
                         depth_str = " Depth:--"
 
