@@ -329,7 +329,12 @@ class MarketMakerStrategy:
 
         # Compute sizes in contracts
         bid_size = round(self.config.quote_size_usd / bid_price, 1) if bid_price > 0 else 0
-        ask_size = round(self.config.quote_size_usd / ask_price, 1) if ask_price > 0 else 0
+
+        # Ask size: sell ALL inventory, not just a tiny $3 chunk.
+        # Bids accumulate slowly (small controlled entries).
+        # Asks should offload everything — no reason to hold profitable
+        # tokens and dribble them out 1 share at a time while the price tanks.
+        ask_size = round(inv.yes_tokens, 1) if has_yes_inventory else 0
 
         # GTD expiration
         expiration = 0
@@ -358,7 +363,7 @@ class MarketMakerStrategy:
                 token_id=yes_token_id,
                 side="SELL",
                 price=ask_price,
-                size=min(ask_size, inv.yes_tokens),  # Never sell more than we hold
+                size=ask_size,  # Sell full inventory
                 expiration=expiration,
             )
 
