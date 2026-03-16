@@ -740,9 +740,114 @@ class MakerRunner:
                 f"{q_short} | Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
             )
 
+            # --- DB trade logging ---
+            await self._log_fill_to_db(
+                condition_id, order_id, token_id, token, side, price, size, m
+            )
+
         except Exception as e:
             if self.verbose:
                 logger.warning(f"Process fill error: {e}")
+
+    async def _log_fill_to_db(
+        self,
+        condition_id: str,
+        order_id: str,
+        token_id: str,
+        token: str,  # "YES" or "NO"
+        side: str,  # "BUY" or "SELL"
+        price: float,
+        size: float,
+        market: Market | None,
+    ):
+        """Log a fill to the trades/positions/orders tables in DB."""
+        try:
+            question = market.question if market else ""
+            inv = self.strategy.get_inventory(condition_id)
+
+            # Snapshot current state for analysis
+            signal_data = {
+                "fill_side": side,
+                "fill_token": token,
+                "fill_price": price,
+                "fill_size": size,
+                "fair_value": self.strategy._last_fair_value.get(condition_id, 0),
+                "inventory_yes": inv.yes_tokens,
+                "inventory_no": inv.no_tokens,
+                "inventory_imbalance": inv.imbalance,
+                "depth_momentum": self.depth_structure.depth_momentum if self.depth_structure else 0,
+            }
+
+            if side == "BUY":
+                # Entry — new position or adding to existing
+                await self.db.insert_trade({
+                    "trade_id": order_id,
+                    "market_id": condition_id,
+                    "token_id": token_id,
+                    "question": question,
+                    "side": side,
+                    "entry_price": price,
+                    "size": size,
+                    "status": "OPEN",
+                    "strategy": "market_maker",
+                    "signal_data": signal_data,
+                })
+
+                await self.db.upsert_position({
+                    "market_id": condition_id,
+                    "token_id": token_id,
+                    "question": question,
+                    "side": side,
+                    "size": inv.yes_tokens if token == "YES" else inv.no_tokens,
+                    "entry_price": price,
+                    "current_price": price,
+                    "unrealized_pnl": 0,
+                    "strategy": "market_maker",
+                })
+
+            else:
+                # Exit — selling tokens we hold
+                # Compute P&L: for a market maker, profit = sell_price - avg_buy_price
+                cost_basis = inv.yes_cost_basis if token == "YES" else inv.no_cost_basis
+                token_count = inv.yes_tokens if token == "YES" else inv.no_tokens
+                avg_entry = cost_basis / token_count if token_count > 0 else price
+                gross_pnl = (price - avg_entry) * size
+
+                self._total_spread_captured += gross_pnl
+
+                await self.db.close_trade_by_market(
+                    market_id=condition_id,
+                    exit_price=price,
+                    pnl=gross_pnl,
+                    exit_reason="maker_sell",
+                )
+
+                # Remove position if fully closed
+                remaining = (inv.yes_tokens if token == "YES" else inv.no_tokens) - size
+                if remaining <= 0.1:
+                    await self.db.remove_position(condition_id, token_id, side)
+                else:
+                    # Update position with remaining size
+                    await self.db.upsert_position({
+                        "market_id": condition_id,
+                        "token_id": token_id,
+                        "question": question,
+                        "side": "BUY",
+                        "size": remaining,
+                        "entry_price": avg_entry,
+                        "current_price": price,
+                        "unrealized_pnl": 0,
+                        "strategy": "market_maker",
+                    })
+
+                if not self.quiet:
+                    console.print(
+                        f"  [green]📊 P&L[/green] ${gross_pnl:+.2f} on {size:.1f} {token} "
+                        f"(entry ${avg_entry:.2f} → exit ${price:.2f})"
+                    )
+
+        except Exception as e:
+            logger.warning(f"DB trade log failed: {e}")
 
     # --- Status ---
 
@@ -776,12 +881,13 @@ class MakerRunner:
         quoting = sum(1 for ids in self.live_order_ids.values() if ids)
 
         mode = "DRY" if self.dry else ("AUTO" if self.auto else "COPILOT")
+        pnl_str = f"P&L: ${self._total_spread_captured:+.2f}" if self._total_spread_captured else ""
         console.print(
             f"\n[dim bold]── Maker Status ── {mode} ─ "
             f"Mkts: {len(self.active_markets)} (quoting: {quoting}) | "
             f"Orders: {total_orders} | Fills: {self._total_fills} | "
             f"Quotes: {self._total_quotes_posted} Pulls: {self._total_pulls} | "
-            f"Inv: {total_inv:.1f} tokens | "
+            f"Inv: {total_inv:.1f} tokens | {pnl_str} "
             f"{depth_str}[/dim bold]"
         )
 
