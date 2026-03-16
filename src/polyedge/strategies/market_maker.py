@@ -287,15 +287,22 @@ class MarketMakerStrategy:
         qs.spread = spread
         half_spread = spread / 2.0
 
-        # Inventory skew — shift quotes to rebalance
+        # Inventory skew — shift quotes to encourage rebalancing
         inv = self.get_inventory(condition_id)
-        imbalance = inv.imbalance  # 0.5 = balanced
+        imbalance = inv.imbalance  # 0.5 = balanced, 1.0 = all YES
         skew = (imbalance - 0.5) * self.config.inventory_skew_factor * 10
-        # Positive skew = too much YES → lower bid (buy less YES), raise ask (sell more YES)
+        # Positive skew (too much YES):
+        #   - Lower bid (discourage buying more YES)
+        #   - Lower ask too (encourage selling YES faster)
+        # But ask must NEVER go below fair_value — that would cross the
+        # spread and get rejected as post_only.
 
         # Compute bid/ask prices
         bid_price = fair_value - half_spread - skew
         ask_price = fair_value + half_spread - skew
+
+        # Safety: ask must be above fair value (otherwise post_only will reject)
+        ask_price = max(ask_price, fair_value + tick_size)
 
         # Round to tick size
         tick = tick_size
