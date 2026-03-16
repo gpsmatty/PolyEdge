@@ -307,6 +307,17 @@ class MarketMakerStrategy:
         bid_price = fair_value - half_spread - bid_skew
         ask_price = fair_value + half_spread
 
+        # Profit floor: don't sell until price is min_profit_pct above avg cost.
+        # Buy at $0.31 with 20% min_profit → don't sell below $0.37.
+        # This lets winners run instead of dumping for 3 cents.
+        # Override: in the last force_sell_seconds, sell at any price to avoid
+        # stranded inventory at window end.
+        avg_cost = inv.avg_cost("YES") if has_yes_inventory else 0
+        near_window_end = seconds_remaining < self.config.force_sell_seconds
+        if avg_cost > 0 and not near_window_end:
+            min_sell_price = avg_cost * (1.0 + self.config.min_profit_pct)
+            ask_price = max(ask_price, min_sell_price)
+
         # Floor ask above the actual Polymarket best bid to prevent post_only rejection.
         # post_only orders that would immediately match get silently rejected.
         if yes_best_bid > 0:

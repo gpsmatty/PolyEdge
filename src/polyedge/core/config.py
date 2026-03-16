@@ -430,6 +430,10 @@ class MarketMakerConfig(BaseModel):
     depth_widen_factor: float = 1.5  # Spread multiplier during depth widen
     depth_recovery_seconds: float = 3.0  # Wait after pull before re-quoting
 
+    # --- Profit targeting ---
+    min_profit_pct: float = 0.20  # Don't sell until 20% above avg cost (buy $0.31 → sell $0.37+)
+    force_sell_seconds: float = 60.0  # Override min_profit in last N seconds — dump at any price
+
     # --- Risk ---
     max_loss_per_window_usd: float = 2.0  # Stop quoting if net loss exceeds this
     max_open_orders: int = 8  # Max simultaneous open orders
