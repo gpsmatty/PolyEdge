@@ -127,6 +127,9 @@ class MakerRunner:
         self.live_order_ids: dict[str, list[str]] = {}  # condition_id -> [order_ids]
         self.heartbeat_id: str | None = None
 
+        # Locks
+        self._quote_lock = asyncio.Lock()  # Prevent double cancel+post races
+
         # State
         self._running = False
         self._last_market_refresh = 0.0
@@ -612,40 +615,41 @@ class MakerRunner:
 
     async def _post_quotes(self, condition_id: str, yes_token_id: str, qs: QuoteSet):
         """Cancel old quotes and post new ones."""
-        try:
-            # Cancel existing orders for this market
-            if self.config.cancel_before_requote:
-                await self._cancel_market_quotes(condition_id, yes_token_id)
+        async with self._quote_lock:  # Prevent race between concurrent cancel+post
+            try:
+                # Cancel existing orders for this market
+                if self.config.cancel_before_requote:
+                    await self._cancel_market_quotes(condition_id, yes_token_id)
 
-            # Build batch
-            orders = [q.as_order_dict() for q in qs.all_quotes()]
-            if not orders:
-                return
+                # Build batch
+                orders = [q.as_order_dict() for q in qs.all_quotes()]
+                if not orders:
+                    return
 
-            if len(orders) <= 15:
-                result = self.client.post_orders_batch(orders)
-            else:
-                # Shouldn't happen but handle gracefully
-                result = self.client.post_orders_batch(orders[:15])
+                if len(orders) <= 15:
+                    result = self.client.post_orders_batch(orders)
+                else:
+                    # Shouldn't happen but handle gracefully
+                    result = self.client.post_orders_batch(orders[:15])
 
-            # Track order IDs from response
-            if isinstance(result, dict) and "orderIDs" in result:
-                self.live_order_ids[condition_id] = result["orderIDs"]
-            elif isinstance(result, list):
-                ids = [r.get("orderID", r.get("id", "")) for r in result if isinstance(r, dict)]
-                self.live_order_ids[condition_id] = [i for i in ids if i]
+                # Track order IDs from response
+                if isinstance(result, dict) and "orderIDs" in result:
+                    self.live_order_ids[condition_id] = result["orderIDs"]
+                elif isinstance(result, list):
+                    ids = [r.get("orderID", r.get("id", "")) for r in result if isinstance(r, dict)]
+                    self.live_order_ids[condition_id] = [i for i in ids if i]
 
-            if not self.quiet:
-                parts = []
-                for q in qs.all_quotes():
-                    parts.append(f"{'BID' if q.side == 'BUY' else 'ASK'} ${q.price:.2f}×{q.size:.0f}")
-                console.print(
-                    f"  [cyan]📋 POST[/cyan] {' | '.join(parts)} | "
-                    f"FV={qs.fair_value:.2f} spread={qs.spread:.3f}"
-                )
+                if not self.quiet:
+                    parts = []
+                    for q in qs.all_quotes():
+                        parts.append(f"{'BID' if q.side == 'BUY' else 'ASK'} ${q.price:.2f}×{q.size:.0f}")
+                    console.print(
+                        f"  [cyan]📋 POST[/cyan] {' | '.join(parts)} | "
+                        f"FV={qs.fair_value:.2f} spread={qs.spread:.3f}"
+                    )
 
-        except Exception as e:
-            logger.warning(f"Post quotes failed: {e}")
+            except Exception as e:
+                logger.warning(f"Post quotes failed: {e}")
 
     async def _cancel_market_quotes(self, condition_id: str, token_id: str):
         """Cancel all our orders on a market."""

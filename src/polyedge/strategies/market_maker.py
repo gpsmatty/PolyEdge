@@ -109,8 +109,15 @@ class Inventory:
                 self.no_cost_basis += size * price
         else:  # SELL
             if token == "YES":
+                # Reduce cost basis proportionally
+                if self.yes_tokens > 0:
+                    sell_frac = min(size / self.yes_tokens, 1.0)
+                    self.yes_cost_basis *= (1.0 - sell_frac)
                 self.yes_tokens = max(0, self.yes_tokens - size)
             else:
+                if self.no_tokens > 0:
+                    sell_frac = min(size / self.no_tokens, 1.0)
+                    self.no_cost_basis *= (1.0 - sell_frac)
                 self.no_tokens = max(0, self.no_tokens - size)
 
 
@@ -329,16 +336,26 @@ class MarketMakerStrategy:
                 expiration=expiration,
             )
 
-        if ask_size >= 1 and not suppress_ask and (can_buy_no or has_yes_inventory):
-            # Selling YES = posting a SELL on the YES token at ask_price
-            # Always allow if we have YES inventory to offload, even if NO capacity is full
-            qs.yes_ask = Quote(
-                token_id=yes_token_id,
-                side="SELL",
-                price=ask_price,
-                size=min(ask_size, inv.yes_tokens) if has_yes_inventory and price_too_high else ask_size,
-                expiration=expiration,
-            )
+        if ask_size >= 1 and not suppress_ask:
+            # Two cases for posting asks:
+            # 1. We hold YES inventory → always allow (offloading), cap size to what we own
+            # 2. Normal MM ask (no inventory) → only if can_buy_no (selling YES = buying NO equivalent)
+            if has_yes_inventory:
+                qs.yes_ask = Quote(
+                    token_id=yes_token_id,
+                    side="SELL",
+                    price=ask_price,
+                    size=min(ask_size, inv.yes_tokens),  # Never sell more than we hold
+                    expiration=expiration,
+                )
+            elif can_buy_no:
+                qs.yes_ask = Quote(
+                    token_id=yes_token_id,
+                    side="SELL",
+                    price=ask_price,
+                    size=ask_size,
+                    expiration=expiration,
+                )
 
         # Update tracking
         self._last_fair_value[condition_id] = fair_value
