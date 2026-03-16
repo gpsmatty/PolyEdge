@@ -318,7 +318,7 @@ class MarketMakerStrategy:
         # Build quotes — suppress buys when price is out of range, but always allow sells
         # to offload inventory
         suppress_bid = price_too_high  # Don't buy YES when it's expensive
-        suppress_ask = price_too_low   # Don't sell YES when it's cheap
+        suppress_ask = price_too_low and not has_yes_inventory  # Always allow sells to offload inventory
 
         if can_buy_yes and bid_size >= 1 and not suppress_bid:
             qs.yes_bid = Quote(
