@@ -248,8 +248,16 @@ class MarketMakerStrategy:
             qs.reason_pulled = "near_expiry"
             return qs
 
-        # Price gate
-        if yes_price < self.config.min_entry_price or yes_price > self.config.max_entry_price:
+        # Price gate — only block NEW buys when price is extreme.
+        # If we hold inventory, always allow asks (sells) to offload.
+        inv = self.get_inventory(condition_id)
+        price_too_low = yes_price < self.config.min_entry_price
+        price_too_high = yes_price > self.config.max_entry_price
+        has_yes_inventory = inv.yes_tokens > 0
+        has_no_inventory = inv.no_tokens > 0
+
+        # If price is out of range AND we have no inventory to sell, pull everything
+        if (price_too_low or price_too_high) and not has_yes_inventory and not has_no_inventory:
             qs.reason_pulled = f"price_range_{yes_price:.2f}"
             return qs
 
@@ -307,8 +315,12 @@ class MarketMakerStrategy:
         if self.config.use_gtd and seconds_remaining > self.config.gtd_buffer_seconds:
             expiration = int(time.time() + seconds_remaining - self.config.gtd_buffer_seconds)
 
-        # Build quotes
-        if can_buy_yes and bid_size >= 1:
+        # Build quotes — suppress buys when price is out of range, but always allow sells
+        # to offload inventory
+        suppress_bid = price_too_high  # Don't buy YES when it's expensive
+        suppress_ask = price_too_low   # Don't sell YES when it's cheap
+
+        if can_buy_yes and bid_size >= 1 and not suppress_bid:
             qs.yes_bid = Quote(
                 token_id=yes_token_id,
                 side="BUY",
@@ -317,14 +329,14 @@ class MarketMakerStrategy:
                 expiration=expiration,
             )
 
-        if can_buy_no and ask_size >= 1:
-            # Selling YES = Buying NO at (1 - ask_price)
-            # But on Polymarket, we post a SELL on the YES token at ask_price
+        if ask_size >= 1 and not suppress_ask and (can_buy_no or has_yes_inventory):
+            # Selling YES = posting a SELL on the YES token at ask_price
+            # Always allow if we have YES inventory to offload, even if NO capacity is full
             qs.yes_ask = Quote(
                 token_id=yes_token_id,
                 side="SELL",
                 price=ask_price,
-                size=ask_size,
+                size=min(ask_size, inv.yes_tokens) if has_yes_inventory and price_too_high else ask_size,
                 expiration=expiration,
             )
 
