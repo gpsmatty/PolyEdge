@@ -50,8 +50,6 @@ class QuoteSet:
 
     yes_bid: Quote | None = None
     yes_ask: Quote | None = None
-    no_bid: Quote | None = None
-    no_ask: Quote | None = None
     fair_value: float = 0.50
     spread: float = 0.06
     reason_pulled: str | None = None  # Why quotes were pulled (depth, risk, etc.)
@@ -61,7 +59,7 @@ class QuoteSet:
         return self.yes_bid is not None or self.yes_ask is not None
 
     def all_quotes(self) -> list[Quote]:
-        return [q for q in [self.yes_bid, self.yes_ask, self.no_bid, self.no_ask] if q]
+        return [q for q in [self.yes_bid, self.yes_ask] if q]
 
 
 @dataclass
@@ -97,6 +95,12 @@ class Inventory:
         Negative = net long NO (bearish exposure).
         """
         return self.yes_tokens - self.no_tokens
+
+    def avg_cost(self, token: str) -> float:
+        """Average cost per token. Returns 0 if no position."""
+        if token == "YES":
+            return self.yes_cost_basis / self.yes_tokens if self.yes_tokens > 0 else 0.0
+        return self.no_cost_basis / self.no_tokens if self.no_tokens > 0 else 0.0
 
     def record_fill(self, side: str, token: str, size: float, price: float):
         """Record a fill. side = BUY/SELL, token = YES/NO."""
@@ -236,11 +240,17 @@ class MarketMakerStrategy:
         seconds_remaining: float,
         depth_momentum: float = 0.0,
         tick_size: float = 0.01,
+        yes_best_bid: float = 0.0,
     ) -> QuoteSet:
         """Compute the full quote set for a market.
 
-        Returns a QuoteSet with bid/ask for YES token (and optionally NO token).
+        Returns a QuoteSet with bid/ask for YES token.
         Quotes may be None if pulled or conditions don't warrant quoting.
+
+        Args:
+            yes_best_bid: The actual best bid on Polymarket for the YES token.
+                          Used to floor ask price above it (post_only would reject
+                          any ask at or below the best bid).
         """
         qs = QuoteSet()
 
@@ -250,25 +260,24 @@ class MarketMakerStrategy:
             qs.reason_pulled = pull_reason
             return qs
 
-        # Time gate
-        if seconds_remaining < self.config.min_seconds_remaining:
-            qs.reason_pulled = "near_expiry"
-            return qs
-
         # Price gate — only block NEW buys when price is extreme.
         # If we hold inventory, always allow asks (sells) to offload.
         inv = self.get_inventory(condition_id)
         price_too_low = yes_price < self.config.min_entry_price
         price_too_high = yes_price > self.config.max_entry_price
         has_yes_inventory = inv.yes_tokens > 0
-        has_no_inventory = inv.no_tokens > 0
+
+        # Time gate — but ALWAYS allow sells to offload inventory near expiry
+        if seconds_remaining < self.config.min_seconds_remaining and not has_yes_inventory:
+            qs.reason_pulled = "near_expiry"
+            return qs
 
         # If price is out of range AND we have no inventory to sell, pull everything
-        if (price_too_low or price_too_high) and not has_yes_inventory and not has_no_inventory:
+        if (price_too_low or price_too_high) and not has_yes_inventory:
             qs.reason_pulled = f"price_range_{yes_price:.2f}"
             return qs
 
-        # Rate limit requotes
+        # Rate limit requotes (but always allow if we have inventory to offload)
         now = time.monotonic()
         last_quote = self._last_quote_time.get(condition_id, 0)
         last_fv = self._last_fair_value.get(condition_id, 0)
@@ -278,7 +287,7 @@ class MarketMakerStrategy:
         fv_moved = abs(fair_value - last_fv) >= self.config.requote_threshold
         time_elapsed = (now - last_quote) >= self.config.requote_interval_seconds
 
-        if not fv_moved and not time_elapsed and last_fv > 0:
+        if not fv_moved and not time_elapsed and last_fv > 0 and not has_yes_inventory:
             qs.reason_pulled = "no_requote_needed"
             return qs
 
@@ -287,22 +296,21 @@ class MarketMakerStrategy:
         qs.spread = spread
         half_spread = spread / 2.0
 
-        # Inventory skew — shift quotes to encourage rebalancing
-        inv = self.get_inventory(condition_id)
+        # Inventory skew — shift BID down to discourage more buying
+        # when we're overweight. Does NOT shift ask — we want to sell at
+        # fair value + half_spread or better.
         imbalance = inv.imbalance  # 0.5 = balanced, 1.0 = all YES
-        skew = (imbalance - 0.5) * self.config.inventory_skew_factor * 10
-        # Positive skew (too much YES):
-        #   - Lower bid (discourage buying more YES)
-        #   - Lower ask too (encourage selling YES faster)
-        # But ask must NEVER go below fair_value — that would cross the
-        # spread and get rejected as post_only.
+        bid_skew = (imbalance - 0.5) * self.config.inventory_skew_factor * 10
+        # Positive bid_skew (too much YES) → lower bid (buy less YES)
 
         # Compute bid/ask prices
-        bid_price = fair_value - half_spread - skew
-        ask_price = fair_value + half_spread - skew
+        bid_price = fair_value - half_spread - bid_skew
+        ask_price = fair_value + half_spread
 
-        # Safety: ask must be above fair value (otherwise post_only will reject)
-        ask_price = max(ask_price, fair_value + tick_size)
+        # Floor ask above the actual Polymarket best bid to prevent post_only rejection.
+        # post_only orders that would immediately match get silently rejected.
+        if yes_best_bid > 0:
+            ask_price = max(ask_price, yes_best_bid + tick_size)
 
         # Round to tick size
         tick = tick_size
@@ -315,10 +323,9 @@ class MarketMakerStrategy:
         if bid_price >= ask_price:
             ask_price = round(bid_price + tick, 2)
 
-        # Check inventory capacity
+        # Check inventory capacity for NEW buys
         max_inv = self.config.max_inventory_usd
         can_buy_yes = inv.yes_tokens * fair_value < max_inv * self.config.max_inventory_imbalance
-        can_buy_no = inv.no_tokens * (1 - fair_value) < max_inv * self.config.max_inventory_imbalance
 
         # Compute sizes in contracts
         bid_size = round(self.config.quote_size_usd / bid_price, 1) if bid_price > 0 else 0
@@ -329,11 +336,10 @@ class MarketMakerStrategy:
         if self.config.use_gtd and seconds_remaining > self.config.gtd_buffer_seconds:
             expiration = int(time.time() + seconds_remaining - self.config.gtd_buffer_seconds)
 
-        # Build quotes — suppress buys when price is out of range, but always allow sells
-        # to offload inventory
-        suppress_bid = price_too_high  # Don't buy YES when it's expensive
-        suppress_ask = price_too_low and not has_yes_inventory  # Always allow sells to offload inventory
+        # Suppress bids when price is extreme (either direction) or near expiry
+        suppress_bid = price_too_low or price_too_high or seconds_remaining < self.config.min_seconds_remaining
 
+        # --- BID side: only when we have capacity and conditions allow ---
         if can_buy_yes and bid_size >= 1 and not suppress_bid:
             qs.yes_bid = Quote(
                 token_id=yes_token_id,
@@ -343,26 +349,18 @@ class MarketMakerStrategy:
                 expiration=expiration,
             )
 
-        if ask_size >= 1 and not suppress_ask:
-            # Two cases for posting asks:
-            # 1. We hold YES inventory → always allow (offloading), cap size to what we own
-            # 2. Normal MM ask (no inventory) → only if can_buy_no (selling YES = buying NO equivalent)
-            if has_yes_inventory:
-                qs.yes_ask = Quote(
-                    token_id=yes_token_id,
-                    side="SELL",
-                    price=ask_price,
-                    size=min(ask_size, inv.yes_tokens),  # Never sell more than we hold
-                    expiration=expiration,
-                )
-            elif can_buy_no:
-                qs.yes_ask = Quote(
-                    token_id=yes_token_id,
-                    side="SELL",
-                    price=ask_price,
-                    size=ask_size,
-                    expiration=expiration,
-                )
+        # --- ASK side: ONLY when we hold YES inventory ---
+        # We never sell YES we don't have. That would be a naked short
+        # (Polymarket treats it as minting NO, committing collateral
+        # the code doesn't track).
+        if has_yes_inventory and ask_size >= 1:
+            qs.yes_ask = Quote(
+                token_id=yes_token_id,
+                side="SELL",
+                price=ask_price,
+                size=min(ask_size, inv.yes_tokens),  # Never sell more than we hold
+                expiration=expiration,
+            )
 
         # Update tracking
         self._last_fair_value[condition_id] = fair_value
@@ -377,26 +375,41 @@ class MarketMakerStrategy:
         token: str,
         size: float,
         price: float,
-    ):
-        """Record a fill and update inventory + P&L tracking."""
+    ) -> float | None:
+        """Record a fill and update inventory + P&L tracking.
+
+        Returns avg_entry price for SELL fills (computed BEFORE inventory
+        is updated), or None for BUY fills.
+        """
         inv = self.get_inventory(condition_id)
+
+        # For SELL fills, capture avg entry BEFORE decrementing inventory
+        avg_entry = None
+        if side == "SELL":
+            avg_entry = inv.avg_cost(token)
+            if avg_entry > 0:
+                # Update window P&L
+                pnl = (price - avg_entry) * size
+                self._window_pnl[condition_id] = self._window_pnl.get(condition_id, 0) + pnl
+
+        # Now update inventory
         inv.record_fill(side, token, size, price)
 
-        # Track window P&L (rough estimate — actual reconciliation happens separately)
-        # A fill captures half the spread if it was our resting order
-        # We'll compute precise P&L from matched buy/sell pairs in the runner
         logger.info(
             f"Fill: {side} {size:.1f} {token} @ ${price:.2f} | "
             f"Inventory: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f} "
             f"(imbalance={inv.imbalance:.2f})"
         )
+        return avg_entry
 
     def reset_window(self, condition_id: str):
         """Reset per-window state when hopping to a new window."""
-        self._window_pnl[condition_id] = 0.0
+        self._window_pnl.pop(condition_id, None)
         self._pulled_until.pop(condition_id, None)
         self._last_fair_value.pop(condition_id, None)
         self._last_quote_time.pop(condition_id, None)
+        # Clear stale inventory for expired market
+        self.inventory.pop(condition_id, None)
 
     def reset_all(self):
         """Reset all state."""

@@ -111,13 +111,13 @@ class MakerRunner:
         # First element = current active window, rest = upcoming for hopping
         self.windows: dict[str, list[Market]] = {}  # e.g. "btcusdt" -> [Market, Market, ...]
         self.active_markets: dict[str, Market] = {}  # condition_id -> Market (flat view)
-        self.yes_prices: dict[str, float] = {}  # condition_id -> YES price
+        self.yes_prices: dict[str, float] = {}  # condition_id -> YES midpoint price
         self.no_prices: dict[str, float] = {}  # condition_id -> NO price
+        self.yes_best_bids: dict[str, float] = {}  # condition_id -> actual YES best bid
         self._token_to_market: dict[str, tuple[Market, str]] = {}  # token_id -> (Market, "yes"|"no")
 
         # Depth feed
         self.depth_feed: Optional[BinanceDepthFeed] = None
-        self.depth_structure: Optional[DepthStructure] = None
 
         # Polymarket WebSocket
         self.poly_feed: Optional[MarketFeed] = None
@@ -157,9 +157,6 @@ class MakerRunner:
 
         if self.config.depth_enabled:
             self.depth_feed = BinanceDepthFeed(symbols=symbols)
-            self.depth_structure = self.depth_feed.depth.get(
-                symbols[0], None
-            ) if symbols else None
 
         # Launch concurrent tasks
         tasks = []
@@ -390,18 +387,29 @@ class MakerRunner:
             if current.end_date and current.end_date <= now:
                 # Current window expired — cancel its orders and promote next
                 old_cid = current.condition_id
-                if old_cid in self.live_order_ids:
-                    if not self.dry:
-                        try:
-                            if current.clob_token_ids:
-                                self.client.cancel_market_orders(
-                                    asset_id=current.clob_token_ids[0]
-                                )
-                        except Exception as e:
-                            logger.warning(f"Cancel on hop failed: {e}")
-                    self.live_order_ids.pop(old_cid, None)
+                if not self.dry:
+                    try:
+                        # Cancel all orders for both YES and NO tokens
+                        if current.clob_token_ids and len(current.clob_token_ids) >= 2:
+                            self.client.cancel_market_orders(
+                                asset_id=current.clob_token_ids[0]
+                            )
+                            self.client.cancel_market_orders(
+                                asset_id=current.clob_token_ids[1]
+                            )
+                    except Exception as e:
+                        logger.warning(f"Cancel on hop failed: {e}")
+                self.live_order_ids.pop(old_cid, None)
 
-                # Reset strategy state for old window
+                # Log stranded inventory warning
+                inv = self.strategy.get_inventory(old_cid)
+                if inv.yes_tokens > 0 or inv.no_tokens > 0:
+                    logger.warning(
+                        f"Window expired with inventory! YES={inv.yes_tokens:.1f} "
+                        f"NO={inv.no_tokens:.1f} on {current.question[:40]}"
+                    )
+
+                # Reset strategy state for old window (also clears inventory)
                 self.strategy.reset_window(old_cid)
 
                 # Promote next window
@@ -469,6 +477,9 @@ class MakerRunner:
             price = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
             if side == "yes":
                 self.yes_prices[cid] = price
+                # Store actual best bid separately — needed to floor ask price
+                if bid > 0:
+                    self.yes_best_bids[cid] = bid
             else:
                 self.no_prices[cid] = price
 
@@ -514,6 +525,23 @@ class MakerRunner:
                 logger.warning(f"Poly feed error: {e}")
                 await asyncio.sleep(2)
 
+    # --- Depth Lookup ---
+
+    def _get_depth_momentum(self) -> float:
+        """Get current depth momentum from Binance feed.
+
+        Looks up lazily each call — NOT cached at startup (the feed
+        hasn't connected yet at that point, so caching would give None).
+        """
+        if not self.depth_feed:
+            return 0.0
+        symbols = self._get_symbols()
+        for sym in symbols:
+            ds = self.depth_feed.depth.get(sym)
+            if ds and ds.is_active:
+                return ds.depth_momentum
+        return 0.0
+
     # --- Quote Loop ---
 
     async def _quote_loop(self):
@@ -533,10 +561,8 @@ class MakerRunner:
                     await asyncio.sleep(1)
                     continue
 
-                # Get depth momentum for defense
-                depth_momentum = 0.0
-                if self.depth_structure and self.depth_structure.is_active:
-                    depth_momentum = self.depth_structure.depth_momentum
+                # Get depth momentum for defense (looked up fresh each iteration)
+                depth_momentum = self._get_depth_momentum()
 
                 # Only quote CURRENT windows (first per symbol), not upcoming ones
                 current_markets = self._get_current_markets()
@@ -577,6 +603,9 @@ class MakerRunner:
         yes_token_id = m.clob_token_ids[0]
         no_token_id = m.clob_token_ids[1]
 
+        # Get actual best bid for ask floor
+        yes_best_bid = self.yes_best_bids.get(condition_id, 0)
+
         # Compute quotes
         qs = self.strategy.compute_quotes(
             condition_id=condition_id,
@@ -586,6 +615,7 @@ class MakerRunner:
             no_price=no_price,
             seconds_remaining=seconds_remaining,
             depth_momentum=depth_momentum,
+            yes_best_bid=yes_best_bid,
         )
 
         if qs.reason_pulled:
@@ -757,7 +787,8 @@ class MakerRunner:
                         token = "NO"
                         break
 
-            self.strategy.record_fill(condition_id, side, token, size, price)
+            # record_fill returns avg_entry for SELLs (computed BEFORE inventory update)
+            avg_entry = self.strategy.record_fill(condition_id, side, token, size, price)
             self._total_fills += 1
 
             inv = self.strategy.get_inventory(condition_id)
@@ -770,7 +801,7 @@ class MakerRunner:
 
             # --- DB trade logging ---
             await self._log_fill_to_db(
-                condition_id, order_id, token_id, token, side, price, size, m
+                condition_id, order_id, token_id, token, side, price, size, m, avg_entry
             )
 
         except Exception as e:
@@ -787,8 +818,13 @@ class MakerRunner:
         price: float,
         size: float,
         market: Market | None,
+        avg_entry: float | None,
     ):
-        """Log a fill to the trades/positions/orders tables in DB."""
+        """Log a fill to the trades/positions/orders tables in DB.
+
+        avg_entry is provided by record_fill() for SELL fills — computed
+        BEFORE inventory was decremented, so the cost basis is accurate.
+        """
         try:
             question = market.question if market else ""
             inv = self.strategy.get_inventory(condition_id)
@@ -803,7 +839,7 @@ class MakerRunner:
                 "inventory_yes": inv.yes_tokens,
                 "inventory_no": inv.no_tokens,
                 "inventory_imbalance": inv.imbalance,
-                "depth_momentum": self.depth_structure.depth_momentum if self.depth_structure else 0,
+                "depth_momentum": self._get_depth_momentum(),
             }
 
             if side == "BUY":
@@ -827,7 +863,7 @@ class MakerRunner:
                     "question": question,
                     "side": side,
                     "size": inv.yes_tokens if token == "YES" else inv.no_tokens,
-                    "entry_price": price,
+                    "entry_price": inv.avg_cost(token),  # Weighted avg, not last fill
                     "current_price": price,
                     "unrealized_pnl": 0,
                     "strategy": "market_maker",
@@ -835,11 +871,9 @@ class MakerRunner:
 
             else:
                 # Exit — selling tokens we hold
-                # Compute P&L: for a market maker, profit = sell_price - avg_buy_price
-                cost_basis = inv.yes_cost_basis if token == "YES" else inv.no_cost_basis
-                token_count = inv.yes_tokens if token == "YES" else inv.no_tokens
-                avg_entry = cost_basis / token_count if token_count > 0 else price
-                gross_pnl = (price - avg_entry) * size
+                # avg_entry was computed BEFORE inventory decrement, so it's accurate
+                entry_price = avg_entry if avg_entry and avg_entry > 0 else price
+                gross_pnl = (price - entry_price) * size
 
                 self._total_spread_captured += gross_pnl
 
@@ -850,10 +884,10 @@ class MakerRunner:
                     exit_reason="maker_sell",
                 )
 
-                # Remove position if fully closed
-                remaining = (inv.yes_tokens if token == "YES" else inv.no_tokens) - size
+                # Check remaining inventory (already decremented by record_fill)
+                remaining = inv.yes_tokens if token == "YES" else inv.no_tokens
                 if remaining <= 0.1:
-                    await self.db.remove_position(condition_id, token_id, side)
+                    await self.db.remove_position(condition_id, token_id, "BUY")
                 else:
                     # Update position with remaining size
                     await self.db.upsert_position({
@@ -862,7 +896,7 @@ class MakerRunner:
                         "question": question,
                         "side": "BUY",
                         "size": remaining,
-                        "entry_price": avg_entry,
+                        "entry_price": entry_price,
                         "current_price": price,
                         "unrealized_pnl": 0,
                         "strategy": "market_maker",
@@ -871,7 +905,7 @@ class MakerRunner:
                 if not self.quiet:
                     console.print(
                         f"  [green]📊 P&L[/green] ${gross_pnl:+.2f} on {size:.1f} {token} "
-                        f"(entry ${avg_entry:.2f} → exit ${price:.2f})"
+                        f"(entry ${entry_price:.2f} → exit ${price:.2f})"
                     )
 
         except Exception as e:
@@ -888,12 +922,10 @@ class MakerRunner:
 
     def _print_status(self):
         """Print market maker status line."""
-        now = time.monotonic()
-
-        # Depth info
+        # Depth info (lazy lookup)
         depth_str = ""
-        if self.depth_structure and self.depth_structure.is_active:
-            dm = self.depth_structure.depth_momentum
+        dm = self._get_depth_momentum()
+        if dm != 0:
             depth_str = f"Depth:{dm:+.2f}"
 
         # Inventory summary
