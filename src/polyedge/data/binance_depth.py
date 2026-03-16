@@ -157,7 +157,6 @@ class DepthStructure:
     # Configurable params (all pushed from DB config, no hardcoded values)
     imbalance_levels: int = 5
     velocity_window_s: float = 3.0
-    exit_velocity_window_s: float = 15.0  # Slower window for exit decisions
     large_order_threshold: float = 3.0
 
     # Momentum weights
@@ -425,26 +424,6 @@ class DepthStructure:
         )
 
         return max(-1.0, min(1.0, raw))
-
-    @property
-    def exit_depth_momentum(self) -> float:
-        """Slower depth momentum for exit decisions. Range [-1, 1].
-
-        Uses ONLY the slow imbalance velocity (exit_velocity_window_s, default
-        15s).  The fast components (depth_delta at 1s, large_order_signal at
-        instant) are excluded because they inject the same 8-second market
-        maker noise we're trying to filter out.  A pure 15s velocity means
-        only sustained book tilts can cross the exit threshold.
-        """
-        if not self.is_active:
-            return 0.0
-
-        velocity = self._velocity(self.exit_velocity_window_s)
-        # Pure slow velocity — no fast delta or large_order components.
-        # Max possible value: imbalance swing of 2.0 over 15s = 0.133 raw,
-        # * velocity_scale (5.0) = 0.667.  Exit threshold at 0.42 requires
-        # ~63% of the maximum possible 15s swing — very selective.
-        return max(-1.0, min(1.0, velocity * self.velocity_scale))
 
     @property
     def confidence(self) -> float:

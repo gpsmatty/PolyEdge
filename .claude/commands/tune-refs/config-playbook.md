@@ -2,228 +2,234 @@
 
 This is the "if you see X, adjust Y" reference for the `/tune` command. Each section maps a data observation to a specific config key, direction, and safe nudge range.
 
-**Signal architecture (as of 2026-03-16):** Pure Binance order book depth (`@depth20@100ms`). `depth_signal_weight=1.0`, `depth_aggtrade_weight=0.0`. aggTrade still runs for trend/price tracking but does NOT drive entries or exits. All OFI weights, dampener, and intensity settings are legacy/inactive.
-
 ---
 
 ## Entry Thresholds
 
-### `entry_threshold` (current 0.40)
+### `entry_threshold` (default 0.50)
 **Raise** when: too many losing trades, false signals in chop, losers with low MFE (signal never had conviction)
 **Lower** when: missing too many good moves, win rate is high but trade count is very low, large favorable MFE on blocked signals
-**Nudge**: +/-0.02-0.05. Never go below 0.35 or above 0.55.
-**Data check**: Compare entry momentum of winners vs losers. If winners avg 0.55+ and losers avg 0.42, threshold is too low.
+**Nudge**: ±0.02–0.05. Never go below 0.45 or above 0.70.
 
-### `counter_trend_threshold` (current 0.40)
-Higher bar for entries against the 30s trend direction.
-**Raise** when: counter-trend trades are underperforming with-trend trades
-**Lower** when: counter-trend trades are actually outperforming (depth signal sometimes leads the trend flip)
-**Nudge**: +/-0.02-0.05. Keep >= entry_threshold.
+### `counter_trend_threshold` (default 0.55)
+**Raise** when: counter-trend (against 30s OFI) trades are underperforming, 30s trend alignment shows clear edge
+**Lower** when: counter-trend trades are actually outperforming with-trend trades (currently common — the 30s OFI is often contrarian)
+**Note**: Counter-trend outperforming with-trend is normal in current data. If with-trend 75% WR, raise counter to match. If both bad, entry_threshold is the problem.
+**Nudge**: ±0.02–0.05. Keep above entry_threshold.
 
-### `exit_threshold` (current 0.42)
-Depth momentum must reverse past this against our position to trigger exit.
-**Raise** when: exiting winners too early on depth noise, trades exit in <10s then price continues favorably, hold times under 10s on most trades
-**Lower** when: losers not being cut fast enough, large negative avg P&L on reversal exits, hold times >60s on losers
-**Nudge**: +/-0.02-0.05. Never below 0.30 (depth is noisy) or above 0.55 (won't exit fast enough).
-**Key insight**: Depth momentum swings +/-0.50 regularly as market makers reposition. Setting this too low causes jitter exits, too high traps you in losers.
+### `exit_threshold` (default 0.20)
+**Raise** when: exiting winners too early on noise, trades exit quickly then price continues in our direction
+**Lower** when: losers not being cut fast enough, large negative avg P&L on momentum-reversal exits
+**Nudge**: ±0.02–0.05. Never below 0.15 (won't exit fast enough on real reversals).
 
-### `counter_trend_exit_threshold` (current 0.50)
-When 30s trend agrees with our position, exit threshold is boosted to this value (more patience).
-**Raise** when: winners are exiting too early while trend is still favorable
-**Lower** when: losers are being held too long because trend agreement prevents exit. CHECK THIS FIRST on big losses.
-**DANGER**: Setting this above 0.60 can trap you in positions during sustained reversals where the 30s trend hasn't flipped yet.
-**Nudge**: +/-0.05. Never above 0.60, never below exit_threshold.
+### `flip_threshold` (default 0.50)
+**Raise** when: flip entries are underperforming (too many marginal flips), flip win rate < 40%
+**Lower** when: missing strong reversal opportunities
+**Only relevant if enable_flips=true.**
 
 ---
 
-## Depth Signal Parameters
+## Timing & Cooldowns
 
-### `depth_velocity_window_s` (current 6.0)
-Lookback window for computing imbalance velocity (how fast the book is tilting).
-**Raise** when: signal is too noisy/spiky, entering on individual market maker moves, lots of 7-10s hold times
-**Lower** when: signal is too slow, missing moves, entering after price already moved
-**Nudge**: +/-1.0s. Range 4.0-12.0. Lower = faster/noisier, higher = smoother/slower.
+### `min_seconds_remaining` (default varies, currently 400 via DB)
+**Raise** when: trades with <N seconds remaining are consistent losers (check time-remaining buckets in trade_analysis)
+**Lower** when: late entries are actually fine and we're missing the end-of-window volatility
+**Note**: Was 120 (default), raised to 400 after data showed trades entering <400s remaining were net negative. This is a high-impact setting — each 60s change excludes/includes significant trade volume.
+**Nudge**: ±30–60s. Watch trade_count impact carefully.
 
-### `depth_imbalance_levels` (current 5)
-Number of price levels used for near-touch imbalance calculation.
-**Raise** when: signal is too sensitive to top-of-book noise (single level changes causing signals)
-**Lower** when: signal is too slow to react, deep book changes diluting near-touch moves
-**Nudge**: +/-1-2. Range 3-10.
+### `trade_cooldown` (default 30.0s)
+**Raise** when: seeing buy-sell-rebuy patterns at worse prices (whipsaw), multiple trades on same market in <60s
+**Lower** when: cooldown is blocking profitable re-entries after clean exits
+**Nudge**: ±5–10s.
 
-### `depth_velocity_scale` (current 5.0)
-Multiplier to normalize velocity into [-1,1] range.
-**Raise** when: velocity component is saturating (frequently at +/-1.0)
-**Lower** when: velocity component is too weak (rarely above +/-0.3)
-**Nudge**: +/-0.5-1.0.
+### `force_exit_seconds` (default 8.0s)
+**Raise** when: force exits are consistent losers (stuck at bad prices, market illiquid at expiry)
+**Lower** when: exits with 8-15s left are leaving money on table (price continues favorably after force exit)
+**Nudge**: ±2s.
 
-### `depth_weight_imbalance_velocity` (current 0.50)
-Weight of imbalance velocity in depth momentum composite. This is the primary LEADING signal.
-**Note**: Three depth weights should sum to ~1.0: imbalance_velocity + depth_delta + large_order.
+### `flip_min_hold_seconds` (default 45.0s)
+**Raise** when: flip exits are happening <45s post-flip and losing (protection not holding long enough)
+**Lower** when: flips are being held too long against clear reversals
+**Nudge**: ±10s. Don't go below 20s.
 
-### `depth_weight_depth_delta` (current 0.30)
-Weight of bid/ask depth growth rate. Measures whether bids or asks are growing in absolute terms.
+---
 
-### `depth_weight_large_order` (current 0.20)
-Weight of large order detection. Catches sudden big orders (>3x mean level size).
+## Blocker Tuning
 
-### `depth_confidence_min_snapshots` (current 10)
-Minimum depth snapshots (at 100ms each = 1 second) before confidence > 0.
-**Raise** when: entering on insufficient depth data after gaps/reconnects
-**Nudge**: +/-5.
+### `high_intensity_max_tps` (default 50.0)
+**Raise** when: blocking too many trades, high-intensity trades are actually profitable, dead zone is above 50 tps
+**Lower** when: losers cluster in a tps bucket that's currently allowed through
+**Key data**: Check intensity bucket breakdown. Find the tps level where win rate collapses. Set `high_intensity_max_tps` to the bottom of that bucket.
+**Current note**: Data showed 40-50 tps is profitable, so avoid blocking below 50. Losers avg ~61 tps, winners ~40 tps.
+**Nudge**: ±3–5 tps.
 
-### `depth_gap_clear_seconds` (current 2.0)
-Seconds of no depth data before clearing history (WebSocket disconnect detection).
-**Raise** when: brief network hiccups are wiping depth state
-**Lower** when: stale depth data persisting after real disconnects
-**Nudge**: +/-0.5s.
+### `low_vol_max_intensity` (default 5.0 tps)
+**Raise** when: low-vol block fires rarely but low-vol regime still has bad win rate (regime classifier missing slow markets)
+**Lower** when: low-vol block fires constantly and is blocking decent trades
+**Nudge**: ±1–2 tps.
 
-### `depth_max_snapshots` (current 200)
-Max depth history (200 = 20 seconds at 100ms each).
-**Raise** when: need longer lookback for velocity calculations
-**Lower** when: memory usage concerns
-**Nudge**: +/-50.
+### `low_vol_max_price_change` (default 0.0005)
+**Raise** when: missing trades in slow but valid market conditions
+**Lower** when: low-vol block isn't catching flat markets
+**Nudge**: ±0.0001.
+
+### `chop_threshold` (default 3.0) — chop index (range/net_move ratio)
+**Raise** when: chop filter too aggressive, blocking good directional trades (high range but real momentum)
+**Lower** when: choppy markets still getting through (many entries, low win rate, price oscillating)
+**Nudge**: ±0.3–0.5.
+
+### `chop_max_boost` (default 0.10)
+**Raise** when: chop filter boost isn't strong enough to block bad chop signals (chop regime win rate still poor)
+**Lower** when: chop regime has acceptable win rate but threshold boost is making it miss good entries
+**Nudge**: ±0.02–0.05.
+
+### `acceleration_tolerance` (default 0.05)
+**Raise** (more tolerant) when: acceleration filter too strict, blocking signals that plateau but are still valid
+**Lower** (stricter) when: fading momentum signals are still getting through and losing
+**Note**: 0.05 = strict (must be accelerating), 0.15 = loose (allows plateau)
+**Nudge**: ±0.02.
 
 ---
 
 ## Entry Filters
 
-### `entry_persistence_seconds` (current 1.2)
-Signal must sustain above threshold for this long before entering.
-**Raise** when: many trades entering on sub-2s depth spikes that immediately reverse (check hold times - if most exits are <10s, persistence may be too low)
-**Lower** when: valid sustained signals being blocked (check DO logs for failed_persistence on signals that would have been winners)
-**CRITICAL**: Depth signals are inherently spiky. At 2.0s, almost NOTHING passes. 1.0-1.5s is the practical range for depth.
-**Nudge**: +/-0.2s. Range 0.8-1.8.
+### `dead_market_band` (default 0.02)
+**Raise** when: trades near 0.50 YES price are consistently losing (market not reacting to BTC moves)
+**Lower** when: some 0.48–0.52 entries are profitable and we're blocking them
+**Nudge**: ±0.005.
 
-### `min_entry_price` (current 0.35) / `max_entry_price` (current 0.62)
-Price band for entries. Prevents buying deep OTM/ITM.
-**Tighten** when: entries near the edges (0.35-0.38 or 0.58-0.62) are consistently losing
-**Widen** when: good signals appearing outside the band (check DO logs for price_band blocks with strong momentum)
-**Nudge**: +/-0.02-0.03.
-**Note**: Best winners historically enter in the 0.40-0.55 range. Entries above 0.60 have limited upside.
+### `min_entry_price` (default 0.35) / `max_entry_price` (default 0.65)
+**Tighten** when: deep OTM/ITM entries are consistently losing
+**Widen** when: good signals appearing outside the band
+**Nudge**: ±0.02–0.05.
 
-### `dead_market_band` (current 0.02)
-Skip entry when YES is within this band of 0.50 (market not reacting to BTC moves).
-**Raise** when: trades near 0.50 are consistently losing
-**Lower** when: some 0.48-0.52 entries are profitable
-**Nudge**: +/-0.005.
+### `min_trades_in_window` (default 10)
+**Raise** when: sparse-data entries (barely 10 trades) are losing — OFI unreliable with few data points
+**Lower** when: valid signals being blocked at low-volume times
+**Nudge**: ±2.
 
-### `min_trades_in_window` (current 3)
-Minimum aggTrade trades in the 15s window. With depth as primary signal, this is less critical but still provides a data quality floor.
-**Nudge**: +/-2.
+### `entry_persistence_seconds` (default 2.0)
+**Raise** when: sub-second spikes getting through (flash signals that immediately reverse)
+**Lower** when: valid slow-building momentum being filtered out
+**Nudge**: ±0.5s.
 
 ---
 
-## Trend Filters
+## Trailing Stop
 
-### `trend_bias_strong_pct` (current 0.003 = 0.30%)
-5-minute BTC price change that triggers hard block on counter-trend entries.
-**Raise** when: trend blocks are too aggressive, blocking valid counter-trend entries that would win
-**Lower** when: entering against strong trends and losing
-**Nudge**: +/-0.001.
+### `trailing_stop_pct` (default 0.12)
+**Raise** when: trailing stop firing on winners that would have recovered (exiting at $0.58 when final price is $0.80)
+**Lower** when: winners giving back too much from high water mark before stop triggers
+**Note**: Breakeven protection is EXPERIMENTAL. Monitor if it reduces P&L on legitimate drawdown recoveries.
+**Nudge**: ±0.02.
 
-### `trend_bias_counter_boost` (current 0.05)
-Added to entry threshold for moderate counter-trend entries (5m trend between min_pct and strong_pct).
-**Raise** when: moderate counter-trend entries underperforming
-**Lower** when: counter-trend boost blocking too many valid entries
-**Nudge**: +/-0.02.
-
-### Chop filter (`chop_filter_enabled`, current true)
-Raises entry threshold in choppy conditions (high price range, no net direction).
-- `chop_threshold` (current 6.0) — chop index above this triggers boost
-- `chop_max_boost` (current 0.05) — max threshold increase in extreme chop
-- `chop_scale` (current 8.0) — chop index at which max_boost fully applies
-**Raise chop_threshold** when: chop filter too aggressive in ranging markets
-**Lower chop_threshold** when: choppy entries still getting through and losing
-**Note**: Chop filter also affects EXIT threshold in same-direction chop. This can prevent premature exits during noisy but favorable windows.
-
----
-
-## Risk Management / Exits
-
-### `trailing_stop_pct` (current 0.18)
-Exit when price drops X% from high water mark.
-**Raise** when: trailing stop firing on winners that would have recovered
-**Lower** when: winners giving back too much from peak before stop fires
-**Nudge**: +/-0.02.
-
-### `trailing_stop_min_profit_pct` (current 0.12)
-Trailing stop only arms after price is X% above entry.
-**Raise** when: trailing stop arming too early, stopping out on normal dips
+### `trailing_stop_min_profit_pct` (default 0.10)
+**Raise** when: trailing stop arming too early (price barely up 10% then stops out on normal noise)
 **Lower** when: not protecting enough gains on small winners
-**Nudge**: +/-0.02.
+**Nudge**: ±0.02.
 
-### `trailing_stop_late_pct` (current 0.15) / `trailing_stop_late_seconds` (current 90.0)
-Tighter trailing stop in the last N seconds of window.
-**Nudge**: pct +/-0.02, seconds +/-15.
+### `take_profit_price` (default 0.90)
+**Lower** when: price is touching 0.85+ but never reaching 0.90, leaving gains on table
+**Raise** when: take-profit exits are capturing the top but price was going higher (rare)
+**Note**: Currently catching good exits at 0.90. Would lower to 0.85 if consistent data shows 0.90 being missed.
+**Nudge**: ±0.02–0.05.
 
-### `take_profit_price` (current 0.90)
-Exit immediately when token price hits this.
-**Lower** when: price touching 0.80-0.85 but rarely reaching 0.90
-**Raise** when: consistently hitting 0.90 and price would have gone higher
-**Nudge**: +/-0.02-0.05.
-
-### `max_loss_pct` (current 0.30)
-Hard stop: exit if token drops X% from entry regardless of anything else.
-**Raise** when: max_loss triggering on trades that would have recovered (check post-exit price)
-**Lower** when: losses still too large before max_loss fires
-**Nudge**: +/-0.05. Never above 0.40 (that's a $2+ loss on $5 trades).
+### `max_loss_pct` (default 0.35, currently 0.45) ⚠️ NEW — under evaluation
+Exits position if token drops X% from entry price, regardless of momentum or time remaining.
+Fills the gap that trailing stop doesn't cover: trailing stop only arms after min_profit_pct gain.
+Without this, a trade that immediately goes wrong rides all the way to window close (floor_exit).
+**Raise** when: max_loss is triggering on trades that would have recovered (check post-exit MFE)
+**Lower** when: losses are still too large before max_loss fires, or a -$4+ loss occurs again
+**Set to 0** to disable entirely.
+**Do not tune aggressively** — new feature, needs a full session of data before conclusions.
+**Nudge**: ±0.05.
 
 ---
 
-## Timing
+## Adaptive Bias
 
-### `min_seconds_remaining` (current 300)
-Don't enter with fewer than this many seconds left in window.
-**Raise** when: late entries are consistent losers
-**Lower** when: missing good late-window signals
-**Nudge**: +/-30-60s.
+### `adaptive_bias_min_move` (default 0.003 = 0.30%)
+**Raise** when: UNFAVORABLE trades are net negative (bias is firing on noise, punishing trades that would have been fine). Current data showed UNFAVORABLE net -$2.30.
+**Lower** when: big macro moves aren't being caught by bias (trend continuing past 0.30% before bias kicks in)
+**Nudge**: ±0.001.
 
-### `trade_cooldown` (current 30.0s)
-Seconds between trades on same market.
-**Raise** when: seeing buy-sell-rebuy at worse prices
-**Lower** when: cooldown blocking profitable re-entries after clean exits
-**Nudge**: +/-5-10s.
+### `adaptive_bias_spread` (default 0.10)
+**Raise** when: bias adjustment isn't impacting trade selection enough (FAVORABLE and UNFAVORABLE performing similarly)
+**Lower** when: bias spread is blocking too many UNFAVORABLE entries that are actually profitable
+**Nudge**: ±0.02.
 
-### `window_hop_cooldown` (current 30.0s)
-Seconds after window hop before trading.
-**Raise** when: first trade after window hop is consistently losing
-**Lower** when: missing the opening move on fresh windows
-**Nudge**: +/-5-10s. Depth feed is continuous so this can be shorter than with aggTrade.
+---
+
+## Signal Weights (weights must sum to ~1.0)
+
+### `weight_ofi_15s` (default 0.50)
+Primary signal. **Raise** when: 15s OFI is reliably predicting direction. **Lower** when: it's generating noise.
+
+### `weight_vwap_drift` (default 0.25)
+Price movement weighted by volume. **Raise** when: price confirmation is key to accuracy. **Lower** when: VWAP is lagging and adding noise.
+
+### `weight_intensity` (default 0.15)
+Trade rate spike. **Raise** when: intensity spikes reliably precede moves. **Lower** when: high intensity = noise (chaotic book).
+
+### `weight_ofi_5s` (default 0.10)
+Short burst, noisy. Keep low. Only raise if 5s OFI is highly predictive in current market.
+
+### `vwap_drift_scale` (default 2000.0)
+Normalizes BTC dollar moves to [-1,1]. At 2000, ~$35 BTC move maxes drift signal.
+**Raise** when: VWAP drift component is saturating (maxing out at ±1.0 on normal moves)
+**Lower** when: VWAP drift component is too weak (small moves not registering)
+**Note**: Was 5000 (too sensitive, $14 maxed it). 2000 is well-calibrated for current BTC volatility.
+
+---
+
+## Dampener
+
+### `dampener_disagree_factor` (default 0.40)
+Heavy penalty when OFI and price move in opposite directions (flow absorbed without price displacement).
+**Raise** (less penalty) when: dampener is blocking too many valid signals where price lags OFI
+**Lower** (more penalty) when: signals passing dampener despite price opposing flow still losing
+**Nudge**: ±0.05.
+
+### `dampener_flat_factor` (default 0.65)
+Moderate penalty when price flat despite OFI.
+**Raise** when: flat-price entries are profitable (OFI precedes price move)
+**Lower** when: flat-price entries are consistent losers
+**Nudge**: ±0.05.
+
+### `dampener_price_deadzone` (default 0.05)
+Below this abs(drift_signal) = "flat price."
+**Raise** when: small price moves are being treated as "agree" when they're really noise
+**Lower** when: valid small price moves are being treated as flat
+**Nudge**: ±0.01.
 
 ---
 
 ## Execution
 
-### `exit_slippage` (current 0.05)
-Cents below market floor for FOK exit.
-**Raise** when: 3+ FOK rejection attempts on same exit in DO logs
-**Lower** when: consistently exiting far below mid
-**Nudge**: +/-0.01.
+### `exit_slippage` (default 0.05)
+5 cents below market floor for FOK exit. Was 0.02 — caused repeated rejections.
+**Raise** when: seeing 3+ FOK rejection attempts on same exit in DO logs
+**Lower** when: consistently exiting far below mid (paying too much slippage)
+**Nudge**: ±0.01.
 
-### `entry_slippage` (current 0.04)
-Base slippage above market for first FOK entry.
-**Raise** when: first-attempt FOK rejections common
-**Lower** when: consistently overpaying on entry
-**Nudge**: +/-0.01.
+### `entry_slippage` (default 0.02, currently 0.04)
+Base slippage above market for first FOK entry attempt.
+**Raise** when: first-attempt FOK rejections still common after retry escalation
+**Lower** when: consistently overpaying on entry (fill price far above signal price)
+**Nudge**: ±0.01.
 
-### `fixed_position_usd` (current 5.0)
-Fixed dollar amount per trade. 0 = use Kelly sizing.
-**Note**: Scale up only after proving consistent edge over multiple sessions.
+### `entry_slippage_retry_step` (default 0.02) ⚠️ NEW — under evaluation
+Added to slippage on each FOK retry. Attempt 1=base, attempt 2=base+step, attempt 3=base+2×step, then resets. Motivation: strong OFI signals (0.99) were getting FOK'd on thin books during fast BTC moves, then the 30s cooldown locked out the entire move. Now retries with escalating slippage, signal threshold is the only gate.
+**Raise** when: still missing fills after 3 retries on strong signals
+**Lower** when: overpaying on retries, entering at bad prices
+**Set to 0** to disable retry escalation entirely.
+**Do not tune aggressively** — this feature is new and needs a full session of data before drawing conclusions.
 
----
-
-## Legacy / Inactive (aggTrade-era, currently disabled)
-
-These settings exist but are NOT active with `depth_aggtrade_weight=0.0`:
-- `weight_ofi_5s`, `weight_ofi_15s`, `weight_vwap_drift`, `weight_intensity` — aggTrade momentum weights
-- `dampener_agree_factor`, `dampener_disagree_factor`, `dampener_flat_factor`, `dampener_price_deadzone` — flow-price dampener
-- `vwap_drift_scale` — VWAP normalization
-- `low_vol_block_enabled` (false) — designed for aggTrade intensity
-- `high_intensity_block_enabled` (false) — designed for aggTrade TPS
-- `acceleration_enabled` (false) — designed for aggTrade momentum acceleration
-- `adaptive_bias_enabled` (false) — macro trend bias on entry thresholds
-
-**Do NOT tune these unless re-enabling aggTrade signal blending.**
+### `entry_slippage_max` (default 0.10)
+Hard cap on entry slippage across all retries. Prevents runaway slippage on repeated rejections.
+**Raise** when: retries hitting the cap but signal is still strong and book has repriced to a level worth entering
+**Lower** when: paying too much on retried entries
+**Nudge**: ±0.02.
 
 ---
 
@@ -232,9 +238,10 @@ These settings exist but are NOT active with `depth_aggtrade_weight=0.0`:
 - `enable_flips` — enables/disables flip logic entirely
 - `poly_book_enabled` — enables Polymarket order book integration
 - `trend_bias_enabled` — enables/disables 5-min trend block
-- `depth_signal_weight` / `depth_aggtrade_weight` — signal source blend
-- `depth_enabled` — master toggle for depth feed
-- Any depth weight change >0.05
+- `adaptive_bias_enabled` — enables/disables 30-min macro bias
+- `chop_filter_enabled` — enables/disables chop detection
+- `high_intensity_block_enabled` — enables/disables intensity cap
+- Any weight change >0.05 from current
 - Any threshold change >0.10 from current
 - `fixed_position_usd` or `max_position_per_trade` changes
 - `max_trades_per_window` changes

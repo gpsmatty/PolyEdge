@@ -242,7 +242,6 @@ class MicroSniperStrategy:
                 market, micro, seconds_remaining, current_position,
                 momentum, confidence, is_bullish, book_intel,
                 entry_price, high_water_mark, flip_hold_remaining,
-                depth=depth,
             )
 
         # --- Check if we should enter ---
@@ -639,26 +638,10 @@ class MicroSniperStrategy:
         entry_price: Optional[float] = None,
         high_water_mark: Optional[float] = None,
         flip_hold_remaining: float = 0.0,
-        depth: Optional[DepthStructure] = None,
     ) -> Optional[MicroOpportunity]:
         """Evaluate when we already have a position — exit, hold, or flip."""
         abs_momentum = abs(momentum)
         holding_yes = current_position == "yes"
-
-        # --- Slow exit momentum ---
-        # Use a longer velocity window for exit decisions so normal market maker
-        # book shuffles (~8s oscillations) don't trigger panic exits.
-        # Entry uses fast depth_momentum (velocity_window_s ~7s).
-        # Exit uses slow exit_depth_momentum (exit_velocity_window_s ~15s).
-        # Falls back to the fast momentum if depth is unavailable.
-        if depth and depth.is_active and self.config.depth_signal_weight > 0:
-            exit_momentum = depth.exit_depth_momentum
-            exit_abs_momentum = abs(exit_momentum)
-            exit_is_bullish = exit_momentum > 0
-        else:
-            exit_momentum = momentum
-            exit_abs_momentum = abs_momentum
-            exit_is_bullish = is_bullish
 
         # --- TAKE PROFIT ---
         # When our token price hits the target (e.g. 0.90), take the money.
@@ -821,10 +804,7 @@ class MicroSniperStrategy:
                 )
 
         # Is momentum aligned with our position?
-        # Use FAST momentum for flips (need to react quickly to strong reversals)
         aligned = (holding_yes and is_bullish) or (not holding_yes and not is_bullish)
-        # Use SLOW momentum for exit decisions (filter out book noise)
-        exit_aligned = (holding_yes and exit_is_bullish) or (not holding_yes and not exit_is_bullish)
 
         # Guard: don't act on sparse data — OFI ±1.00 with only 1-2 trades
         # is noise, not momentum. Require minimum trade activity for flip/exit
@@ -931,10 +911,8 @@ class MicroSniperStrategy:
             if not self.quiet if hasattr(self, 'quiet') else True:
                 pass  # Logged via exit threshold detail below
 
-        # Exit uses SLOW depth momentum — filters out 8-second book oscillations.
-        # The slow signal needs to sustain against us to trigger exit.
-        should_exit_reversal = not exit_aligned and exit_abs_momentum >= effective_exit_threshold
-        should_exit_faded = exit_aligned and exit_abs_momentum < self.config.hold_threshold
+        should_exit_reversal = not aligned and abs_momentum >= effective_exit_threshold
+        should_exit_faded = aligned and abs_momentum < self.config.hold_threshold
 
         # --- Polymarket book exit override ---
         # When momentum says exit but the Poly book still shows strong support
