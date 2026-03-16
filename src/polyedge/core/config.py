@@ -327,7 +327,8 @@ class MicroSniperConfig(BaseModel):
     depth_weight_depth_delta: float = 0.30         # Bid/ask depth growth rate
     depth_weight_large_order: float = 0.20         # Sudden large order detection
     depth_imbalance_levels: int = 5                # Number of levels for near-touch imbalance
-    depth_velocity_window_s: float = 3.0           # Primary velocity window in seconds
+    depth_velocity_window_s: float = 3.0           # Primary velocity window in seconds (entry)
+    depth_exit_velocity_window_s: float = 15.0       # Slower velocity window for exit decisions
     depth_large_order_threshold: float = 3.0       # Multiple of mean level size to flag as "large"
     depth_signal_weight: float = 1.0               # Weight of depth_momentum in final composite (1.0 = depth only)
     depth_aggtrade_weight: float = 0.0             # Weight of existing momentum_signal (0 = disabled)

@@ -249,6 +249,7 @@ class MicroRunner:
         for depth in self.depth_feed.depth.values():
             depth.imbalance_levels = self.config.depth_imbalance_levels
             depth.velocity_window_s = self.config.depth_velocity_window_s
+            depth.exit_velocity_window_s = self.config.depth_exit_velocity_window_s
             depth.large_order_threshold = self.config.depth_large_order_threshold
             depth.weight_imbalance_velocity = self.config.depth_weight_imbalance_velocity
             depth.weight_depth_delta = self.config.depth_weight_depth_delta

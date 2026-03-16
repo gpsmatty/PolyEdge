@@ -157,6 +157,7 @@ class DepthStructure:
     # Configurable params (all pushed from DB config, no hardcoded values)
     imbalance_levels: int = 5
     velocity_window_s: float = 3.0
+    exit_velocity_window_s: float = 15.0  # Slower window for exit decisions
     large_order_threshold: float = 3.0
 
     # Momentum weights
@@ -412,6 +413,32 @@ class DepthStructure:
         # Primary signal: imbalance velocity at the configured window
         velocity = self._velocity(self.velocity_window_s)
         # Normalize velocity to [-1, 1] — typical range is [-0.5, 0.5]
+        velocity_signal = max(-1.0, min(1.0, velocity * self.velocity_scale))
+
+        delta = self.depth_delta
+        large = self.large_order_signal
+
+        raw = (
+            self.weight_imbalance_velocity * velocity_signal
+            + self.weight_depth_delta * delta
+            + self.weight_large_order * large
+        )
+
+        return max(-1.0, min(1.0, raw))
+
+    @property
+    def exit_depth_momentum(self) -> float:
+        """Slower depth momentum for exit decisions. Range [-1, 1].
+
+        Same composite as depth_momentum but uses exit_velocity_window_s
+        (default 15s) instead of velocity_window_s (default 7s).
+        This smooths out market maker noise — only sustained book shifts
+        cross the exit threshold, preventing 8-second panic exits.
+        """
+        if not self.is_active:
+            return 0.0
+
+        velocity = self._velocity(self.exit_velocity_window_s)
         velocity_signal = max(-1.0, min(1.0, velocity * self.velocity_scale))
 
         delta = self.depth_delta

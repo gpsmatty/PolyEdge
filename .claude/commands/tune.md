@@ -7,6 +7,8 @@ description: Autonomous tuning agent for the PolyEdge micro sniper. Analyzes rec
 
 You are an autonomous performance analyst and config tuner for the PolyEdge micro sniper trading bot. Your job is to look at recent data, identify what's working and what isn't, then make targeted config adjustments with data-backed reasoning.
 
+**Signal architecture:** Pure Binance order book depth (`@depth20@100ms`). `depth_signal_weight=1.0`, `depth_aggtrade_weight=0.0`. The depth signal computes imbalance velocity (50%), depth delta (30%), and large order detection (20%) into a composite momentum from -1 to +1. aggTrade still runs for trend/price tracking but does NOT drive entries or exits.
+
 ## Context
 
 Current working directory: /Users/gpsmatty/production/PolyEdge
@@ -19,8 +21,17 @@ Current config:
 Recent trade performance:
 !`.venv/bin/python scripts/trade_analysis.py --hours 4 --json 2>/dev/null || .venv/bin/python scripts/trade_analysis.py --hours 4 2>/dev/null | tail -80`
 
-MFE/MAE by regime and entry quality (labeled snapshots, last 4h):
-!`DB_URL=$(security find-generic-password -s polyedge -a database_url -w 2>/dev/null); [ -n "$DB_URL" ] && psql "$DB_URL" -c "SELECT (features->>'regime')::text as regime, COUNT(*) as n, ROUND(AVG((features->>'mfe_30s')::float)::numeric, 4) as avg_mfe, ROUND(AVG((features->>'mae_30s')::float)::numeric, 4) as avg_mae FROM polyedge.signal_snapshots WHERE ts > NOW() - INTERVAL '4 hours' AND features->>'mfe_30s' IS NOT NULL GROUP BY regime ORDER BY n DESC;" 2>/dev/null || echo "MFE/MAE query unavailable"`
+Full trade list with signal data (last 30 trades):
+!`DB_URL=$(security find-generic-password -s polyedge -a database_url -w 2>/dev/null); [ -n "$DB_URL" ] && psql "$DB_URL" -c "SELECT side, entry_price, exit_price, pnl, exit_reason, EXTRACT(EPOCH FROM (closed_at - opened_at))::int as hold_secs, (signal_data->>'momentum')::float as entry_momentum, opened_at FROM polyedge.trades ORDER BY opened_at DESC LIMIT 30;" 2>/dev/null || echo "Trade query unavailable"`
+
+Winners vs Losers momentum comparison:
+!`DB_URL=$(security find-generic-password -s polyedge -a database_url -w 2>/dev/null); [ -n "$DB_URL" ] && psql "$DB_URL" -c "SELECT CASE WHEN pnl > 0.01 THEN 'WINNER' WHEN pnl < -0.01 THEN 'LOSER' ELSE 'FLAT' END as result, COUNT(*) as n, ROUND(AVG(ABS((signal_data->>'momentum')::float))::numeric, 3) as avg_entry_mom, ROUND(AVG(pnl)::numeric, 3) as avg_pnl, ROUND(AVG(EXTRACT(EPOCH FROM (closed_at - opened_at)))::numeric, 1) as avg_hold_s FROM polyedge.trades WHERE config_snapshot::text LIKE '%0.42%' GROUP BY 1 ORDER BY 1;" 2>/dev/null || echo "Winner/Loser query unavailable"`
+
+Exit reason breakdown:
+!`DB_URL=$(security find-generic-password -s polyedge -a database_url -w 2>/dev/null); [ -n "$DB_URL" ] && psql "$DB_URL" -c "SELECT exit_reason, COUNT(*) as n, ROUND(AVG(pnl)::numeric, 3) as avg_pnl, SUM(CASE WHEN pnl > 0.01 THEN 1 ELSE 0 END) as wins, SUM(CASE WHEN pnl < -0.01 THEN 1 ELSE 0 END) as losses FROM polyedge.trades WHERE config_snapshot::text LIKE '%0.42%' GROUP BY exit_reason ORDER BY n DESC;" 2>/dev/null || echo "Exit reason query unavailable"`
+
+MFE/MAE by regime (labeled snapshots):
+!`DB_URL=$(security find-generic-password -s polyedge -a database_url -w 2>/dev/null); [ -n "$DB_URL" ] && psql "$DB_URL" -c "SELECT (features->>'regime')::text as regime, COUNT(*) as n, ROUND(AVG((features->>'mfe_30s')::float)::numeric, 4) as avg_mfe, ROUND(AVG((features->>'mae_30s')::float)::numeric, 4) as avg_mae FROM polyedge.signal_snapshots WHERE ts > NOW() - INTERVAL '8 hours' AND features->>'mfe_30s' IS NOT NULL GROUP BY regime ORDER BY n DESC;" 2>/dev/null || echo "MFE/MAE query unavailable"`
 
 Recent tuning history (last 10 changes):
 !`DB_URL=$(security find-generic-password -s polyedge -a database_url -w 2>/dev/null); [ -n "$DB_URL" ] && psql "$DB_URL" -c "SELECT ts::date, key, old_value, new_value, reason, win_rate_at_change, avg_pnl_at_change FROM polyedge.tuning_log ORDER BY ts DESC LIMIT 10;" 2>/dev/null || echo "tuning_log not accessible"`
@@ -50,36 +61,36 @@ If fewer than 5 completed trades in the window, note "insufficient data for conf
 For each dimension, state the data finding and what it implies:
 
 **Win rate & P&L baseline**
-- Overall win rate and avg P&L vs historical context
-- Is this better/worse than the 40-50% target?
+- Overall win rate and avg P&L
+- Is this better/worse than the 50% target?
+- Trend over time: is performance degrading (first half vs second half of window)?
 
-**Entry quality**
-- High-momentum entries (>0.65): win rate and avg P&L. High momentum should be better — if not, signal quality is degraded.
-- Counter-trend vs with-trend: which side is carrying performance? (Counter-trend outperforming is normal but requires monitoring)
-- Entry timing: trades with >400s remaining vs <400s. Late entries should underperform significantly.
+**Entry quality (depth signal)**
+- Entry momentum distribution: what momentum levels are winners vs losers entering at?
+- If winners avg significantly higher momentum than losers, entry_threshold should be raised
+- Entry price analysis: which price ranges (0.35-0.45, 0.45-0.55, 0.55-0.62) are performing best?
+- YES vs NO side performance: is one side carrying or dragging?
 
 **Exit quality**
-- Trailing stop exits: win rate (should be high — these caught winners). If trailing stop is triggering on losers, min_profit_pct may be too low.
-- Momentum reversal exits: avg P&L. Large negative avg = exiting too late on losers.
-- Force exits (<8s): if frequent, min_seconds_remaining may need raising.
-- Take-profit exits: if these are a large fraction, great. If absent, take_profit_price may be too high.
+- Hold time analysis: avg hold time for winners vs losers. If both are <15s, the depth signal is too noisy.
+- Exit reason distribution: reversal (most common), trailing_stop (should catch winners), take_profit (best outcome), max_loss (loss limiter), force_exit (time expiry)
+- If trailing_stop never fires but trades hit >10% gains, trailing_stop_min_profit_pct may be wrong
+- If max_loss fires frequently, entries are bad or max_loss_pct is too tight
+- Large negative avg P&L on reversal exits = either exiting too late (lower exit_threshold) or entering bad positions (raise entry_threshold)
 
-**Blockers & regime**
-- Which blocker fires most: low_vol_block, high_intensity_block, chop_filter, trend_bias, acceleration?
-- High blocker rate (>60% of evaluations blocked) with poor win rate = filters working correctly.
-- Low blocker rate with poor win rate = filters not catching bad signals.
-- What regime do winners come from vs losers?
+**Depth signal behavior**
+- Is the depth signal oscillating too fast? (all hold times <15s = depth noise dominating)
+- Check DO logs for depth momentum values — are they consistently hitting +/-0.50+ or staying in +/-0.20 range?
+- depth_velocity_window_s may need adjustment if signal is too spiky or too smooth
 
-**Adaptive bias**
-- FAVORABLE vs UNFAVORABLE vs NEUTRAL: if UNFAVORABLE trades are net negative, consider raising adaptive_bias_min_move.
-- NEUTRAL performing well = bias is irrelevant noise.
+**Blockers & filters**
+- Which blockers are firing in DO logs: price_band, trend_veto, TREND BLOCK, failed_persistence, chop?
+- Are blockers correctly preventing bad entries, or blocking good opportunities?
+- Note: low_vol_block, high_intensity_block, acceleration are DISABLED (legacy aggTrade filters)
 
-**Trade intensity buckets**
-- Find the "dead zone" TPS range where win rate collapses. Set high_intensity_max_tps to block below that.
-
-**Flip performance** (if enable_flips=true)
-- Flip win rate vs normal win rate. If flips are significantly worse, consider disabling again.
-- Any exits within flip_min_hold_seconds (sign flip_hold protection isn't working)?
+**Time analysis**
+- Performance by seconds_remaining: are early-window or late-window entries better?
+- Window hop performance: do trades immediately after a window hop perform differently?
 
 **DO logs**
 - Look for: repeated FOK rejections (exit_slippage too low), WebSocket disconnects (gap detection), config reload messages, ERROR patterns, stuck exit loops (same market selling 5+ times).
@@ -91,31 +102,31 @@ Before making config recommendations, check whether the data patterns are explai
 **Red flags that indicate a bug, not a config issue:**
 - A filter is enabled in config but the DO logs show it never firing (or always firing regardless of data)
 - Exit reason distribution is impossible (e.g., 0% trailing stop exits when trailing_stop_enabled=true and trades are hitting >10% gains)
-- Flip protection not working: exits appearing in logs within `flip_min_hold_seconds` of a flip entry
-- OFI values flat or constant (feed might be stale, gap detection might not be resetting properly)
+- Depth values flat or constant (feed might be stale, gap detection might not be resetting properly)
 - Entry persistence firing but trades still entering on sub-second signals
 - Config reloads in DO logs showing wrong values vs what `polyedge config show` reports
 - Win rate perfectly 0% or 100% (almost always a logic error, not market conditions)
+- counter_trend_exit_threshold boosting exit threshold so high that positions can't exit during reversals (caused a -$2.29 loss historically at 0.95 — now set to 0.50)
 
 **If a bug is suspected:**
-- Do NOT apply config changes that would mask the bug (e.g., raising a threshold to avoid the bad behavior)
-- Read the relevant source file(s) to diagnose: `src/polyedge/strategies/micro_sniper.py` (strategy logic), `src/polyedge/strategies/micro_runner.py` (runner/state management)
+- Do NOT apply config changes that would mask the bug
+- Read the relevant source file(s) to diagnose: `src/polyedge/strategies/micro_sniper.py` (strategy logic), `src/polyedge/strategies/micro_runner.py` (runner/state management), `src/polyedge/data/binance_depth.py` (depth feed)
 - Flag it clearly in the report: **BUG SUSPECTED: [description] — [evidence from data/logs] — [files to check]**
-- Suggest the specific code section to review, but do not apply code changes in tune — that requires the user's attention
 
 ### 5. Identify config changes (use playbook)
 
 Categorize each potential change. Use `.claude/commands/tune-refs/config-playbook.md` to map observations to keys and safe nudge ranges. Do not recommend changes not grounded in the playbook or clear data evidence.
 
-**AUTO-APPLY** (small parameter nudges, clearly data-backed, ±10-20% of current value, reversible):
+**AUTO-APPLY** (small parameter nudges, clearly data-backed, +/-10-20% of current value, reversible):
 - Threshold adjustments based on clear bucket performance data
 - Timeout/cooldown tweaks based on log patterns
-- Blocker parameter tightening based on dead zones
+- Depth signal parameter adjustments based on signal behavior analysis
 
 **FLAG FOR APPROVAL** (structural or larger changes):
 - Enabling/disabling entire features (flips, poly book, etc.)
 - Changes >30% from current value
 - Anything that could fundamentally change trading behavior
+- Depth weight rebalancing (imbalance_velocity / depth_delta / large_order)
 
 ### 6. Apply and log changes
 
@@ -158,6 +169,6 @@ Win rate: X% | Avg P&L: $X.XX | Net: $X.XX
 - [dimension]: looks healthy
 ```
 
-Keep findings specific and quantitative. Avoid vague statements like "performance seems weak." Say "win rate 31% on with-trend entries vs 75% counter-trend — 30s OFI trend filter is inverting expected direction edge."
+Keep findings specific and quantitative. Avoid vague statements like "performance seems weak." Say "winners avg 0.52 entry momentum vs losers 0.44 — entry_threshold at 0.40 is letting in low-conviction trades."
 
 After the report, if there are flagged changes, ask: "Apply any of the flagged changes? (list numbers or 'all')"
