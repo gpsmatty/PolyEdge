@@ -413,8 +413,8 @@ class MarketMakerConfig(BaseModel):
     inventory_skew_factor: float = 0.02  # Price offset per 10% imbalance
 
     # --- Quote management ---
-    requote_threshold: float = 0.02  # Requote when fair value moves this much
-    requote_interval_seconds: float = 5.0  # Min seconds between requotes
+    requote_threshold: float = 0.01  # Requote when fair value moves 1 cent
+    requote_interval_seconds: float = 2.0  # Min seconds between requotes — fast tracking
     cancel_before_requote: bool = True
     use_gtd: bool = True  # Auto-expire orders at window end
     gtd_buffer_seconds: float = 10.0  # Expire orders N seconds before window end
@@ -432,6 +432,7 @@ class MarketMakerConfig(BaseModel):
 
     # --- Profit targeting ---
     min_profit_pct: float = 0.20  # Don't sell until 20% above avg cost (buy $0.31 → sell $0.37+)
+    profit_decay_start_seconds: float = 300.0  # Start decaying profit floor at 5 min remaining
     force_sell_seconds: float = 60.0  # Override min_profit in last N seconds — dump at any price
 
     # --- Risk ---

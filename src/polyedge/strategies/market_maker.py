@@ -232,6 +232,33 @@ class MarketMakerStrategy:
 
         return None
 
+    def _decayed_profit_pct(self, seconds_remaining: float) -> float:
+        """Decay the profit floor as the window runs out.
+
+        Full profit target (20%) when plenty of time left.
+        Linearly decays to 0% (breakeven) as we approach force_sell_seconds.
+
+        Timeline (15m window, defaults):
+          >300s remaining: full 20% profit target
+          300s → 60s:     linear decay from 20% → 0%
+          <60s:           force dump (handled by near_window_end flag)
+        """
+        decay_start = self.config.profit_decay_start_seconds
+        force_sell = self.config.force_sell_seconds
+        full_profit = self.config.min_profit_pct
+
+        if seconds_remaining >= decay_start:
+            return full_profit
+
+        # Linear decay from full profit to 0 (breakeven)
+        decay_window = decay_start - force_sell
+        if decay_window <= 0:
+            return full_profit
+
+        progress = (seconds_remaining - force_sell) / decay_window
+        progress = max(0.0, min(1.0, progress))
+        return full_profit * progress
+
     def compute_quotes(
         self,
         condition_id: str,
@@ -330,10 +357,11 @@ class MarketMakerStrategy:
         # YES ask — sell YES when we hold it and price is up
         if has_yes_inventory:
             yes_ask_price = fair_value + half_spread
-            # Profit floor
+            # Profit floor — decays as window runs out
             yes_avg_cost = inv.avg_cost("YES")
             if yes_avg_cost > 0 and not near_window_end:
-                yes_ask_price = max(yes_ask_price, yes_avg_cost * (1.0 + self.config.min_profit_pct))
+                effective_profit_pct = self._decayed_profit_pct(seconds_remaining)
+                yes_ask_price = max(yes_ask_price, yes_avg_cost * (1.0 + effective_profit_pct))
             # Floor above best bid (post_only protection)
             if yes_best_bid > 0:
                 yes_ask_price = max(yes_ask_price, yes_best_bid + tick)
@@ -375,10 +403,11 @@ class MarketMakerStrategy:
         # NO ask — sell NO when we hold it and price is up
         if has_no_inventory:
             no_ask_price = no_fair_value + half_spread
-            # Profit floor
+            # Profit floor — decays as window runs out
             no_avg_cost = inv.avg_cost("NO")
             if no_avg_cost > 0 and not near_window_end:
-                no_ask_price = max(no_ask_price, no_avg_cost * (1.0 + self.config.min_profit_pct))
+                effective_profit_pct = self._decayed_profit_pct(seconds_remaining)
+                no_ask_price = max(no_ask_price, no_avg_cost * (1.0 + effective_profit_pct))
             # Floor above best bid (post_only protection)
             if no_best_bid > 0:
                 no_ask_price = max(no_ask_price, no_best_bid + tick)
