@@ -394,8 +394,8 @@ class MarketMakerConfig(BaseModel):
     # --- Market selection ---
     symbols: list[str] = ["btcusdt"]
     min_liquidity: float = 500.0
-    min_entry_price: float = 0.30
-    max_entry_price: float = 0.70
+    min_entry_price: float = 0.10  # MM needs to quote across full range
+    max_entry_price: float = 0.90  # Only pull at extreme edges
     min_seconds_remaining: float = 120.0
 
     # --- Spread & pricing ---
@@ -425,8 +425,8 @@ class MarketMakerConfig(BaseModel):
 
     # --- Depth defense (Binance order book) ---
     depth_enabled: bool = True
-    depth_pull_threshold: float = 0.40  # Pull quotes when depth momentum > this
-    depth_widen_threshold: float = 0.25  # Widen spread when depth momentum > this
+    depth_pull_threshold: float = 0.80  # Pull quotes when depth momentum > this (BTC is noisy, 0.40 fired constantly)
+    depth_widen_threshold: float = 0.40  # Widen spread when depth momentum > this
     depth_widen_factor: float = 1.5  # Spread multiplier during depth widen
     depth_recovery_seconds: float = 3.0  # Wait after pull before re-quoting
 
