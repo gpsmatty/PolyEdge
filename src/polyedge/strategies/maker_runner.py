@@ -172,6 +172,8 @@ class MakerRunner:
         if not self.dry:
             tasks.append(asyncio.create_task(self._fill_monitor_loop()))
 
+        tasks.append(asyncio.create_task(self._config_refresh_loop()))
+
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -609,10 +611,13 @@ class MakerRunner:
                 ids = [r.get("orderID", r.get("id", "")) for r in result if isinstance(r, dict)]
                 self.live_order_ids[condition_id] = [i for i in ids if i]
 
-            if self.verbose:
-                logger.info(
-                    f"Posted {len(orders)} quotes | FV={qs.fair_value:.2f} "
-                    f"spread={qs.spread:.3f}"
+            if not self.quiet:
+                parts = []
+                for q in qs.all_quotes():
+                    parts.append(f"{'BID' if q.side == 'BUY' else 'ASK'} ${q.price:.2f}×{q.size:.0f}")
+                console.print(
+                    f"  [cyan]📋 POST[/cyan] {' | '.join(parts)} | "
+                    f"FV={qs.fair_value:.2f} spread={qs.spread:.3f}"
                 )
 
         except Exception as e:
@@ -727,8 +732,12 @@ class MakerRunner:
             self.strategy.record_fill(condition_id, side, token, size, price)
             self._total_fills += 1
 
+            inv = self.strategy.get_inventory(condition_id)
+            m = self.active_markets.get(condition_id)
+            q_short = m.question[:40] if m else condition_id[:8]
             console.print(
-                f"  [green]FILL[/green] {side} {size:.1f} {token} @ ${price:.2f}"
+                f"  [green bold]💰 FILL[/green bold] {side} {size:.1f} {token} @ ${price:.2f} | "
+                f"{q_short} | Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
             )
 
         except Exception as e:
