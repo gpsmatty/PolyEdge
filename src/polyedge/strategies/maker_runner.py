@@ -444,8 +444,33 @@ class MakerRunner:
 
         self.poly_feed = MarketFeed(self.settings)
 
-        # Register price update callback
-        async def _on_price_event(event: dict):
+        # Register price update callbacks
+        async def _on_best_bid_ask(event: dict):
+            """best_bid_ask events have 'best_bid' and 'best_ask' fields."""
+            token_id = event.get("asset_id", "")
+            if not token_id:
+                return
+            entry = self._token_to_market.get(token_id)
+            if not entry:
+                return
+            m, side = entry
+            cid = m.condition_id
+            # Use midpoint of bid/ask as price
+            try:
+                bid = float(event.get("best_bid", 0))
+                ask = float(event.get("best_ask", 0))
+            except (ValueError, TypeError):
+                return
+            if bid <= 0 and ask <= 0:
+                return
+            price = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+            if side == "yes":
+                self.yes_prices[cid] = price
+            else:
+                self.no_prices[cid] = price
+
+        async def _on_last_trade(event: dict):
+            """last_trade_price events have 'price' or 'last_trade_price' field."""
             token_id = event.get("asset_id", "")
             price_str = event.get("price") or event.get("last_trade_price") or "0"
             try:
@@ -454,19 +479,18 @@ class MakerRunner:
                 return
             if not token_id or not price:
                 return
-
-            # Fast lookup via token map
             entry = self._token_to_market.get(token_id)
-            if entry:
-                m, side = entry
-                cid = m.condition_id
-                if side == "yes":
-                    self.yes_prices[cid] = price
-                else:
-                    self.no_prices[cid] = price
+            if not entry:
+                return
+            m, side = entry
+            cid = m.condition_id
+            if side == "yes":
+                self.yes_prices[cid] = price
+            else:
+                self.no_prices[cid] = price
 
-        self.poly_feed.on(EVENT_BEST_BID_ASK, _on_price_event)
-        self.poly_feed.on(EVENT_LAST_TRADE, _on_price_event)
+        self.poly_feed.on(EVENT_BEST_BID_ASK, _on_best_bid_ask)
+        self.poly_feed.on(EVENT_LAST_TRADE, _on_last_trade)
         self._subscribed_tokens = set(token_ids)
 
         if not self.quiet:
