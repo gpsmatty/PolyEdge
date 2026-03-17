@@ -761,9 +761,10 @@ class MakerRunner:
                     await self._cancel_market_quotes(condition_id, no_token_id)
             if qs.reason_skipped not in ("no_requote_needed",):
                 self._total_pulls += 1
-                if self.verbose:
+                # Always log skip reasons (not just verbose) so we can diagnose
+                if not self.quiet:
                     console.print(
-                        f"  [yellow]PULL[/yellow] {qs.reason_skipped} | "
+                        f"  [yellow]SKIP[/yellow] {qs.reason_skipped} | "
                         f"depth={depth_momentum:+.2f}"
                     )
             return

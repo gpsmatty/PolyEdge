@@ -427,7 +427,7 @@ class MarketMakerConfig(BaseModel):
     heartbeat_interval_seconds: float = 5.0  # Must be <10s
 
     # --- Poly book defense ---
-    min_profitable_spread_bps: float = 200.0  # Don't quote if market spread < 2c
+    min_profitable_spread_bps: float = 100.0  # Don't quote if market spread < 1c
     adverse_selection_threshold: float = 0.70  # Pull if |imbalance_5c| > this
     imbalance_velocity_pull_threshold: float = 0.15  # Pull when imbalance changes this fast/sec
     whale_widen_factor: float = 1.5  # Widen spread when whale near our price
