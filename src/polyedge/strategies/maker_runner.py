@@ -1,22 +1,27 @@
-"""Market Maker Runner — persistent async loop for market making on
-Polymarket crypto up/down markets.
+"""Market Maker Runner — persistent async loop for spread capture on Polymarket.
+
+Two modes:
+  Crypto mode (--market "btc 15m"): Window hopping on crypto up/down markets.
+  Static mode (--condition-id <cid>): Any Polymarket market, no expiry.
 
 Connects to:
-  - Binance @depth20@100ms WebSocket for adverse selection defense
-  - Polymarket WebSocket for real-time YES/NO prices
+  - Polymarket WebSocket for real-time YES/NO book data
   - CLOB API for posting/canceling post-only limit orders
+  - CLOB trade history for fill detection with actual prices
+  - [Optional] Binance depth for crypto defense signal
 
 Main loop:
-1. Heartbeat task — sends heartbeat every 5s (dead-man switch)
-2. Quote task — computes and posts bid/ask quotes every few seconds
-3. Fill monitor — polls for fills, updates inventory
-4. Depth callback — pulls or widens quotes on momentum spikes
-5. Window management — hops to next window, pauses, resets state
+1. Warmup — wait for Poly book data before quoting
+2. Quote loop — event-driven requoting with floor interval
+3. Fill monitor — polls CLOB trade history for actual fill prices
+4. Heartbeat — dead-man switch (10s timeout)
+5. Window management — hops, force-sell, market refresh (crypto only)
+6. Status — periodic stats
 
 Usage:
-    polyedge maker              # Copilot mode (confirm trades)
-    polyedge maker --auto       # Autopilot mode (auto-execute)
-    polyedge maker --dry        # Dry run — watch and analyze only
+    polyedge maker --dry --market "btc 15m"     # Crypto mode, dry run
+    polyedge maker --dry --condition-id abc123   # Static mode, any market
+    polyedge maker --auto --market "btc"         # Auto-trade all BTC windows
 """
 
 from __future__ import annotations
@@ -31,17 +36,13 @@ from polyedge.core.config import Settings, MarketMakerConfig
 from polyedge.core.client import PolyClient
 from polyedge.core.db import Database
 from polyedge.core.models import Market
-from polyedge.data.binance_depth import BinanceDepthFeed, DepthStructure
-from polyedge.data.ws_feed import MarketFeed, EVENT_BEST_BID_ASK, EVENT_LAST_TRADE
-from polyedge.data.indexer import MarketIndexer
+from polyedge.data.book_analyzer import analyze_book, BookIntelligence
+from polyedge.data.ws_feed import (
+    MarketFeed, EVENT_BEST_BID_ASK, EVENT_LAST_TRADE, EVENT_BOOK,
+)
 from polyedge.strategies.market_maker import (
     MarketMakerStrategy,
     QuoteSet,
-)
-from polyedge.strategies.crypto_sniper import (
-    UP_DOWN_PATTERN,
-    CRYPTO_SYMBOL_MAP,
-    EXCLUDED_PATTERNS,
 )
 from polyedge.core.console import console
 
@@ -54,7 +55,7 @@ STATUS_INTERVAL = 15  # seconds
 class MakerRunner:
     """Persistent async loop for market making on Polymarket.
 
-    Posts post-only limit orders on both sides of crypto up/down markets.
+    Posts post-only limit orders on both sides of any market.
     All orders are maker-only (zero fees + rebates).
     """
 
@@ -66,6 +67,7 @@ class MakerRunner:
         auto: bool = False,
         dry: bool = False,
         market_filter: str | None = None,
+        condition_ids: list[str] | None = None,
         verbose: bool = False,
         quiet: bool = False,
     ):
@@ -74,12 +76,67 @@ class MakerRunner:
         self.db = db
         self.auto = auto
         self.dry = dry
-        self.market_filter = market_filter.lower() if market_filter else None
         self.verbose = verbose
         self.quiet = quiet
 
-        # Parse filter: "btc 15m" → text pattern "btc"/"bitcoin" + duration 15 min
+        # Mode detection
+        self.mode: str = "static" if condition_ids else "crypto"
+        self._condition_ids = condition_ids or []
+
+        # Crypto mode: parse --market filter
+        self.market_filter = market_filter.lower() if market_filter else None
+        self._duration_filter_minutes: int | None = None
+        self._filter_patterns = []
+        if self.market_filter:
+            self._parse_market_filter()
+
+        self.config: MarketMakerConfig = settings.strategies.market_maker
+        self.strategy = MarketMakerStrategy(self.config)
+
+        # Market state
+        # Crypto mode: symbol -> [Market, ...] sorted by end_date (window hopping)
+        self.windows: dict[str, list[Market]] = {}
+        # Both modes: condition_id -> Market
+        self.active_markets: dict[str, Market] = {}
+        # token_id -> (Market, "yes"|"no")
+        self._token_to_market: dict[str, tuple[Market, str]] = {}
+
+        # Polymarket WebSocket
+        self.poly_feed: Optional[MarketFeed] = None
+        self._subscribed_tokens: set[str] = set()
+
+        # Optional Binance depth (crypto mode only)
+        self.depth_feed = None
+
+        # Order tracking
+        self.live_order_ids: dict[str, list[str]] = {}  # condition_id -> [order_ids]
+        self.heartbeat_id: str | None = None
+
+        # Fill tracking — cursor for CLOB trade history polling
+        self._fill_cursor_ts: int = int(time.time())
+
+        # Locks
+        self._quote_lock = asyncio.Lock()
+        self._requote_event = asyncio.Event()
+
+        # Warmup gate
+        self._warmup_complete = False
+        self._warmup_start: float = 0.0
+
+        # State
+        self._running = False
+        self._last_market_refresh = 0.0
+        self._last_status = 0.0
+        self._last_hop_time = 0.0
+        self._total_fills = 0
+        self._total_spread_captured = 0.0
+        self._total_quotes_posted = 0
+        self._total_pulls = 0
+
+    def _parse_market_filter(self):
+        """Parse --market "btc 15m" into text patterns + duration filter."""
         import re
+
         _filter_words = self.market_filter.split() if self.market_filter else []
         _ALIASES = {
             "btc": "bitcoin", "bitcoin": "btc",
@@ -89,8 +146,6 @@ class MakerRunner:
             "doge": "dogecoin", "dogecoin": "doge",
         }
         _DURATION_RE = re.compile(r'^(\d+)(m|h)$')
-        self._duration_filter_minutes: int | None = None
-        self._filter_patterns = []
         for w in _filter_words:
             dur_match = _DURATION_RE.match(w)
             if dur_match:
@@ -104,65 +159,39 @@ class MakerRunner:
                 pat = r'(?:^|[\s\-–,])' + re.escape(w) + r'(?:[\s\-–,]|$)'
             self._filter_patterns.append(re.compile(pat, re.IGNORECASE))
 
-        self.config: MarketMakerConfig = settings.strategies.market_maker
-        self.strategy = MarketMakerStrategy(self.config)
-
-        # Window management: symbol -> list of Markets sorted by end_date
-        # First element = current active window, rest = upcoming for hopping
-        self.windows: dict[str, list[Market]] = {}  # e.g. "btcusdt" -> [Market, Market, ...]
-        self.active_markets: dict[str, Market] = {}  # condition_id -> Market (flat view)
-        self.yes_prices: dict[str, float] = {}  # condition_id -> YES midpoint price
-        self.no_prices: dict[str, float] = {}  # condition_id -> NO price
-        self.yes_best_bids: dict[str, float] = {}  # condition_id -> actual YES best bid
-        self.no_best_bids: dict[str, float] = {}  # condition_id -> actual NO best bid
-        self._token_to_market: dict[str, tuple[Market, str]] = {}  # token_id -> (Market, "yes"|"no")
-
-        # Depth feed + BTC price tracking
-        self.depth_feed: Optional[BinanceDepthFeed] = None
-        self._btc_open_prices: dict[str, float] = {}  # condition_id -> BTC price at window start
-
-        # Polymarket WebSocket
-        self.poly_feed: Optional[MarketFeed] = None
-        self._subscribed_tokens: set[str] = set()
-
-        # Order tracking
-        self.live_order_ids: dict[str, list[str]] = {}  # condition_id -> [order_ids]
-        self.heartbeat_id: str | None = None
-
-        # Locks
-        self._quote_lock = asyncio.Lock()  # Prevent double cancel+post races
-
-        # State
-        self._running = False
-        self._last_market_refresh = 0.0
-        self._last_status = 0.0
-        self._last_hop_time = 0.0
-        self._total_fills = 0
-        self._total_spread_captured = 0.0
-        self._total_quotes_posted = 0
-        self._total_pulls = 0
+    # ===================================================================
+    # Main entry point
+    # ===================================================================
 
     async def run(self):
         """Main entry point — runs until cancelled."""
         self._running = True
-        logger.info("Market Maker starting...")
+        logger.info(f"Market Maker starting in {self.mode.upper()} mode...")
 
-        # Load markets (also starts Polymarket WS via _start_poly_feed)
-        await self._refresh_markets()
-        if not self.windows:
-            logger.error("No active crypto up/down markets found. Exiting.")
-            return
+        # Load markets
+        if self.mode == "crypto":
+            await self._refresh_markets()
+            if not self.windows:
+                logger.error("No active crypto up/down markets found. Exiting.")
+                return
+        else:
+            await self._load_static_markets()
+            if not self.active_markets:
+                logger.error("No markets loaded. Check --condition-id values.")
+                return
 
-        # Reconcile inventory — check actual CLOB token balances so we know
-        # what we're holding even after a restart/redeploy
+        # Start Polymarket WebSocket
+        all_token_ids = self._collect_token_ids()
+        await self._start_poly_feed(all_token_ids)
+
+        # Reconcile inventory from actual CLOB balances
         if not self.dry:
             await self._reconcile_inventory()
 
-        # Connect Binance depth feed for adverse selection defense
-        symbols = self._get_symbols()
-        logger.info(f"Tracking symbols: {symbols}")
-
-        if self.config.depth_enabled:
+        # Optional Binance depth for crypto mode
+        if self.mode == "crypto" and self.config.depth_defense_enabled:
+            from polyedge.data.binance_depth import BinanceDepthFeed
+            symbols = list(self.windows.keys()) or ["btcusdt"]
             self.depth_feed = BinanceDepthFeed(symbols=symbols)
 
         # Launch concurrent tasks
@@ -172,14 +201,17 @@ class MakerRunner:
         tasks.append(asyncio.create_task(self._poly_feed_loop()))
         tasks.append(asyncio.create_task(self._quote_loop()))
         tasks.append(asyncio.create_task(self._status_loop()))
+        tasks.append(asyncio.create_task(self._config_refresh_loop()))
 
         if self.config.heartbeat_enabled and not self.dry:
             tasks.append(asyncio.create_task(self._heartbeat_loop()))
 
         if not self.dry:
             tasks.append(asyncio.create_task(self._fill_monitor_loop()))
+            tasks.append(asyncio.create_task(self._balance_reconcile_loop()))
 
-        tasks.append(asyncio.create_task(self._config_refresh_loop()))
+        if self.mode == "crypto":
+            tasks.append(asyncio.create_task(self._force_sell_loop()))
 
         try:
             await asyncio.gather(*tasks)
@@ -188,54 +220,43 @@ class MakerRunner:
         finally:
             await self._shutdown()
 
-    async def _reconcile_inventory(self):
-        """Check actual CLOB token balances on startup and seed inventory.
+    # ===================================================================
+    # Market Loading
+    # ===================================================================
 
-        Prevents orphaned positions after restart/redeploy — if we hold
-        tokens, we need to know about them to post sell orders.
-        """
-        for cid, m in self.active_markets.items():
-            if not m.clob_token_ids or len(m.clob_token_ids) < 2:
-                continue
+    async def _load_static_markets(self):
+        """Load markets by condition_id (static mode)."""
+        import aiohttp
+        from polyedge.data.markets import _parse_market
+
+        gamma_url = self.settings.polymarket.gamma_url
+        self.active_markets.clear()
+        self._token_to_market.clear()
+
+        for cid in self._condition_ids:
             try:
-                yes_bal = self.client.get_token_balance(m.clob_token_ids[0])
-                no_bal = self.client.get_token_balance(m.clob_token_ids[1])
+                async with aiohttp.ClientSession() as session:
+                    url = f"{gamma_url}/markets/{cid}"
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            logger.warning(f"Market {cid[:12]} not found (HTTP {resp.status})")
+                            continue
+                        data = await resp.json()
 
-                actual_yes = float(yes_bal.get("balance", 0)) if isinstance(yes_bal, dict) else 0.0
-                actual_no = float(no_bal.get("balance", 0)) if isinstance(no_bal, dict) else 0.0
+                m = _parse_market(data)
+                self.active_markets[m.condition_id] = m
+                if m.clob_token_ids and len(m.clob_token_ids) >= 2:
+                    self._token_to_market[m.clob_token_ids[0]] = (m, "yes")
+                    self._token_to_market[m.clob_token_ids[1]] = (m, "no")
 
-                if actual_yes > 0.5 or actual_no > 0.5:
-                    inv = self.strategy.get_inventory(cid)
-                    if actual_yes > 0.5:
-                        inv.yes_tokens = actual_yes
-                        # Estimate cost basis from current market price
-                        est_price = 0.50  # Conservative estimate
-                        inv.yes_cost_basis = actual_yes * est_price
-                    if actual_no > 0.5:
-                        inv.no_tokens = actual_no
-                        est_price = 0.50
-                        inv.no_cost_basis = actual_no * est_price
+                if not self.quiet:
+                    console.print(f"[cyan]Loaded: {m.question[:70]}[/cyan]")
 
-                    q = m.question[:50]
-                    console.print(
-                        f"  [yellow]♻ RECONCILE[/yellow] {q} | "
-                        f"YES={actual_yes:.1f} NO={actual_no:.1f}"
-                    )
-                    logger.info(f"Reconciled inventory: {q} YES={actual_yes:.1f} NO={actual_no:.1f}")
             except Exception as e:
-                logger.warning(f"Reconcile failed for {cid[:8]}: {e}")
+                logger.warning(f"Failed to load market {cid[:12]}: {e}")
 
-    async def _shutdown(self):
-        """Clean shutdown — cancel all orders."""
-        self._running = False
-        if not self.dry:
-            try:
-                logger.info("Cancelling all open orders...")
-                self.client.cancel_all_orders()
-            except Exception as e:
-                logger.error(f"Failed to cancel orders on shutdown: {e}")
-
-    # --- Market Management ---
+        if not self.quiet:
+            console.print(f"[dim]Loaded {len(self.active_markets)} static market(s)[/dim]")
 
     def _matches_filter(self, market: Market) -> bool:
         """Check if a market matches the --market filter (text + duration)."""
@@ -246,7 +267,6 @@ class MakerRunner:
         if not all(p.search(haystack) for p in self._filter_patterns):
             return False
 
-        # Duration filter — parse time range from question like "3:20PM-3:25PM"
         if self._duration_filter_minutes is not None:
             import re
             time_range = re.search(
@@ -268,13 +288,10 @@ class MakerRunner:
         return True
 
     async def _quick_sync(self) -> list[Market]:
-        """Fetch live crypto markets directly from Gamma API (sorted by endDate ASC).
-
-        Same as micro_runner's _quick_sync — bypasses the DB indexer which
-        misses low-volume short-duration crypto windows.
-        """
+        """Fetch live crypto markets from Gamma API (sorted by endDate ASC)."""
         import aiohttp
         from polyedge.data.markets import _parse_market
+        from polyedge.strategies.crypto_sniper import UP_DOWN_PATTERN
 
         gamma_url = self.settings.polymarket.gamma_url
         found: list[Market] = []
@@ -314,29 +331,28 @@ class MakerRunner:
                 except (KeyError, ValueError):
                     continue
 
-            # Stop early if we have enough crypto matches
             crypto_count = sum(1 for m in found if UP_DOWN_PATTERN.search(m.question))
             if crypto_count >= 30:
                 break
 
         if not self.quiet:
-            console.print(f"[dim]Fetched {len(found)} markets ({sum(1 for m in found if UP_DOWN_PATTERN.search(m.question))} crypto up/down)[/dim]")
+            from polyedge.strategies.crypto_sniper import UP_DOWN_PATTERN
+            console.print(
+                f"[dim]Fetched {len(found)} markets "
+                f"({sum(1 for m in found if UP_DOWN_PATTERN.search(m.question))} crypto up/down)[/dim]"
+            )
         return found
 
     async def _refresh_markets(self, prefetched: list[Market] | None = None):
-        """Refresh active crypto up/down markets from API.
+        """Refresh active crypto up/down markets (crypto mode)."""
+        from polyedge.strategies.crypto_sniper import (
+            UP_DOWN_PATTERN, CRYPTO_SYMBOL_MAP, EXCLUDED_PATTERNS,
+        )
 
-        Mirrors micro_runner's window management:
-        - Groups markets by Binance symbol
-        - Sorts by end_date ascending (current window first)
-        - Takes first 10 windows per symbol for seamless hopping
-        - Subscribes to Polymarket WebSocket for price updates
-        """
         try:
             all_markets = prefetched or await self._quick_sync()
-
             now = datetime.now(timezone.utc)
-            candidates: dict[str, list[Market]] = {}  # symbol -> [Market, ...]
+            candidates: dict[str, list[Market]] = {}
 
             for m in all_markets:
                 if not UP_DOWN_PATTERN.search(m.question):
@@ -348,7 +364,6 @@ class MakerRunner:
                 if not self._matches_filter(m):
                     continue
 
-                # Extract Binance symbol
                 symbol = None
                 q_lower = m.question.lower()
                 for keyword in sorted(CRYPTO_SYMBOL_MAP.keys(), key=len, reverse=True):
@@ -362,11 +377,9 @@ class MakerRunner:
                     candidates[symbol] = []
                 candidates[symbol].append(m)
 
-            # Sort by end_date, take first 10 per symbol (current + 9 upcoming)
             self.windows.clear()
             self.active_markets.clear()
             self._token_to_market.clear()
-            new_token_ids: list[str] = []
 
             for symbol, market_list in candidates.items():
                 market_list.sort(key=lambda m: m.end_date)
@@ -378,9 +391,7 @@ class MakerRunner:
                     if m.clob_token_ids and len(m.clob_token_ids) >= 2:
                         self._token_to_market[m.clob_token_ids[0]] = (m, "yes")
                         self._token_to_market[m.clob_token_ids[1]] = (m, "no")
-                        new_token_ids.extend(m.clob_token_ids[:2])
 
-                # Log current window
                 if selected and not self.quiet:
                     current = selected[0]
                     remaining = (current.end_date - now).total_seconds()
@@ -392,10 +403,10 @@ class MakerRunner:
 
             self._last_market_refresh = time.monotonic()
 
-            # Update Polymarket WS subscription
-            new_token_set = set(new_token_ids)
-            if new_token_set != self._subscribed_tokens and new_token_ids:
-                await self._start_poly_feed(new_token_ids)
+            # Update Poly WS subscriptions
+            new_tokens = self._collect_token_ids()
+            if set(new_tokens) != self._subscribed_tokens and new_tokens:
+                await self._start_poly_feed(new_tokens)
 
             if not self.quiet:
                 total = sum(len(w) for w in self.windows.values())
@@ -404,12 +415,23 @@ class MakerRunner:
         except Exception as e:
             logger.error(f"Market refresh failed: {e}")
 
-    def _get_symbols(self) -> list[str]:
-        """Get unique Binance symbols from loaded windows."""
-        return list(self.windows.keys()) or ["btcusdt"]
+    def _collect_token_ids(self) -> list[str]:
+        """Collect all token IDs from active markets."""
+        token_ids = []
+        for m in self.active_markets.values():
+            if m.clob_token_ids and len(m.clob_token_ids) >= 2:
+                token_ids.extend(m.clob_token_ids[:2])
+        return token_ids
 
     def _get_current_markets(self) -> dict[str, Market]:
-        """Get only the CURRENT (first) window per symbol — the one we're quoting."""
+        """Get markets we should be quoting right now.
+
+        Crypto mode: only the CURRENT (first) window per symbol.
+        Static mode: all loaded markets.
+        """
+        if self.mode == "static":
+            return dict(self.active_markets)
+
         result = {}
         now = datetime.now(timezone.utc)
         for symbol, market_list in self.windows.items():
@@ -419,61 +441,67 @@ class MakerRunner:
                     result[current.condition_id] = current
         return result
 
+    # ===================================================================
+    # Window Hopping (crypto mode only)
+    # ===================================================================
+
     def _check_window_hops(self):
-        """Check if any current windows have expired and hop to the next one."""
+        """Check if current windows expired and hop to next one."""
+        if self.mode != "crypto":
+            return
+
         now = datetime.now(timezone.utc)
         hopped = False
+
         for symbol in list(self.windows.keys()):
             market_list = self.windows[symbol]
             if not market_list:
                 continue
             current = market_list[0]
-            if current.end_date and current.end_date <= now:
-                # Current window expired — cancel its orders and promote next
-                old_cid = current.condition_id
-                if not self.dry:
-                    try:
-                        # Cancel all orders for both YES and NO tokens
-                        if current.clob_token_ids and len(current.clob_token_ids) >= 2:
-                            self.client.cancel_market_orders(
-                                asset_id=current.clob_token_ids[0]
-                            )
-                            self.client.cancel_market_orders(
-                                asset_id=current.clob_token_ids[1]
-                            )
-                    except Exception as e:
-                        logger.warning(f"Cancel on hop failed: {e}")
-                self.live_order_ids.pop(old_cid, None)
+            if not current.end_date or current.end_date > now:
+                continue
 
-                # Log stranded inventory warning
-                inv = self.strategy.get_inventory(old_cid)
-                if inv.yes_tokens > 0 or inv.no_tokens > 0:
-                    logger.warning(
-                        f"Window expired with inventory! YES={inv.yes_tokens:.1f} "
-                        f"NO={inv.no_tokens:.1f} on {current.question[:40]}"
-                    )
+            # Window expired
+            old_cid = current.condition_id
 
-                # Reset strategy state for old window (also clears inventory)
-                self.strategy.reset_window(old_cid)
-                self._btc_open_prices.pop(old_cid, None)
+            # Cancel orders on expired window
+            if not self.dry:
+                try:
+                    if current.clob_token_ids and len(current.clob_token_ids) >= 2:
+                        self.client.cancel_market_orders(asset_id=current.clob_token_ids[0])
+                        self.client.cancel_market_orders(asset_id=current.clob_token_ids[1])
+                except Exception as e:
+                    logger.warning(f"Cancel on hop failed: {e}")
+            self.live_order_ids.pop(old_cid, None)
 
-                # Promote next window
-                market_list.pop(0)
-                self._last_hop_time = time.monotonic()
-                hopped = True
+            # Warn about stranded inventory
+            inv = self.strategy.get_inventory(old_cid)
+            if inv.yes_tokens > 0 or inv.no_tokens > 0:
+                logger.warning(
+                    f"Window expired with inventory! YES={inv.yes_tokens:.1f} "
+                    f"NO={inv.no_tokens:.1f} on {current.question[:40]}"
+                )
 
-                if market_list:
-                    next_m = market_list[0]
-                    remaining = (next_m.end_date - now).total_seconds()
-                    console.print(
-                        f"\n[yellow]⟳ WINDOW HOP[/yellow] {symbol.replace('usdt','').upper()}: "
-                        f"{next_m.question[:50]} ({remaining:.0f}s left)"
-                    )
-                else:
-                    logger.warning(f"No more windows for {symbol} — need refresh")
+            # Reset strategy state
+            self.strategy.reset_window(old_cid)
 
-        # Rebuild flat view after hops
+            # Promote next window
+            market_list.pop(0)
+            self._last_hop_time = time.monotonic()
+            hopped = True
+
+            if market_list:
+                next_m = market_list[0]
+                remaining = (next_m.end_date - now).total_seconds()
+                console.print(
+                    f"\n[yellow]HOP[/yellow] {symbol.replace('usdt','').upper()}: "
+                    f"{next_m.question[:50]} ({remaining:.0f}s left)"
+                )
+            else:
+                logger.warning(f"No more windows for {symbol} — need refresh")
+
         if hopped:
+            # Rebuild flat view
             self.active_markets.clear()
             self._token_to_market.clear()
             for symbol, market_list in self.windows.items():
@@ -483,15 +511,16 @@ class MakerRunner:
                         self._token_to_market[m.clob_token_ids[0]] = (m, "yes")
                         self._token_to_market[m.clob_token_ids[1]] = (m, "no")
 
-            # Refetch if running low on windows
             remaining_windows = sum(len(w) for w in self.windows.values())
             if remaining_windows <= 3:
                 asyncio.create_task(self._refresh_markets())
 
-    # --- Polymarket Feed ---
+    # ===================================================================
+    # Polymarket Feed
+    # ===================================================================
 
     async def _start_poly_feed(self, token_ids: list[str]):
-        """Start or restart the Polymarket WebSocket with new token IDs."""
+        """Start or restart the Polymarket WebSocket."""
         if self.poly_feed:
             try:
                 await self.poly_feed.stop()
@@ -500,58 +529,22 @@ class MakerRunner:
 
         self.poly_feed = MarketFeed(self.settings)
 
-        # Register price update callbacks
         async def _on_best_bid_ask(event: dict):
-            """best_bid_ask events have 'best_bid' and 'best_ask' fields."""
             token_id = event.get("asset_id", "")
             if not token_id:
                 return
             entry = self._token_to_market.get(token_id)
             if not entry:
                 return
-            m, side = entry
-            cid = m.condition_id
-            # Use midpoint of bid/ask as price
-            try:
-                bid = float(event.get("best_bid", 0))
-                ask = float(event.get("best_ask", 0))
-            except (ValueError, TypeError):
-                return
-            if bid <= 0 and ask <= 0:
-                return
-            price = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
-            if side == "yes":
-                self.yes_prices[cid] = price
-                # Store actual best bid separately — needed to floor ask price
-                if bid > 0:
-                    self.yes_best_bids[cid] = bid
-            else:
-                self.no_prices[cid] = price
-                if bid > 0:
-                    self.no_best_bids[cid] = bid
+            # Trigger requote on material book change
+            self._requote_event.set()
 
-        async def _on_last_trade(event: dict):
-            """last_trade_price events have 'price' or 'last_trade_price' field."""
-            token_id = event.get("asset_id", "")
-            price_str = event.get("price") or event.get("last_trade_price") or "0"
-            try:
-                price = float(price_str)
-            except (ValueError, TypeError):
-                return
-            if not token_id or not price:
-                return
-            entry = self._token_to_market.get(token_id)
-            if not entry:
-                return
-            m, side = entry
-            cid = m.condition_id
-            if side == "yes":
-                self.yes_prices[cid] = price
-            else:
-                self.no_prices[cid] = price
+        async def _on_book(event: dict):
+            """Full book snapshot — most useful for BookIntelligence."""
+            self._requote_event.set()
 
         self.poly_feed.on(EVENT_BEST_BID_ASK, _on_best_bid_ask)
-        self.poly_feed.on(EVENT_LAST_TRADE, _on_last_trade)
+        self.poly_feed.on(EVENT_BOOK, _on_book)
         self._subscribed_tokens = set(token_ids)
 
         if not self.quiet:
@@ -563,7 +556,6 @@ class MakerRunner:
             if not self.poly_feed:
                 await asyncio.sleep(1)
                 continue
-
             try:
                 token_ids = list(self._subscribed_tokens)
                 if token_ids:
@@ -572,65 +564,112 @@ class MakerRunner:
                 logger.warning(f"Poly feed error: {e}")
                 await asyncio.sleep(2)
 
-    # --- Depth Lookup ---
+    # ===================================================================
+    # BookIntelligence
+    # ===================================================================
+
+    def _get_book_intel(self, market: Market) -> tuple[BookIntelligence | None, BookIntelligence | None]:
+        """Get BookIntelligence for YES and NO tokens from Poly WS."""
+        if not self.poly_feed or not market.clob_token_ids or len(market.clob_token_ids) < 2:
+            return None, None
+
+        yes_book = self.poly_feed.get_book(market.clob_token_ids[0])
+        no_book = self.poly_feed.get_book(market.clob_token_ids[1])
+
+        yes_intel = analyze_book(yes_book) if yes_book else None
+        no_intel = analyze_book(no_book) if no_book else None
+        return yes_intel, no_intel
 
     def _get_depth_momentum(self) -> float:
-        """Get current depth momentum from Binance feed.
-
-        Looks up lazily each call — NOT cached at startup (the feed
-        hasn't connected yet at that point, so caching would give None).
-        """
+        """Get Binance depth momentum (crypto mode only)."""
         if not self.depth_feed:
             return 0.0
-        symbols = self._get_symbols()
+        symbols = list(self.windows.keys()) or ["btcusdt"]
         for sym in symbols:
             ds = self.depth_feed.depth.get(sym)
             if ds and ds.is_active:
                 return ds.depth_momentum
         return 0.0
 
-    def _get_btc_mid_price(self) -> float:
-        """Get current BTC mid price from Binance depth feed."""
-        if not self.depth_feed:
-            return 0.0
-        symbols = self._get_symbols()
-        for sym in symbols:
-            ds = self.depth_feed.depth.get(sym)
-            if ds and ds.is_active and ds.mid_price > 0:
-                return ds.mid_price
-        return 0.0
+    # ===================================================================
+    # Warmup Gate
+    # ===================================================================
 
-    # --- Quote Loop ---
+    def _check_warmup(self) -> bool:
+        """Check if warmup is complete (book data received + time elapsed)."""
+        if self._warmup_complete:
+            return True
+
+        if not self.poly_feed or not self.poly_feed.is_connected:
+            return False
+
+        # Need book data for at least one market
+        for m in self._get_current_markets().values():
+            if not m.clob_token_ids or len(m.clob_token_ids) < 2:
+                continue
+            book = self.poly_feed.get_book(m.clob_token_ids[0])
+            if book and (book.bids or book.asks):
+                # Have data — check time
+                if self._warmup_start == 0:
+                    self._warmup_start = time.monotonic()
+                    if not self.quiet:
+                        console.print("[yellow]Warming up — got first book data...[/yellow]")
+
+                elapsed = time.monotonic() - self._warmup_start
+                if elapsed >= self.config.warmup_seconds:
+                    self._warmup_complete = True
+                    if not self.quiet:
+                        console.print("[green]Warmup complete — quoting enabled.[/green]")
+                    return True
+
+        return False
+
+    # ===================================================================
+    # Quote Loop
+    # ===================================================================
 
     async def _quote_loop(self):
-        """Main quoting loop — compute and post quotes periodically."""
+        """Main quoting loop — event-driven with floor interval."""
         while self._running:
             try:
-                # Check for window expirations and hop
+                # Wait for event or floor interval
+                try:
+                    await asyncio.wait_for(
+                        self._requote_event.wait(),
+                        timeout=self.config.min_requote_interval,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                self._requote_event.clear()
+
+                # Check window hops (crypto mode)
                 self._check_window_hops()
 
-                # Refresh markets periodically (or when running low on windows)
-                if time.monotonic() - self._last_market_refresh > MARKET_REFRESH_INTERVAL:
+                # Refresh markets periodically (crypto mode)
+                if (
+                    self.mode == "crypto"
+                    and time.monotonic() - self._last_market_refresh > MARKET_REFRESH_INTERVAL
+                ):
                     await self._refresh_markets()
 
-                # Window hop cooldown — don't quote immediately after hop
-                hop_elapsed = time.monotonic() - self._last_hop_time
-                if self._last_hop_time > 0 and hop_elapsed < self.config.window_hop_pause_seconds:
-                    await asyncio.sleep(1)
+                # Window hop cooldown
+                if self._last_hop_time > 0:
+                    hop_elapsed = time.monotonic() - self._last_hop_time
+                    if hop_elapsed < self.config.window_hop_pause_seconds:
+                        continue
+
+                # Warmup gate
+                if not self._check_warmup():
                     continue
 
-                # Get depth momentum for defense (looked up fresh each iteration)
+                # Quote each current market
                 depth_momentum = self._get_depth_momentum()
-
-                # Only quote CURRENT windows (first per symbol), not upcoming ones
                 current_markets = self._get_current_markets()
                 for cid, m in current_markets.items():
                     await self._quote_market(cid, m, depth_momentum)
 
             except Exception as e:
                 logger.error(f"Quote loop error: {e}")
-
-            await asyncio.sleep(self.config.requote_interval_seconds)
 
     async def _quote_market(
         self,
@@ -639,107 +678,77 @@ class MakerRunner:
         depth_momentum: float,
     ):
         """Compute and post quotes for a single market."""
-
-        # Get prices
-        yes_price = self.yes_prices.get(condition_id, 0)
-        no_price = self.no_prices.get(condition_id, 0)
-        if not yes_price or not no_price:
-            return
-
-        # Get time remaining
-        now = datetime.now(timezone.utc)
-        if m.end_date:
-            seconds_remaining = (m.end_date - now).total_seconds()
-        else:
-            seconds_remaining = 0
-        if seconds_remaining <= 0:
-            return
-
-        # Get token IDs
         if not m.clob_token_ids or len(m.clob_token_ids) < 2:
             return
+
         yes_token_id = m.clob_token_ids[0]
         no_token_id = m.clob_token_ids[1]
 
-        # Get actual best bids for ask floor
-        yes_best_bid = self.yes_best_bids.get(condition_id, 0)
-        no_best_bid = self.no_best_bids.get(condition_id, 0)
+        # Get time remaining (None for static markets)
+        seconds_remaining: float | None = None
+        if m.end_date:
+            now = datetime.now(timezone.utc)
+            remaining = (m.end_date - now).total_seconds()
+            if remaining <= 0:
+                return
+            seconds_remaining = remaining
 
-        # Get BTC price from depth feed for Binance-informed fair value
-        btc_price = self._get_btc_mid_price()
-        btc_open = self._btc_open_prices.get(condition_id, 0)
-        # Record BTC open price on first quote of each window
-        if btc_open <= 0 and btc_price > 0:
-            self._btc_open_prices[condition_id] = btc_price
-            btc_open = btc_price
+        # Get BookIntelligence from Poly WS
+        yes_intel, no_intel = self._get_book_intel(m)
 
         # Compute quotes
         qs = self.strategy.compute_quotes(
             condition_id=condition_id,
             yes_token_id=yes_token_id,
             no_token_id=no_token_id,
-            yes_price=yes_price,
-            no_price=no_price,
+            yes_book=yes_intel,
+            no_book=no_intel,
             seconds_remaining=seconds_remaining,
             depth_momentum=depth_momentum,
-            yes_best_bid=yes_best_bid,
-            no_best_bid=no_best_bid,
-            btc_price=btc_price,
-            btc_open_price=btc_open,
         )
 
-        if qs.reason_pulled:
-            # Cancel existing orders if we're pulling (both YES and NO)
+        if qs.reason_skipped:
+            # Cancel existing orders if we're pulling
             if condition_id in self.live_order_ids and self.live_order_ids[condition_id]:
                 if not self.dry:
                     await self._cancel_market_quotes(condition_id, yes_token_id)
                     await self._cancel_market_quotes(condition_id, no_token_id)
-            # Always log pulls — need to see defense working
-            if qs.reason_pulled not in ("no_requote_needed",):
+            if qs.reason_skipped not in ("no_requote_needed",):
                 self._total_pulls += 1
-                if not self.quiet:
+                if self.verbose:
                     console.print(
-                        f"  [yellow]⛔ PULL[/yellow] {qs.reason_pulled} | "
-                        f"depth={depth_momentum:+.2f} | {seconds_remaining:.0f}s left"
+                        f"  [yellow]PULL[/yellow] {qs.reason_skipped} | "
+                        f"depth={depth_momentum:+.2f}"
                     )
             return
 
         if not qs.is_active:
             return
 
-        # Post quotes
         self._total_quotes_posted += 1
-        yes_token_id = m.clob_token_ids[0]
-        no_token_id = m.clob_token_ids[1]
         if self.dry:
-            self._log_dry_quotes(m, qs, depth_momentum)
+            self._log_dry_quotes(m, qs)
         else:
             await self._post_quotes(condition_id, yes_token_id, no_token_id, qs)
 
-    async def _post_quotes(self, condition_id: str, yes_token_id: str, no_token_id: str, qs: QuoteSet):
-        """Cancel old quotes and post new ones for both YES and NO tokens."""
-        async with self._quote_lock:  # Prevent race between concurrent cancel+post
+    async def _post_quotes(
+        self, condition_id: str, yes_token_id: str, no_token_id: str, qs: QuoteSet,
+    ):
+        """Cancel old quotes and post new ones."""
+        async with self._quote_lock:
             try:
-                # Cancel existing orders for BOTH tokens
                 if self.config.cancel_before_requote:
                     await self._cancel_market_quotes(condition_id, yes_token_id)
                     await self._cancel_market_quotes(condition_id, no_token_id)
-                    # Brief pause for cancel propagation — prevents race where
-                    # new orders post before old ones are fully removed
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)  # Cancel propagation
 
-                # Build batch
                 orders = [q.as_order_dict() for q in qs.all_quotes()]
                 if not orders:
                     return
 
-                if len(orders) <= 15:
-                    result = self.client.post_orders_batch(orders)
-                else:
-                    # Shouldn't happen but handle gracefully
-                    result = self.client.post_orders_batch(orders[:15])
+                result = self.client.post_orders_batch(orders[:15])
 
-                # Track order IDs from response
+                # Track order IDs
                 if isinstance(result, dict) and "orderIDs" in result:
                     self.live_order_ids[condition_id] = result["orderIDs"]
                 elif isinstance(result, list):
@@ -749,12 +758,11 @@ class MakerRunner:
                 if not self.quiet:
                     parts = []
                     for q in qs.all_quotes():
-                        # Label YES vs NO quotes
                         token_label = "Y" if q.token_id == yes_token_id else "N"
                         side_label = "BID" if q.side == "BUY" else "ASK"
-                        parts.append(f"{token_label}:{side_label} ${q.price:.2f}×{q.size:.0f}")
+                        parts.append(f"{token_label}:{side_label} ${q.price:.2f}x{q.size:.0f}")
                     console.print(
-                        f"  [cyan]📋 POST[/cyan] {' | '.join(parts)} | "
+                        f"  [cyan]POST[/cyan] {' | '.join(parts)} | "
                         f"FV={qs.fair_value:.2f} spread={qs.spread:.3f}"
                     )
 
@@ -762,65 +770,96 @@ class MakerRunner:
                 logger.warning(f"Post quotes failed: {e}")
 
     async def _cancel_market_quotes(self, condition_id: str, token_id: str):
-        """Cancel all our orders on a market.
-
-        Uses both tracked order IDs AND blanket cancel for belt-and-suspenders.
-        """
+        """Cancel all our orders on a token (tracked IDs + blanket)."""
         try:
-            # First: cancel by tracked order IDs (most reliable)
             tracked_ids = self.live_order_ids.get(condition_id, [])
             if tracked_ids:
                 try:
                     self.client.cancel_orders_batch(tracked_ids)
                 except Exception:
-                    pass  # Fall through to blanket cancel
-
-            # Second: blanket cancel by token (catches any we lost track of)
+                    pass
             self.client.cancel_market_orders(asset_id=token_id)
             self.live_order_ids.pop(condition_id, None)
         except Exception as e:
             logger.warning(f"Cancel market orders failed: {e}")
-            # Still clear tracking — stale IDs cause problems
             self.live_order_ids.pop(condition_id, None)
 
-    def _log_dry_quotes(self, market, qs: QuoteSet, depth_momentum: float = 0.0):
+    def _log_dry_quotes(self, market: Market, qs: QuoteSet):
         """Log quotes in dry-run mode."""
         if self.quiet:
             return
         parts = []
-        if qs.yes_bid:
-            parts.append(f"Y:BID ${qs.yes_bid.price:.2f}×{qs.yes_bid.size:.0f}")
-        if qs.yes_ask:
-            parts.append(f"Y:ASK ${qs.yes_ask.price:.2f}×{qs.yes_ask.size:.0f}")
-        if qs.no_bid:
-            parts.append(f"N:BID ${qs.no_bid.price:.2f}×{qs.no_bid.size:.0f}")
-        if qs.no_ask:
-            parts.append(f"N:ASK ${qs.no_ask.price:.2f}×{qs.no_ask.size:.0f}")
-        spread_str = f"spread={qs.spread:.3f}"
-        q = market.question[:60] if hasattr(market, 'question') else "?"
-        depth_str = f"d={depth_momentum:+.2f}" if depth_momentum else ""
+        yes_tid = market.clob_token_ids[0] if market.clob_token_ids else ""
+        for q in qs.all_quotes():
+            token_label = "Y" if q.token_id == yes_tid else "N"
+            side_label = "BID" if q.side == "BUY" else "ASK"
+            parts.append(f"{token_label}:{side_label} ${q.price:.2f}x{q.size:.0f}")
+        q_text = market.question[:60] if hasattr(market, 'question') else "?"
+        inv = self.strategy.get_inventory(market.condition_id)
+        inv_str = f"Inv: Y={inv.yes_tokens:.0f} N={inv.no_tokens:.0f}" if (inv.yes_tokens or inv.no_tokens) else ""
         console.print(
-            f"  [dim]MM[/dim] {q} | FV={qs.fair_value:.2f} {spread_str} {depth_str} | "
-            + " | ".join(parts)
+            f"  [dim]MM[/dim] {q_text} | FV={qs.fair_value:.2f} spread={qs.spread:.3f} | "
+            + " | ".join(parts) + (f" | {inv_str}" if inv_str else "")
         )
 
-    # --- Heartbeat ---
+    # ===================================================================
+    # Force-Sell Loop (crypto mode)
+    # ===================================================================
 
-    async def _heartbeat_loop(self):
-        """Send heartbeats to prevent stale orders on crash."""
+    async def _force_sell_loop(self):
+        """Force-sell inventory before crypto windows expire."""
         while self._running:
             try:
-                result = self.client.post_heartbeat(self.heartbeat_id)
-                if isinstance(result, dict):
-                    self.heartbeat_id = result.get("heartbeat_id", self.heartbeat_id)
-            except Exception as e:
-                logger.error(f"Heartbeat failed: {e}")
-            await asyncio.sleep(self.config.heartbeat_interval_seconds)
+                now = datetime.now(timezone.utc)
+                for symbol, market_list in self.windows.items():
+                    if not market_list:
+                        continue
+                    current = market_list[0]
+                    if not current.end_date:
+                        continue
 
-    # --- Fill Monitor ---
+                    remaining = (current.end_date - now).total_seconds()
+                    cid = current.condition_id
+                    inv = self.strategy.get_inventory(cid)
+
+                    if remaining < self.config.force_sell_seconds and (inv.yes_tokens > 0 or inv.no_tokens > 0):
+                        if not current.clob_token_ids or len(current.clob_token_ids) < 2:
+                            continue
+
+                        yes_intel, no_intel = self._get_book_intel(current)
+                        force_qs = self.strategy.compute_force_sell_quotes(
+                            condition_id=cid,
+                            yes_token_id=current.clob_token_ids[0],
+                            no_token_id=current.clob_token_ids[1],
+                            seconds_remaining=remaining,
+                            yes_book=yes_intel,
+                            no_book=no_intel,
+                        )
+
+                        if force_qs.is_active:
+                            if not self.quiet:
+                                console.print(
+                                    f"  [red]FORCE SELL[/red] {remaining:.0f}s left | "
+                                    f"YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
+                                )
+                            if not self.dry:
+                                await self._post_quotes(
+                                    cid,
+                                    current.clob_token_ids[0],
+                                    current.clob_token_ids[1],
+                                    force_qs,
+                                )
+            except Exception as e:
+                logger.warning(f"Force-sell loop error: {e}")
+
+            await asyncio.sleep(2)
+
+    # ===================================================================
+    # Fill Monitor — actual fill prices from CLOB API
+    # ===================================================================
 
     async def _fill_monitor_loop(self):
-        """Poll for fills and update inventory."""
+        """Poll CLOB trade history for fills with actual prices."""
         while self._running:
             try:
                 await self._check_fills()
@@ -829,175 +868,81 @@ class MakerRunner:
             await asyncio.sleep(self.config.fill_check_interval_seconds)
 
     async def _check_fills(self):
-        """Check actual CLOB token balances and sync inventory.
+        """Fetch new fills from CLOB API since last check."""
+        try:
+            fills = self.client.get_trades(after=self._fill_cursor_ts)
+        except Exception as e:
+            logger.warning(f"get_trades failed: {e}")
+            return
 
-        Source-of-truth approach: reads real balances from the CLOB API
-        instead of trying to detect fills by watching order IDs disappear
-        (which has race conditions with cancel-before-requote).
-        """
-        for cid, m in list(self.active_markets.items()):
-            if not m.clob_token_ids or len(m.clob_token_ids) < 2:
-                continue
+        if not fills:
+            return
+
+        for fill in fills:
+            token_id = fill.get("asset_id", "")
+            if token_id not in self._token_to_market:
+                continue  # Not our market
+
+            market, token_side = self._token_to_market[token_id]
+            cid = market.condition_id
+            token = "YES" if token_side == "yes" else "NO"
 
             try:
-                yes_token_id = m.clob_token_ids[0]
-                no_token_id = m.clob_token_ids[1]
+                price = float(fill.get("price", 0))
+                size = float(fill.get("size", 0))
+                side = fill.get("side", "").upper()
+            except (ValueError, TypeError):
+                continue
 
-                # Get actual balances from CLOB
-                yes_bal_resp = self.client.get_token_balance(yes_token_id)
-                no_bal_resp = self.client.get_token_balance(no_token_id)
+            if price <= 0 or size <= 0 or side not in ("BUY", "SELL"):
+                continue
 
-                actual_yes = float(yes_bal_resp.get("balance", 0)) if isinstance(yes_bal_resp, dict) else 0.0
-                actual_no = float(no_bal_resp.get("balance", 0)) if isinstance(no_bal_resp, dict) else 0.0
-
-                inv = self.strategy.get_inventory(cid)
-                old_yes = inv.yes_tokens
-                old_no = inv.no_tokens
-
-                # Detect new buys (balance increased)
-                if actual_yes > old_yes + 0.5:
-                    delta = actual_yes - old_yes
-                    # Estimate fill price from current market
-                    est_price = self.yes_prices.get(cid, 0.50)
-                    inv.yes_tokens = actual_yes
-                    inv.yes_cost_basis += delta * est_price
-                    self._total_fills += 1
-                    q_short = m.question[:40] if m else cid[:8]
-                    console.print(
-                        f"  [green bold]💰 FILL[/green bold] BUY {delta:.1f} YES @ ~${est_price:.2f} | "
-                        f"{q_short} | Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
-                    )
-                    logger.info(f"Fill: BUY {delta:.1f} YES @ ~${est_price:.2f} | "
-                                f"Inventory: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}")
-
-                # Detect new NO buys
-                if actual_no > old_no + 0.5:
-                    delta = actual_no - old_no
-                    est_price = self.no_prices.get(cid, 0.50)
-                    inv.no_tokens = actual_no
-                    inv.no_cost_basis += delta * est_price
-                    self._total_fills += 1
-                    q_short = m.question[:40] if m else cid[:8]
-                    console.print(
-                        f"  [green bold]💰 FILL[/green bold] BUY {delta:.1f} NO @ ~${est_price:.2f} | "
-                        f"{q_short} | Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
-                    )
-                    logger.info(f"Fill: BUY {delta:.1f} NO @ ~${est_price:.2f} | "
-                                f"Inventory: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}")
-
-                # Detect sells (balance decreased)
-                if actual_yes < old_yes - 0.5:
-                    delta = old_yes - actual_yes
-                    est_price = self.yes_prices.get(cid, 0.50)
-                    avg_entry = inv.avg_cost("YES")
-                    if avg_entry > 0:
-                        pnl = (est_price - avg_entry) * delta
-                        self.strategy._window_pnl[cid] = self.strategy._window_pnl.get(cid, 0) + pnl
-                    sell_frac = min(delta / old_yes, 1.0) if old_yes > 0 else 1.0
-                    inv.yes_cost_basis *= (1.0 - sell_frac)
-                    inv.yes_tokens = actual_yes
-                    self._total_fills += 1
-                    console.print(
-                        f"  [green bold]💰 FILL[/green bold] SELL {delta:.1f} YES @ ~${est_price:.2f} | "
-                        f"Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
-                    )
-
-                if actual_no < old_no - 0.5:
-                    delta = old_no - actual_no
-                    est_price = self.no_prices.get(cid, 0.50)
-                    avg_entry = inv.avg_cost("NO")
-                    if avg_entry > 0:
-                        pnl = (est_price - avg_entry) * delta
-                        self.strategy._window_pnl[cid] = self.strategy._window_pnl.get(cid, 0) + pnl
-                    sell_frac = min(delta / old_no, 1.0) if old_no > 0 else 1.0
-                    inv.no_cost_basis *= (1.0 - sell_frac)
-                    inv.no_tokens = actual_no
-                    self._total_fills += 1
-                    console.print(
-                        f"  [green bold]💰 FILL[/green bold] SELL {delta:.1f} NO @ ~${est_price:.2f} | "
-                        f"Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
-                    )
-
-                # Sync even without threshold change (handles manual trades, startup, etc.)
-                if abs(actual_yes - inv.yes_tokens) > 0.1:
-                    inv.yes_tokens = actual_yes
-                if abs(actual_no - inv.no_tokens) > 0.1:
-                    inv.no_tokens = actual_no
-
-            except Exception as e:
-                if self.verbose:
-                    logger.warning(f"Fill check error for {cid[:8]}: {e}")
-
-    async def _process_potential_fill(self, condition_id: str, order_id: str):
-        """Check if an order was filled (vs cancelled) and record it."""
-        try:
-            order_info = self.client.get_order(order_id)
-            if not order_info:
-                return
-
-            status = order_info.get("status", "")
-            if status not in ("MATCHED", "FILLED"):
-                return  # Was cancelled, not filled
-
-            side = order_info.get("side", "BUY")
-            price = float(order_info.get("price", 0))
-            size = float(order_info.get("size_matched", order_info.get("original_size", 0)))
-            token_id = order_info.get("asset_id", "")
-
-            if size <= 0:
-                return
-
-            # Determine if YES or NO token
-            token = "YES"
-            for m in self.active_markets.values():
-                if m.clob_token_ids and len(m.clob_token_ids) >= 2:
-                    if token_id == m.clob_token_ids[1]:
-                        token = "NO"
-                        break
-
-            # record_fill returns avg_entry for SELLs (computed BEFORE inventory update)
-            avg_entry = self.strategy.record_fill(condition_id, side, token, size, price)
+            # Record fill in strategy inventory
+            avg_entry = self.strategy.record_fill(cid, side, token, size, price)
             self._total_fills += 1
 
-            inv = self.strategy.get_inventory(condition_id)
-            m = self.active_markets.get(condition_id)
-            q_short = m.question[:40] if m else condition_id[:8]
+            # Trigger requote (inventory changed)
+            self._requote_event.set()
+
+            # Display
+            q_short = market.question[:40]
             console.print(
-                f"  [green bold]💰 FILL[/green bold] {side} {size:.1f} {token} @ ${price:.2f} | "
-                f"{q_short} | Inv: YES={inv.yes_tokens:.1f} NO={inv.no_tokens:.1f}"
+                f"  [green bold]FILL[/green bold] {side} {size:.1f} {token} @ ${price:.2f} | {q_short}"
             )
 
-            # --- DB trade logging ---
+            # Log to DB
+            fill_id = fill.get("id", "")
             await self._log_fill_to_db(
-                condition_id, order_id, token_id, token, side, price, size, m, avg_entry
+                cid, fill_id, token_id, token, side, price, size, market, avg_entry,
             )
 
-        except Exception as e:
-            if self.verbose:
-                logger.warning(f"Process fill error: {e}")
+            # Advance cursor
+            match_time = fill.get("match_time")
+            if match_time:
+                try:
+                    ts = int(match_time)
+                    if ts > self._fill_cursor_ts:
+                        self._fill_cursor_ts = ts
+                except (ValueError, TypeError):
+                    pass
 
     async def _log_fill_to_db(
         self,
         condition_id: str,
-        order_id: str,
+        fill_id: str,
         token_id: str,
-        token: str,  # "YES" or "NO"
-        side: str,  # "BUY" or "SELL"
+        token: str,
+        side: str,
         price: float,
         size: float,
         market: Market | None,
         avg_entry: float | None,
     ):
-        """Log a fill to the trades/positions/orders tables in DB.
-
-        avg_entry is provided by record_fill() for SELL fills — computed
-        BEFORE inventory was decremented, so the cost basis is accurate.
-        """
+        """Log a fill to the trades/positions tables."""
         try:
             question = market.question if market else ""
             inv = self.strategy.get_inventory(condition_id)
 
-            # Snapshot current state for analysis
             signal_data = {
                 "fill_side": side,
                 "fill_token": token,
@@ -1007,13 +952,11 @@ class MakerRunner:
                 "inventory_yes": inv.yes_tokens,
                 "inventory_no": inv.no_tokens,
                 "inventory_imbalance": inv.imbalance,
-                "depth_momentum": self._get_depth_momentum(),
             }
 
             if side == "BUY":
-                # Entry — new position or adding to existing
                 await self.db.insert_trade({
-                    "trade_id": order_id,
+                    "trade_id": fill_id or None,
                     "market_id": condition_id,
                     "token_id": token_id,
                     "question": question,
@@ -1031,18 +974,15 @@ class MakerRunner:
                     "question": question,
                     "side": side,
                     "size": inv.yes_tokens if token == "YES" else inv.no_tokens,
-                    "entry_price": inv.avg_cost(token),  # Weighted avg, not last fill
+                    "entry_price": inv.avg_cost(token),
                     "current_price": price,
                     "unrealized_pnl": 0,
                     "strategy": "market_maker",
                 })
 
             else:
-                # Exit — selling tokens we hold
-                # avg_entry was computed BEFORE inventory decrement, so it's accurate
                 entry_price = avg_entry if avg_entry and avg_entry > 0 else price
                 gross_pnl = (price - entry_price) * size
-
                 self._total_spread_captured += gross_pnl
 
                 await self.db.close_trade_by_market(
@@ -1052,12 +992,10 @@ class MakerRunner:
                     exit_reason="maker_sell",
                 )
 
-                # Check remaining inventory (already decremented by record_fill)
                 remaining = inv.yes_tokens if token == "YES" else inv.no_tokens
                 if remaining <= 0.1:
                     await self.db.remove_position(condition_id, token_id, "BUY")
                 else:
-                    # Update position with remaining size
                     await self.db.upsert_position({
                         "market_id": condition_id,
                         "token_id": token_id,
@@ -1072,14 +1010,130 @@ class MakerRunner:
 
                 if not self.quiet:
                     console.print(
-                        f"  [green]📊 P&L[/green] ${gross_pnl:+.2f} on {size:.1f} {token} "
-                        f"(entry ${entry_price:.2f} → exit ${price:.2f})"
+                        f"  [green]P&L[/green] ${gross_pnl:+.2f} on {size:.1f} {token} "
+                        f"(entry ${entry_price:.2f} -> exit ${price:.2f})"
                     )
 
         except Exception as e:
             logger.warning(f"DB trade log failed: {e}")
 
-    # --- Status ---
+    # ===================================================================
+    # Balance Reconciliation (belt-and-suspenders)
+    # ===================================================================
+
+    async def _balance_reconcile_loop(self):
+        """Periodic balance check to catch any fills the trade history missed."""
+        while self._running:
+            await asyncio.sleep(self.config.balance_reconcile_interval)
+            try:
+                for cid, m in list(self.active_markets.items()):
+                    if not m.clob_token_ids or len(m.clob_token_ids) < 2:
+                        continue
+
+                    yes_bal = self.client.get_token_balance(m.clob_token_ids[0])
+                    no_bal = self.client.get_token_balance(m.clob_token_ids[1])
+
+                    actual_yes = float(yes_bal.get("balance", 0)) if isinstance(yes_bal, dict) else 0.0
+                    actual_no = float(no_bal.get("balance", 0)) if isinstance(no_bal, dict) else 0.0
+
+                    inv = self.strategy.get_inventory(cid)
+
+                    # Warn on significant mismatch (don't auto-fix — trade history is source of truth)
+                    if abs(actual_yes - inv.yes_tokens) > 1.0 or abs(actual_no - inv.no_tokens) > 1.0:
+                        logger.warning(
+                            f"Balance mismatch on {cid[:8]}: "
+                            f"tracked YES={inv.yes_tokens:.1f} actual={actual_yes:.1f} | "
+                            f"tracked NO={inv.no_tokens:.1f} actual={actual_no:.1f}"
+                        )
+                        # Sync to actual (our trade history may have missed something)
+                        inv.yes_tokens = actual_yes
+                        inv.no_tokens = actual_no
+
+            except Exception as e:
+                logger.warning(f"Balance reconcile error: {e}")
+
+    # ===================================================================
+    # Startup Reconciliation
+    # ===================================================================
+
+    async def _reconcile_inventory(self):
+        """Check actual CLOB balances on startup and reconstruct cost basis."""
+        for cid, m in self.active_markets.items():
+            if not m.clob_token_ids or len(m.clob_token_ids) < 2:
+                continue
+            try:
+                yes_bal = self.client.get_token_balance(m.clob_token_ids[0])
+                no_bal = self.client.get_token_balance(m.clob_token_ids[1])
+
+                actual_yes = float(yes_bal.get("balance", 0)) if isinstance(yes_bal, dict) else 0.0
+                actual_no = float(no_bal.get("balance", 0)) if isinstance(no_bal, dict) else 0.0
+
+                if actual_yes > 0.5 or actual_no > 0.5:
+                    inv = self.strategy.get_inventory(cid)
+
+                    # Try to find actual entry prices from recent trade history
+                    recent_fills = self.client.get_trades(
+                        market=cid,
+                        after=int(time.time()) - 3600,  # Last hour
+                    )
+
+                    yes_prices = [
+                        float(f["price"]) for f in recent_fills
+                        if f.get("asset_id") == m.clob_token_ids[0]
+                        and f.get("side", "").upper() == "BUY"
+                        and float(f.get("price", 0)) > 0
+                    ]
+                    no_prices = [
+                        float(f["price"]) for f in recent_fills
+                        if f.get("asset_id") == m.clob_token_ids[1]
+                        and f.get("side", "").upper() == "BUY"
+                        and float(f.get("price", 0)) > 0
+                    ]
+
+                    if actual_yes > 0.5:
+                        inv.yes_tokens = actual_yes
+                        # Use actual avg fill price if available, else estimate from book
+                        avg_price = (sum(yes_prices) / len(yes_prices)) if yes_prices else 0.50
+                        inv.yes_cost_basis = actual_yes * avg_price
+
+                    if actual_no > 0.5:
+                        inv.no_tokens = actual_no
+                        avg_price = (sum(no_prices) / len(no_prices)) if no_prices else 0.50
+                        inv.no_cost_basis = actual_no * avg_price
+
+                    q = m.question[:50]
+                    price_info = ""
+                    if yes_prices or no_prices:
+                        price_info = " (from trade history)"
+                    else:
+                        price_info = " (estimated)"
+                    console.print(
+                        f"  [yellow]RECONCILE[/yellow] {q} | "
+                        f"YES={actual_yes:.1f} NO={actual_no:.1f}{price_info}"
+                    )
+                    logger.info(f"Reconciled: {q} YES={actual_yes:.1f} NO={actual_no:.1f}")
+
+            except Exception as e:
+                logger.warning(f"Reconcile failed for {cid[:8]}: {e}")
+
+    # ===================================================================
+    # Heartbeat
+    # ===================================================================
+
+    async def _heartbeat_loop(self):
+        """Send heartbeats to prevent stale orders on crash."""
+        while self._running:
+            try:
+                result = self.client.post_heartbeat(self.heartbeat_id)
+                if isinstance(result, dict):
+                    self.heartbeat_id = result.get("heartbeat_id", self.heartbeat_id)
+            except Exception as e:
+                logger.error(f"Heartbeat failed: {e}")
+            await asyncio.sleep(self.config.heartbeat_interval_seconds)
+
+    # ===================================================================
+    # Status
+    # ===================================================================
 
     async def _status_loop(self):
         """Print periodic status updates."""
@@ -1090,36 +1144,29 @@ class MakerRunner:
 
     def _print_status(self):
         """Print market maker status line."""
-        # Depth info (lazy lookup)
-        depth_str = ""
-        dm = self._get_depth_momentum()
-        if dm != 0:
-            depth_str = f"Depth:{dm:+.2f}"
-
-        # Inventory summary
         total_inv = sum(
             inv.yes_tokens + inv.no_tokens
             for inv in self.strategy.inventory.values()
         )
-
-        # Count live orders
         total_orders = sum(len(ids) for ids in self.live_order_ids.values())
-
-        # Count quoting markets
         quoting = sum(1 for ids in self.live_order_ids.values() if ids)
 
-        mode = "DRY" if self.dry else ("AUTO" if self.auto else "COPILOT")
+        mode_str = "DRY" if self.dry else ("AUTO" if self.auto else "COPILOT")
+        market_mode = self.mode.upper()
         pnl_str = f"P&L: ${self._total_spread_captured:+.2f}" if self._total_spread_captured else ""
+        warmup_str = "" if self._warmup_complete else " [WARMING UP]"
+
         console.print(
-            f"\n[dim bold]── Maker Status ── {mode} ─ "
-            f"Mkts: {len(self.active_markets)} (quoting: {quoting}) | "
+            f"\n[dim bold]-- Maker {market_mode} {mode_str}{warmup_str} -- "
+            f"Mkts: {len(self._get_current_markets())} (quoting: {quoting}) | "
             f"Orders: {total_orders} | Fills: {self._total_fills} | "
             f"Quotes: {self._total_quotes_posted} Pulls: {self._total_pulls} | "
-            f"Inv: {total_inv:.1f} tokens | {pnl_str} "
-            f"{depth_str}[/dim bold]"
+            f"Inv: {total_inv:.1f} tokens | {pnl_str}[/dim bold]"
         )
 
-    # --- Config Hot Reload ---
+    # ===================================================================
+    # Config Hot Reload
+    # ===================================================================
 
     async def _config_refresh_loop(self):
         """Reload config from DB every 30 seconds."""
@@ -1133,3 +1180,17 @@ class MakerRunner:
             except Exception as e:
                 logger.warning(f"Config refresh failed: {e}")
             await asyncio.sleep(30)
+
+    # ===================================================================
+    # Shutdown
+    # ===================================================================
+
+    async def _shutdown(self):
+        """Clean shutdown — cancel all orders."""
+        self._running = False
+        if not self.dry:
+            try:
+                logger.info("Cancelling all open orders...")
+                self.client.cancel_all_orders()
+            except Exception as e:
+                logger.error(f"Failed to cancel orders on shutdown: {e}")
