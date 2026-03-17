@@ -384,25 +384,28 @@ class MicroSniperConfig(BaseModel):
 class MarketMakerConfig(BaseModel):
     """Market maker strategy config — post-only limit orders, zero taker fees.
 
-    The market maker posts bids and asks on both sides of Polymarket crypto
-    up/down markets, capturing the spread. Uses Binance depth as a DEFENSIVE
-    signal (pull quotes when momentum spikes) not an offensive one.
+    Pure spread capture on ANY Polymarket market. Fair value from Poly book
+    midpoint. Defense from book dynamics (imbalance velocity, whale detection).
+    Optional Binance depth defense for crypto markets.
     """
 
     enabled: bool = False
 
     # --- Market selection ---
-    symbols: list[str] = ["btcusdt"]
+    symbols: list[str] = ["btcusdt"]  # Crypto mode: Binance symbols
+    condition_ids: list[str] = []  # Static mode: direct condition_id targeting
     min_liquidity: float = 500.0
-    min_entry_price: float = 0.10  # MM needs to quote across full range
-    max_entry_price: float = 0.90  # Only pull at extreme edges
-    min_seconds_remaining: float = 120.0
+    min_entry_price: float = 0.10  # Don't quote below this (deep OTM)
+    max_entry_price: float = 0.90  # Don't quote above this (near certainty)
+    min_seconds_remaining: float = 120.0  # Suppress new bids with <N seconds left
+
+    # --- Warmup ---
+    warmup_seconds: float = 5.0  # Wait for book data before first quote
 
     # --- Spread & pricing ---
     min_spread: float = 0.04  # Minimum full spread (bid-ask gap)
     base_spread: float = 0.06  # Normal calm-market spread
     max_spread: float = 0.12  # Widest allowed spread
-    spread_vol_scale: float = 2.0  # spread = base + vol_scale * recent_vol
     time_decay_widen_seconds: float = 60.0  # Widen in last N seconds of window
     time_decay_spread_mult: float = 1.5  # Spread multiplier during time decay
 
@@ -410,11 +413,11 @@ class MarketMakerConfig(BaseModel):
     quote_size_usd: float = 3.0  # USD per side per quote level
     max_inventory_usd: float = 15.0  # Max total inventory both sides
     max_inventory_imbalance: float = 0.70  # Max fraction on one side (0.5=balanced)
-    inventory_skew_factor: float = 0.02  # Price offset per 10% imbalance
+    inventory_skew_factor: float = 0.02  # Price offset per unit of net exposure
 
     # --- Quote management ---
     requote_threshold: float = 0.01  # Requote when fair value moves 1 cent
-    requote_interval_seconds: float = 2.0  # Min seconds between requotes — fast tracking
+    min_requote_interval: float = 3.0  # Min seconds between requotes
     cancel_before_requote: bool = True
     use_gtd: bool = True  # Auto-expire orders at window end
     gtd_buffer_seconds: float = 10.0  # Expire orders N seconds before window end
@@ -423,17 +426,22 @@ class MarketMakerConfig(BaseModel):
     heartbeat_enabled: bool = True
     heartbeat_interval_seconds: float = 5.0  # Must be <10s
 
-    # --- Depth defense (Binance order book) ---
-    depth_enabled: bool = True
-    depth_pull_threshold: float = 0.80  # Pull quotes when depth momentum > this (BTC is noisy, 0.40 fired constantly)
-    depth_widen_threshold: float = 0.40  # Widen spread when depth momentum > this
-    depth_widen_factor: float = 1.5  # Spread multiplier during depth widen
+    # --- Poly book defense ---
+    min_profitable_spread_bps: float = 200.0  # Don't quote if market spread < 2c
+    adverse_selection_threshold: float = 0.70  # Pull if |imbalance_5c| > this
+    imbalance_velocity_pull_threshold: float = 0.15  # Pull when imbalance changes this fast/sec
+    whale_widen_factor: float = 1.5  # Widen spread when whale near our price
+
+    # --- Binance depth defense (crypto only) ---
+    depth_defense_enabled: bool = False  # Only for crypto window markets
+    depth_pull_threshold: float = 0.80  # Pull when Binance depth momentum > this
     depth_recovery_seconds: float = 3.0  # Wait after pull before re-quoting
 
     # --- Profit targeting ---
-    min_profit_pct: float = 0.20  # Don't sell until 20% above avg cost (buy $0.31 → sell $0.37+)
+    min_profit_pct: float = 0.20  # Don't sell until 20% above avg cost
     profit_decay_start_seconds: float = 300.0  # Start decaying profit floor at 5 min remaining
-    force_sell_seconds: float = 60.0  # Override min_profit in last N seconds — dump at any price
+    force_sell_seconds: float = 60.0  # Force-sell mode in last N seconds
+    force_sell_fire_sale_seconds: float = 5.0  # Fire sale at any price in last N seconds
 
     # --- Risk ---
     max_loss_per_window_usd: float = 2.0  # Stop quoting if net loss exceeds this
@@ -441,8 +449,8 @@ class MarketMakerConfig(BaseModel):
     window_hop_pause_seconds: float = 15.0  # Pause quoting after window hop
 
     # --- Fill tracking ---
-    fill_check_interval_seconds: float = 2.0
-    inventory_rebalance_threshold: float = 0.60
+    fill_check_interval_seconds: float = 3.0  # Poll CLOB API for fills
+    balance_reconcile_interval: float = 60.0  # Belt-and-suspenders balance check
 
 
 class StrategiesConfig(BaseModel):
