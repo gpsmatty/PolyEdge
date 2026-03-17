@@ -395,8 +395,8 @@ class MarketMakerConfig(BaseModel):
     symbols: list[str] = ["btcusdt"]  # Crypto mode: Binance symbols
     condition_ids: list[str] = []  # Static mode: direct condition_id targeting
     min_liquidity: float = 500.0
-    min_entry_price: float = 0.10  # Don't quote below this (deep OTM)
-    max_entry_price: float = 0.90  # Don't quote above this (near certainty)
+    min_entry_price: float = 0.35  # Don't buy below 35c — deep OTM likely resolves to 0
+    max_entry_price: float = 0.65  # Don't buy above 65c — overpaying near certainty
     min_seconds_remaining: float = 120.0  # Suppress new bids with <N seconds left
 
     # --- Warmup ---

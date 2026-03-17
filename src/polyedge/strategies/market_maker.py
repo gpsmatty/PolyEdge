@@ -472,11 +472,12 @@ class MarketMakerStrategy:
             skew_offset = self.config.inventory_skew_factor * inv.net_exposure / max_tokens
 
         # ===================== YES SIDE =====================
-        yes_price_ok = self.config.min_entry_price <= fair_value <= self.config.max_entry_price
-
         # YES bid — buy YES
         yes_bid_price = fair_value - half_spread - skew_offset
         yes_bid_price = _snap_price(yes_bid_price, tick)
+
+        # Gate on the actual bid price, not just FV — prevents deep OTM bids
+        yes_price_ok = self.config.min_entry_price <= yes_bid_price <= self.config.max_entry_price
 
         yes_bid_size = round(self.config.quote_size_usd / yes_bid_price, 1) if yes_bid_price > 0 else 0
 
@@ -517,11 +518,12 @@ class MarketMakerStrategy:
                 )
 
         # ===================== NO SIDE =====================
-        no_price_ok = self.config.min_entry_price <= no_fair_value <= self.config.max_entry_price
-
         # NO bid — buy NO
         no_bid_price = no_fair_value - half_spread + skew_offset  # Opposite skew direction
         no_bid_price = _snap_price(no_bid_price, tick)
+
+        # Gate on actual bid price, not just FV
+        no_price_ok = self.config.min_entry_price <= no_bid_price <= self.config.max_entry_price
 
         no_bid_size = round(self.config.quote_size_usd / no_bid_price, 1) if no_bid_price > 0 else 0
 
