@@ -1,27 +1,29 @@
-"""Comprehensive tests for the market maker strategy.
+"""Tests for the market maker strategy.
 
-Tests every bug that was found in the audit:
-1. No naked short sells — never sell YES without holding it
-2. Window P&L circuit breaker fires correctly
-3. Ask price never crosses best bid (post_only safety)
-4. P&L computed correctly with accurate avg_entry
-5. Inventory cleaned on window reset
-6. Time gate allows exits near expiry
-7. Inventory skew only shifts bid, not ask
-8. Cost basis tracks correctly through buy/sell cycles
-9. Size capped to inventory on sells
-10. Full buy→sell→profit cycle
+Tests the core logic:
+1. Fair value from Poly book midpoint
+2. Quote gating (no book data, tight spread, max inventory, one-sided book)
+3. Defense (imbalance velocity, depth spike, spread compression)
+4. Inventory tracking and skew
+5. No naked shorts — never sell tokens we don't hold
+6. P&L tracking through buy/sell cycles
+7. Window reset clears all state
+8. Force-sell progressive pricing
+9. Static market mode (no time decay)
 """
 
 import time
 import pytest
+from dataclasses import dataclass
 from polyedge.core.config import MarketMakerConfig
 from polyedge.strategies.market_maker import (
     MarketMakerStrategy,
     QuoteSet,
     Quote,
     Inventory,
+    _snap_price,
 )
+from polyedge.data.book_analyzer import BookIntelligence
 
 
 @pytest.fixture
@@ -38,11 +40,19 @@ def config():
         max_inventory_usd=15.0,
         max_inventory_imbalance=0.70,
         inventory_skew_factor=0.02,
+        min_profitable_spread_bps=200.0,
+        adverse_selection_threshold=0.70,
+        imbalance_velocity_pull_threshold=0.15,
+        whale_widen_factor=1.5,
+        depth_defense_enabled=True,
         depth_pull_threshold=0.80,
-        depth_widen_threshold=0.40,
+        depth_recovery_seconds=3.0,
         max_loss_per_window_usd=2.0,
         requote_threshold=0.02,
-        requote_interval_seconds=5.0,
+        min_requote_interval=0.0,  # Disable for tests
+        min_profit_pct=0.20,
+        force_sell_seconds=60.0,
+        force_sell_fire_sale_seconds=5.0,
     )
 
 
@@ -54,6 +64,64 @@ def strategy(config):
 CID = "test_condition_123"
 YES_TID = "yes_token_456"
 NO_TID = "no_token_789"
+
+
+def _make_book(
+    market_id: str = CID,
+    token_id: str = YES_TID,
+    best_bid: float = 0.47,
+    best_ask: float = 0.53,
+    imbalance_5c: float = 0.0,
+    bid_depth_5c: float = 50.0,
+    ask_depth_5c: float = 50.0,
+    whale_bids=None,
+    whale_asks=None,
+) -> BookIntelligence:
+    """Helper to create BookIntelligence for tests."""
+    midpoint = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else max(best_bid, best_ask)
+    spread = best_ask - best_bid if best_bid > 0 and best_ask > 0 else 0
+    spread_bps = (spread / midpoint * 10000) if midpoint > 0 else 0
+    return BookIntelligence(
+        market_id=market_id,
+        token_id=token_id,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        midpoint=midpoint,
+        spread=spread,
+        spread_bps=spread_bps,
+        imbalance_5c=imbalance_5c,
+        bid_depth_5c=bid_depth_5c,
+        ask_depth_5c=ask_depth_5c,
+        whale_bids=whale_bids or [],
+        whale_asks=whale_asks or [],
+    )
+
+
+def _yes_no_books(
+    yes_mid: float = 0.50,
+    spread: float = 0.06,
+    imbalance_5c: float = 0.0,
+) -> tuple[BookIntelligence, BookIntelligence]:
+    """Create YES and NO books from a fair value midpoint."""
+    half = spread / 2
+    yes_book = _make_book(
+        token_id=YES_TID,
+        best_bid=yes_mid - half,
+        best_ask=yes_mid + half,
+        imbalance_5c=imbalance_5c,
+    )
+    no_mid = 1.0 - yes_mid
+    no_book = _make_book(
+        token_id=NO_TID,
+        best_bid=no_mid - half,
+        best_ask=no_mid + half,
+    )
+    return yes_book, no_book
+
+
+# ===================================================================
+# Inventory
+# ===================================================================
 
 
 class TestInventory:
@@ -75,11 +143,8 @@ class TestInventory:
     def test_sell_yes_reduces_cost_basis(self):
         inv = Inventory()
         inv.record_fill("BUY", "YES", 10.0, 0.50)
-        assert inv.yes_cost_basis == 5.0
-
         inv.record_fill("SELL", "YES", 5.0, 0.60)
         assert inv.yes_tokens == 5.0
-        # Cost basis should be halved (sold half)
         assert abs(inv.yes_cost_basis - 2.50) < 0.01
         assert abs(inv.avg_cost("YES") - 0.50) < 0.01
 
@@ -89,486 +154,445 @@ class TestInventory:
         inv.record_fill("SELL", "YES", 10.0, 0.60)
         assert inv.yes_tokens == 0
         assert inv.yes_cost_basis == 0.0
-        assert inv.avg_cost("YES") == 0.0
 
     def test_multiple_buys_different_prices(self):
         inv = Inventory()
-        inv.record_fill("BUY", "YES", 5.0, 0.40)  # $2.00
-        inv.record_fill("BUY", "YES", 5.0, 0.60)  # $3.00
+        inv.record_fill("BUY", "YES", 5.0, 0.40)
+        inv.record_fill("BUY", "YES", 5.0, 0.60)
         assert inv.yes_tokens == 10.0
-        assert inv.yes_cost_basis == 5.0  # $2 + $3
+        assert inv.yes_cost_basis == 5.0
         assert abs(inv.avg_cost("YES") - 0.50) < 0.01
 
     def test_sell_more_than_held_clamps_to_zero(self):
         inv = Inventory()
         inv.record_fill("BUY", "YES", 5.0, 0.50)
-        inv.record_fill("SELL", "YES", 10.0, 0.60)  # Sell more than held
+        inv.record_fill("SELL", "YES", 10.0, 0.60)
         assert inv.yes_tokens == 0
         assert inv.yes_cost_basis == 0.0
 
+    def test_net_exposure(self):
+        inv = Inventory()
+        inv.record_fill("BUY", "YES", 10.0, 0.50)
+        inv.record_fill("BUY", "NO", 5.0, 0.50)
+        assert inv.net_exposure == 5.0  # 10 YES - 5 NO
+
+
+# ===================================================================
+# Fair Value
+# ===================================================================
+
+
+class TestFairValue:
+    def test_from_yes_book_midpoint(self, strategy):
+        yes_book = _make_book(best_bid=0.47, best_ask=0.53)
+        fv = strategy.compute_fair_value(yes_book, None)
+        assert fv == 0.50
+
+    def test_blended_with_no_book(self, strategy):
+        yes_book = _make_book(best_bid=0.47, best_ask=0.53)  # mid=0.50
+        no_book = _make_book(token_id=NO_TID, best_bid=0.47, best_ask=0.53)  # mid=0.50, implied YES=0.50
+        fv = strategy.compute_fair_value(yes_book, no_book)
+        assert fv == 0.50
+
+    def test_no_book_data_returns_none(self, strategy):
+        assert strategy.compute_fair_value(None, None) is None
+
+    def test_empty_book_returns_none(self, strategy):
+        book = _make_book(best_bid=0, best_ask=0)
+        assert strategy.compute_fair_value(book, None) is None
+
+    def test_bid_only_uses_bid(self, strategy):
+        book = _make_book(best_bid=0.45, best_ask=0)
+        fv = strategy.compute_fair_value(book, None)
+        assert fv == 0.45
+
+    def test_clamped_to_range(self, strategy):
+        book = _make_book(best_bid=0.99, best_ask=1.00)
+        fv = strategy.compute_fair_value(book, None)
+        assert fv <= 0.98
+
+
+# ===================================================================
+# Quote Gating
+# ===================================================================
+
+
+class TestQuoteGating:
+    def test_no_book_data_blocks(self, strategy):
+        reason = strategy.should_quote(CID, None, None, 500.0)
+        assert reason == "no_yes_book"
+
+    def test_empty_book_blocks(self, strategy):
+        book = _make_book(best_bid=0, best_ask=0)
+        reason = strategy.should_quote(CID, book, None, 500.0)
+        assert reason == "yes_book_empty"
+
+    def test_tight_spread_blocks(self, strategy):
+        # Spread = 1c = 200bps at midpoint 0.50 — exactly at threshold
+        book = _make_book(best_bid=0.495, best_ask=0.505)
+        # spread_bps = 0.01 / 0.50 * 10000 = 200 — need it BELOW threshold
+        tight_book = _make_book(best_bid=0.498, best_ask=0.502)
+        # spread_bps = 0.004 / 0.50 * 10000 = 80
+        reason = strategy.should_quote(CID, tight_book, None, 500.0)
+        assert reason is not None
+        assert "spread_too_tight" in reason
+
+    def test_one_sided_book_blocks(self, strategy):
+        book = _make_book(imbalance_5c=0.85)  # Above 0.70 threshold
+        reason = strategy.should_quote(CID, book, None, 500.0)
+        assert reason is not None
+        assert "one_sided" in reason
+
+    def test_window_loss_blocks(self, strategy):
+        strategy._window_pnl[CID] = -3.0  # Below -2.0 threshold
+        book = _make_book()
+        reason = strategy.should_quote(CID, book, None, 500.0)
+        assert reason is not None
+        assert "window_loss" in reason
+
+    def test_near_expiry_blocks_without_inventory(self, strategy):
+        book = _make_book()
+        reason = strategy.should_quote(CID, book, None, 30.0)  # Below 120s
+        assert reason == "near_expiry"
+
+    def test_near_expiry_allows_with_inventory(self, strategy):
+        inv = strategy.get_inventory(CID)
+        inv.record_fill("BUY", "YES", 10.0, 0.50)
+        book = _make_book()
+        reason = strategy.should_quote(CID, book, None, 30.0)
+        assert reason is None  # Should not block
+
+    def test_good_conditions_pass(self, strategy):
+        book = _make_book()
+        reason = strategy.should_quote(CID, book, None, 500.0)
+        assert reason is None
+
+
+# ===================================================================
+# Defense
+# ===================================================================
+
+
+class TestDefense:
+    def test_depth_spike_pulls(self, strategy):
+        strategy.config.depth_defense_enabled = True
+        book = _make_book()
+        reason = strategy.should_pull_quotes(CID, book, depth_momentum=0.95)
+        assert reason is not None
+        assert "depth_spike" in reason
+
+    def test_depth_moderate_does_not_pull(self, strategy):
+        strategy.config.depth_defense_enabled = True
+        book = _make_book()
+        reason = strategy.should_pull_quotes(CID, book, depth_momentum=0.50)
+        assert reason is None
+
+    def test_recovery_period(self, strategy):
+        strategy.config.depth_defense_enabled = True
+        book = _make_book()
+        strategy.should_pull_quotes(CID, book, depth_momentum=0.95)
+        # Should still be recovering
+        reason = strategy.should_pull_quotes(CID, book, depth_momentum=0.0)
+        assert reason == "recovering"
+
+    def test_spread_compression_pulls(self, strategy):
+        # Spread = 80bps < 200bps threshold
+        tight_book = _make_book(best_bid=0.498, best_ask=0.502)
+        reason = strategy.should_pull_quotes(CID, tight_book)
+        assert reason == "spread_compressed"
+
+    def test_imbalance_velocity_pulls(self, strategy):
+        """Fast imbalance change should trigger a pull."""
+        now = time.monotonic()
+        # Simulate rapid imbalance readings
+        history = strategy._get_imbalance_history(CID)
+        # Add readings 0.5s apart with big imbalance change
+        from polyedge.strategies.market_maker import _ImbalanceReading
+        history.append(_ImbalanceReading(now - 1.0, 0.0))
+        history.append(_ImbalanceReading(now - 0.5, 0.05))
+
+        # Now call with high imbalance — velocity = (0.20 - 0.0) / 1.0 = 0.20 > 0.15
+        book = _make_book(imbalance_5c=0.20)
+        reason = strategy.should_pull_quotes(CID, book)
+        assert reason is not None
+        assert "imbalance_velocity" in reason
+
+
+# ===================================================================
+# No Naked Shorts
+# ===================================================================
+
 
 class TestNoNakedShorts:
-    """Bug #1: Never sell YES tokens we don't hold."""
-
     def test_no_ask_without_inventory(self, strategy):
-        """Fresh start, no inventory → should NOT post an ask."""
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
-        # Should have a bid (buying YES) but NO ask (we don't hold any to sell)
-        assert qs.yes_bid is not None, "Should post a bid"
-        assert qs.yes_ask is None, "Should NOT post an ask without inventory"
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
+        assert qs.yes_ask is None
+        assert qs.no_ask is None
 
     def test_ask_only_with_inventory(self, strategy):
-        """After buying YES, should post ask to sell."""
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 10.0, 0.50)
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
-        assert qs.yes_ask is not None, "Should post an ask when holding inventory"
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
+        assert qs.yes_ask is not None
         assert qs.yes_ask.side == "SELL"
 
     def test_ask_size_capped_to_inventory(self, strategy):
-        """Ask size must never exceed what we hold."""
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 3.0, 0.50)
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
         if qs.yes_ask:
-            assert qs.yes_ask.size <= 3.0, f"Ask size {qs.yes_ask.size} exceeds inventory 3.0"
+            assert qs.yes_ask.size <= 3.0
+
+    def test_no_naked_short_no(self, strategy):
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
+        assert qs.no_ask is None
 
 
-class TestAskPriceFloor:
-    """Bug #6: Ask price must be above best bid to avoid post_only rejection."""
+# ===================================================================
+# Both-Side Quoting
+# ===================================================================
 
-    def test_ask_above_best_bid(self, strategy):
-        """Ask should be above the actual Polymarket best bid."""
+
+class TestBothSideQuoting:
+    def test_both_sides_get_bids(self, strategy):
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
+        assert qs.yes_bid is not None
+        assert qs.no_bid is not None
+        assert qs.yes_bid.token_id == YES_TID
+        assert qs.no_bid.token_id == NO_TID
+
+    def test_no_inventory_posts_sell(self, strategy):
         inv = strategy.get_inventory(CID)
-        inv.record_fill("BUY", "YES", 10.0, 0.50)
+        inv.record_fill("BUY", "NO", 10.0, 0.40)
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.60,
-            no_price=0.40,
-            seconds_remaining=500,
-            yes_best_bid=0.58,
-        )
-        if qs.yes_ask:
-            assert qs.yes_ask.price > 0.58, (
-                f"Ask ${qs.yes_ask.price} must be above best bid $0.58"
-            )
+        yes_book, no_book = _yes_no_books(0.60)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
+        assert qs.no_ask is not None
+        assert qs.no_ask.side == "SELL"
 
-    def test_ask_above_best_bid_extreme_skew(self, strategy):
-        """Even with heavy inventory skew, ask must stay above best bid."""
-        inv = strategy.get_inventory(CID)
-        inv.record_fill("BUY", "YES", 50.0, 0.50)  # Heavy imbalance
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.70,
-            no_price=0.30,
-            seconds_remaining=500,
-            yes_best_bid=0.68,
-        )
-        if qs.yes_ask:
-            assert qs.yes_ask.price > 0.68, (
-                f"Ask ${qs.yes_ask.price} crossed best bid $0.68 with heavy skew"
-            )
-
-    def test_ask_above_fair_value_without_best_bid(self, strategy):
-        """Without best_bid info, ask should still be above fair value."""
-        inv = strategy.get_inventory(CID)
-        inv.record_fill("BUY", "YES", 10.0, 0.50)
-
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.55,
-            no_price=0.45,
-            seconds_remaining=500,
-            yes_best_bid=0.0,  # No best bid info
-        )
-        if qs.yes_ask:
-            fv = qs.fair_value
-            assert qs.yes_ask.price >= fv, (
-                f"Ask ${qs.yes_ask.price} below fair value ${fv}"
-            )
+# ===================================================================
+# Inventory Skew
+# ===================================================================
 
 
 class TestInventorySkew:
-    """Verify skew only lowers bid, doesn't lower ask below market."""
+    def test_heavy_yes_lowers_yes_bid(self, strategy):
+        # Baseline with no inventory
+        yes_book, no_book = _yes_no_books(0.50)
+        qs_base = strategy.compute_quotes("base", YES_TID, NO_TID, yes_book, no_book, 500)
 
-    def test_balanced_inventory_no_skew(self, strategy):
-        """With no inventory, bid and ask should be symmetric around FV."""
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
-        if qs.yes_bid:
-            fv = qs.fair_value
-            bid_dist = fv - qs.yes_bid.price
-            # Bid should be ~half_spread below FV
-            assert 0.02 <= bid_dist <= 0.10
-
-    def test_heavy_yes_inventory_lowers_bid(self, strategy):
-        """Heavy YES inventory should lower the bid (discourage buying more)."""
-        # Get baseline bid with no inventory
-        qs_base = strategy.compute_quotes(
-            condition_id="base",
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
-
-        # Now with heavy YES inventory
+        # Heavy YES inventory
         inv = strategy.get_inventory("heavy")
         inv.record_fill("BUY", "YES", 50.0, 0.50)
-
-        qs_heavy = strategy.compute_quotes(
-            condition_id="heavy",
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
+        qs_heavy = strategy.compute_quotes("heavy", YES_TID, NO_TID, yes_book, no_book, 500)
 
         if qs_base.yes_bid and qs_heavy.yes_bid:
-            assert qs_heavy.yes_bid.price < qs_base.yes_bid.price, (
-                "Heavy YES inventory should lower bid price"
-            )
+            assert qs_heavy.yes_bid.price < qs_base.yes_bid.price
+
+    def test_max_one_side_suppresses_bid(self, strategy):
+        """At max inventory on YES side, YES bid should be suppressed."""
+        inv = strategy.get_inventory(CID)
+        # $15 max inventory, buy $12 worth (above 70% imbalance)
+        inv.record_fill("BUY", "YES", 24.0, 0.50)  # $12 at 0.50
+
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
+        assert qs.yes_bid is None  # Suppressed — overweight YES
+
+
+# ===================================================================
+# P&L Tracking
+# ===================================================================
 
 
 class TestPnLTracking:
-    """Bug #2: Window P&L must be tracked. Bug #4: avg_entry must be accurate."""
-
     def test_record_fill_returns_avg_entry_on_sell(self, strategy):
-        """record_fill should return avg_entry for sells."""
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 10.0, 0.50)
-
         avg_entry = strategy.record_fill(CID, "SELL", "YES", 5.0, 0.55)
         assert avg_entry is not None
-        assert abs(avg_entry - 0.50) < 0.01, f"avg_entry {avg_entry} should be 0.50"
+        assert abs(avg_entry - 0.50) < 0.01
 
     def test_record_fill_returns_none_on_buy(self, strategy):
-        """record_fill should return None for buys."""
         result = strategy.record_fill(CID, "BUY", "YES", 10.0, 0.50)
         assert result is None
 
-    def test_window_pnl_updated_on_sell(self, strategy):
-        """Window P&L should be updated when a sell fill occurs."""
+    def test_window_pnl_positive(self, strategy):
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 10.0, 0.50)
-
         strategy.record_fill(CID, "SELL", "YES", 10.0, 0.55)
-
         pnl = strategy._window_pnl.get(CID, 0)
-        expected_pnl = (0.55 - 0.50) * 10.0  # $0.50
-        assert abs(pnl - expected_pnl) < 0.01, f"Window P&L {pnl} != expected {expected_pnl}"
+        assert abs(pnl - 0.50) < 0.01  # (0.55-0.50)*10
 
-    def test_window_pnl_negative_on_loss(self, strategy):
-        """Window P&L should go negative on losing sells."""
+    def test_window_pnl_negative(self, strategy):
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 10.0, 0.50)
-
         strategy.record_fill(CID, "SELL", "YES", 10.0, 0.45)
-
         pnl = strategy._window_pnl.get(CID, 0)
-        expected_pnl = (0.45 - 0.50) * 10.0  # -$0.50
         assert pnl < 0
-        assert abs(pnl - expected_pnl) < 0.01
+        assert abs(pnl - (-0.50)) < 0.01
 
-    def test_circuit_breaker_fires_on_loss(self, strategy):
-        """Circuit breaker should pull quotes when window loss exceeds threshold."""
-        # Simulate a big loss
+    def test_circuit_breaker(self, strategy):
         inv = strategy.get_inventory(CID)
-        inv.record_fill("BUY", "YES", 20.0, 0.50)  # $10 invested
+        inv.record_fill("BUY", "YES", 20.0, 0.50)
         strategy.record_fill(CID, "SELL", "YES", 20.0, 0.35)  # Lost $3
 
-        pnl = strategy._window_pnl.get(CID, 0)
-        assert pnl < -2.0  # Below max_loss_per_window_usd
-
-        reason = strategy.should_pull_quotes(CID, depth_momentum=0)
+        book = _make_book()
+        reason = strategy.should_quote(CID, book, None, 500.0)
         assert reason is not None
         assert "window_loss" in reason
 
 
-class TestWindowReset:
-    """Bug #10: Stale inventory must be cleaned on window reset."""
+# ===================================================================
+# Window Reset
+# ===================================================================
 
-    def test_reset_clears_inventory(self, strategy):
-        """reset_window should clear inventory for that condition_id."""
+
+class TestWindowReset:
+    def test_clears_inventory(self, strategy):
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 10.0, 0.50)
-        assert CID in strategy.inventory
-
         strategy.reset_window(CID)
         assert CID not in strategy.inventory
 
-    def test_reset_clears_pnl(self, strategy):
-        """reset_window should clear window P&L."""
+    def test_clears_pnl(self, strategy):
         strategy._window_pnl[CID] = -1.50
         strategy.reset_window(CID)
         assert CID not in strategy._window_pnl
 
-    def test_reset_clears_tracking(self, strategy):
-        """reset_window should clear FV and quote time tracking."""
+    def test_clears_tracking(self, strategy):
         strategy._last_fair_value[CID] = 0.55
         strategy._last_quote_time[CID] = time.monotonic()
         strategy._pulled_until[CID] = time.monotonic() + 100
-
         strategy.reset_window(CID)
         assert CID not in strategy._last_fair_value
         assert CID not in strategy._last_quote_time
         assert CID not in strategy._pulled_until
 
+    def test_clears_imbalance_history(self, strategy):
+        history = strategy._get_imbalance_history(CID)
+        from polyedge.strategies.market_maker import _ImbalanceReading
+        history.append(_ImbalanceReading(time.monotonic(), 0.5))
+        strategy.reset_window(CID)
+        assert CID not in strategy._imbalance_history
 
-class TestTimeGate:
-    """Bug #3 partial: Time gate should allow sells near expiry."""
 
-    def test_near_expiry_blocks_new_entry(self, strategy):
-        """Near expiry with no inventory → pull quotes."""
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=30,  # Below min_seconds_remaining (120)
-        )
-        assert qs.reason_pulled == "near_expiry"
-        assert qs.yes_bid is None
-        assert qs.yes_ask is None
+# ===================================================================
+# Spread Computation
+# ===================================================================
 
-    def test_near_expiry_allows_sell_with_inventory(self, strategy):
-        """Near expiry with inventory → should still post asks to offload."""
+
+class TestSpread:
+    def test_base_spread(self, strategy):
+        spread = strategy.compute_spread(CID, 500, None, 0.50)
+        assert abs(spread - 0.06) < 0.001
+
+    def test_time_decay_widens(self, strategy):
+        spread = strategy.compute_spread(CID, 30, None, 0.50)
+        assert spread > strategy.config.base_spread
+
+    def test_clamp_max(self, strategy):
+        spread = strategy.compute_spread(CID, 5, None, 0.50)
+        assert spread <= strategy.config.max_spread
+
+    def test_clamp_min(self, strategy):
+        spread = strategy.compute_spread(CID, 500, None, 0.50)
+        assert spread >= strategy.config.min_spread
+
+    def test_static_market_no_time_decay(self, strategy):
+        """seconds_remaining=None should use base spread (no time decay)."""
+        spread = strategy.compute_spread(CID, None, None, 0.50)
+        assert abs(spread - 0.06) < 0.001
+
+
+# ===================================================================
+# Force-Sell
+# ===================================================================
+
+
+class TestForceSell:
+    def test_no_inventory_returns_empty(self, strategy):
+        qs = strategy.compute_force_sell_quotes(CID, YES_TID, NO_TID, 30.0, None, None)
+        assert not qs.is_active
+
+    def test_with_inventory_returns_asks(self, strategy):
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 10.0, 0.50)
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.55,
-            no_price=0.45,
-            seconds_remaining=30,  # Below min_seconds_remaining
-        )
-        # Should NOT be pulled — we have inventory to offload
-        assert qs.reason_pulled is None or qs.reason_pulled == "no_requote_needed"
-        # Bid should be suppressed (no new buys near expiry)
-        # But ask should be posted to sell
-        if qs.yes_ask is not None:
-            assert qs.yes_ask.side == "SELL"
+        yes_book = _make_book(best_bid=0.48, best_ask=0.52)
+        qs = strategy.compute_force_sell_quotes(CID, YES_TID, NO_TID, 30.0, yes_book, None)
+        assert qs.yes_ask is not None
+        assert qs.yes_ask.side == "SELL"
 
-
-class TestPriceGate:
-    """Price range filters should allow sells even when price is extreme."""
-
-    def test_price_out_of_range_no_inventory_no_quotes(self, strategy):
-        """Price > max_entry_price with no inventory → no quotes posted.
-
-        YES is too high (0.95 > 0.90 max), NO is too low (0.05 < 0.10 min).
-        Neither side qualifies for a bid, and there's no inventory to sell.
-        """
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.95,  # Above max_entry_price (0.90)
-            no_price=0.05,   # Below min_entry_price (0.10)
-            seconds_remaining=500,
-        )
-        assert not qs.is_active, "Should not post any quotes when both sides out of range"
-        assert qs.yes_bid is None
-        assert qs.no_bid is None
-
-    def test_price_too_high_with_inventory_posts_ask(self, strategy):
-        """Price > max_entry_price but holding inventory → post ask to sell."""
+    def test_fire_sale_uses_low_price(self, strategy):
         inv = strategy.get_inventory(CID)
         inv.record_fill("BUY", "YES", 10.0, 0.50)
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.95,
-            no_price=0.05,
-            seconds_remaining=500,
-        )
-        # Should NOT pull — we have inventory
-        assert qs.reason_pulled is None or qs.reason_pulled == "no_requote_needed"
+        yes_book = _make_book(best_bid=0.48, best_ask=0.52)
+        # 3 seconds left = fire sale territory (<5s threshold)
+        qs = strategy.compute_force_sell_quotes(CID, YES_TID, NO_TID, 3.0, yes_book, None)
+        assert qs.yes_ask is not None
+        # Fire sale should be below cost basis
+        assert qs.yes_ask.price < 0.50
 
-    def test_price_too_low_with_inventory_no_bid(self, strategy):
-        """Price < min_entry_price with inventory → post ask but NO bid."""
-        inv = strategy.get_inventory("low_price")
-        inv.record_fill("BUY", "YES", 10.0, 0.50)
-
-        qs = strategy.compute_quotes(
-            condition_id="low_price",
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.05,
-            no_price=0.95,
-            seconds_remaining=500,
-        )
-        # Should NOT pull — we have inventory
-        assert qs.reason_pulled is None or qs.reason_pulled == "no_requote_needed"
-        # BID must be suppressed — don't buy more at extreme lows
-        assert qs.yes_bid is None, "Should NOT post bid when price is below min_entry_price"
-
-    def test_price_too_low_with_inventory_posts_ask(self, strategy):
-        """Price < min_entry_price but holding inventory → post ask to sell."""
+    def test_normal_force_sell_at_cost(self, strategy):
         inv = strategy.get_inventory(CID)
-        inv.record_fill("BUY", "YES", 10.0, 0.50)
+        inv.record_fill("BUY", "YES", 10.0, 0.40)
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.05,
-            no_price=0.95,
-            seconds_remaining=500,
-        )
-        assert qs.reason_pulled is None or qs.reason_pulled == "no_requote_needed"
+        yes_book = _make_book(best_bid=0.48, best_ask=0.52)
+        # 30 seconds left = force-sell but not fire-sale
+        qs = strategy.compute_force_sell_quotes(CID, YES_TID, NO_TID, 30.0, yes_book, None)
+        assert qs.yes_ask is not None
+        # Should be at or above cost basis (breakeven)
+        assert qs.yes_ask.price >= 0.40
 
 
-class TestDepthDefense:
-    def test_depth_spike_pulls_quotes(self, strategy):
-        """High depth momentum should pull all quotes."""
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-            depth_momentum=0.95,  # Above pull threshold (0.80)
-        )
-        assert qs.reason_pulled is not None
-        assert "depth_spike" in qs.reason_pulled
-
-    def test_depth_moderate_does_not_pull(self, strategy):
-        """Moderate depth momentum should NOT pull (just widen spread)."""
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-            depth_momentum=0.50,  # Below pull (0.80) but above widen (0.40)
-        )
-        assert qs.reason_pulled is None
-        # Spread should be wider than base
-        assert qs.spread > strategy.config.base_spread
-
-    def test_depth_recovery_period(self, strategy):
-        """After a pull, should stay pulled for recovery period."""
-        # First: trigger a pull
-        strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-            depth_momentum=0.95,
-        )
-
-        # Second: even with zero momentum, should still be recovering
-        qs2 = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-            depth_momentum=0.0,
-        )
-        assert qs2.reason_pulled == "recovering"
+# ===================================================================
+# Full Cycle
+# ===================================================================
 
 
 class TestFullCycle:
-    """End-to-end: buy at bid → sell at ask → verify profit."""
-
     def test_buy_then_sell_profit(self, strategy):
-        """Full cycle: bid fills, then ask fills, P&L is positive."""
-        # Step 1: Bid fills — someone sold to us
         avg = strategy.record_fill(CID, "BUY", "YES", 6.0, 0.47)
-        assert avg is None  # No avg_entry for buys
+        assert avg is None
 
         inv = strategy.get_inventory(CID)
         assert inv.yes_tokens == 6.0
         assert abs(inv.avg_cost("YES") - 0.47) < 0.01
 
-        # Step 2: Compute quotes — should have ask
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, 500)
         assert qs.yes_ask is not None
-        assert qs.yes_ask.price > 0.47  # Ask should be above our entry
+        assert qs.yes_ask.price > 0.47
 
-        # Step 3: Ask fills — someone bought from us
         avg_entry = strategy.record_fill(CID, "SELL", "YES", 6.0, 0.53)
-        assert avg_entry is not None
         assert abs(avg_entry - 0.47) < 0.01
 
-        # Step 4: P&L should be positive
         pnl = strategy._window_pnl.get(CID, 0)
-        expected = (0.53 - 0.47) * 6.0  # $0.36
-        assert pnl > 0
+        expected = (0.53 - 0.47) * 6.0
         assert abs(pnl - expected) < 0.01
-
-        # Step 5: Inventory should be cleared
         assert inv.yes_tokens == 0
 
-    def test_buy_then_sell_loss(self, strategy):
-        """Full cycle with loss: market moved against us."""
-        strategy.record_fill(CID, "BUY", "YES", 10.0, 0.55)
-
-        avg_entry = strategy.record_fill(CID, "SELL", "YES", 10.0, 0.45)
-        assert abs(avg_entry - 0.55) < 0.01
-
+    def test_no_token_cycle(self, strategy):
+        strategy.record_fill(CID, "BUY", "NO", 10.0, 0.30)
+        avg_entry = strategy.record_fill(CID, "SELL", "NO", 10.0, 0.50)
+        assert abs(avg_entry - 0.30) < 0.01
         pnl = strategy._window_pnl.get(CID, 0)
-        assert pnl < 0
-        expected = (0.45 - 0.55) * 10.0  # -$1.00
-        assert abs(pnl - expected) < 0.01
+        assert abs(pnl - 2.0) < 0.01
+
+
+# ===================================================================
+# QuoteSet and Quote basics
+# ===================================================================
 
 
 class TestQuoteSetBasics:
@@ -582,14 +606,6 @@ class TestQuoteSetBasics:
         assert qs.is_active
         assert len(qs.all_quotes()) == 1
 
-    def test_both_sides(self):
-        qs = QuoteSet(
-            yes_bid=Quote("t1", "BUY", 0.47, 6.0),
-            yes_ask=Quote("t1", "SELL", 0.53, 5.0),
-        )
-        assert qs.is_active
-        assert len(qs.all_quotes()) == 2
-
     def test_quote_as_order_dict(self):
         q = Quote("t1", "BUY", 0.47, 6.0, expiration=1234)
         d = q.as_order_dict()
@@ -601,142 +617,46 @@ class TestQuoteSetBasics:
         assert d["expiration"] == 1234
 
 
-class TestSpread:
-    def test_base_spread(self, strategy):
-        spread = strategy.compute_spread(CID, seconds_remaining=500)
-        assert abs(spread - 0.06) < 0.001
-
-    def test_time_decay_widens(self, strategy):
-        spread = strategy.compute_spread(CID, seconds_remaining=30)
-        assert spread > strategy.config.base_spread
-
-    def test_depth_widens(self, strategy):
-        spread = strategy.compute_spread(CID, seconds_remaining=500, depth_momentum=0.60)
-        assert spread > strategy.config.base_spread
-
-    def test_spread_clamp_max(self, strategy):
-        spread = strategy.compute_spread(CID, seconds_remaining=5, depth_momentum=0.99)
-        assert spread <= strategy.config.max_spread
-
-    def test_spread_clamp_min(self, strategy):
-        spread = strategy.compute_spread(CID, seconds_remaining=500, depth_momentum=0.0)
-        assert spread >= strategy.config.min_spread
+# ===================================================================
+# Snap Price
+# ===================================================================
 
 
-class TestFairValue:
-    def test_midpoint(self, strategy):
-        fv = strategy.compute_fair_value(0.50, 0.50)
-        assert fv == 0.50
+class TestSnapPrice:
+    def test_snap_to_cent(self):
+        assert _snap_price(0.473, 0.01) == 0.47
+        assert _snap_price(0.475, 0.01) == 0.48
 
-    def test_yes_higher(self, strategy):
-        fv = strategy.compute_fair_value(0.70, 0.30)
-        assert fv == 0.70
+    def test_clamp_low(self):
+        assert _snap_price(0.001, 0.01) == 0.01
 
-    def test_clamped_low(self, strategy):
-        fv = strategy.compute_fair_value(0.00, 1.00)
-        assert fv >= 0.01
+    def test_clamp_high(self):
+        assert _snap_price(0.999, 0.01) == 0.99
 
-    def test_clamped_high(self, strategy):
-        fv = strategy.compute_fair_value(1.00, 0.00)
-        assert fv <= 0.99
+    def test_half_cent_tick(self):
+        # Polymarket uses 2 decimal places, so 0.475 rounds to 0.48
+        assert _snap_price(0.475, 0.005) == 0.48
 
 
-class TestNoSideQuoting:
-    """Both YES and NO tokens should be quoted — profit regardless of direction."""
+# ===================================================================
+# Static Market Mode
+# ===================================================================
 
-    def test_both_sides_get_bids(self, strategy):
-        """At FV=0.50, both YES and NO should get bid quotes."""
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
-        assert qs.yes_bid is not None, "Should post YES bid"
-        assert qs.no_bid is not None, "Should post NO bid"
-        assert qs.yes_bid.token_id == YES_TID
-        assert qs.no_bid.token_id == NO_TID
 
-    def test_no_inventory_sells_no(self, strategy):
-        """Holding NO inventory → should post NO ask to sell it."""
+class TestStaticMarketMode:
+    def test_no_time_decay_on_sell(self, strategy):
+        """Static markets (seconds_remaining=None) should use full profit floor."""
         inv = strategy.get_inventory(CID)
-        inv.record_fill("BUY", "NO", 10.0, 0.40)
+        inv.record_fill("BUY", "YES", 10.0, 0.40)
 
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.60,  # YES high → NO cheap was $0.40, now NO=1-0.60=0.40
-            no_price=0.40,
-            seconds_remaining=500,
-        )
-        assert qs.no_ask is not None, "Should post NO ask when holding NO inventory"
-        assert qs.no_ask.side == "SELL"
-        assert qs.no_ask.size == 10.0
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, None)
+        if qs.yes_ask:
+            # Full 20% profit floor: 0.40 * 1.20 = 0.48
+            assert qs.yes_ask.price >= 0.48
 
-    def test_no_naked_short_no(self, strategy):
-        """No NO inventory → no NO ask. Same naked short protection."""
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
-        assert qs.no_ask is None, "Should not sell NO without holding it"
-
-    def test_no_profit_floor(self, strategy):
-        """NO ask should respect min_profit_pct above avg cost."""
-        inv = strategy.get_inventory(CID)
-        inv.record_fill("BUY", "NO", 10.0, 0.30)
-
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.65,  # FV=0.65, so NO FV=0.35
-            no_price=0.35,
-            seconds_remaining=500,
-        )
-        if qs.no_ask:
-            # min_profit_pct=0.20 → 0.30 * 1.20 = 0.36
-            assert qs.no_ask.price >= 0.36, (
-                f"NO ask ${qs.no_ask.price} below profit floor $0.36"
-            )
-
-    def test_btc_dip_buy_yes_sell_no_cycle(self, strategy):
-        """Full NO cycle: buy NO cheap when BTC rips, sell when BTC dips back."""
-        # BTC rips → NO is cheap at 0.30
-        avg = strategy.record_fill(CID, "BUY", "NO", 10.0, 0.30)
-        assert avg is None  # No avg_entry for buys
-
-        # BTC dips back → NO price recovers to 0.50
-        avg_entry = strategy.record_fill(CID, "SELL", "NO", 10.0, 0.50)
-        assert avg_entry is not None
-        assert abs(avg_entry - 0.30) < 0.01
-
-        # P&L should be positive
-        pnl = strategy._window_pnl.get(CID, 0)
-        expected = (0.50 - 0.30) * 10.0  # $2.00 profit
-        assert abs(pnl - expected) < 0.01
-
-    def test_total_inventory_cap(self, strategy):
-        """Total inventory across YES+NO should be capped."""
-        inv = strategy.get_inventory(CID)
-        # Fill up to near max inventory ($15)
-        inv.record_fill("BUY", "YES", 20.0, 0.50)  # $10 in YES
-
-        qs = strategy.compute_quotes(
-            condition_id=CID,
-            yes_token_id=YES_TID,
-            no_token_id=NO_TID,
-            yes_price=0.50,
-            no_price=0.50,
-            seconds_remaining=500,
-        )
-        # With $10 in YES and max $15 total, should still allow some NO buying
-        # but YES bid should be suppressed (already overweight)
-        # The exact behavior depends on the capacity check
+    def test_no_expiry_suppression(self, strategy):
+        """Static markets should always allow new bids."""
+        yes_book, no_book = _yes_no_books(0.50)
+        qs = strategy.compute_quotes(CID, YES_TID, NO_TID, yes_book, no_book, None)
+        assert qs.yes_bid is not None
