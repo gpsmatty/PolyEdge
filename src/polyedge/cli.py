@@ -1549,15 +1549,20 @@ def price_logger(symbols, interval):
 @click.option("--dry", is_flag=True, help="Dry run — compute quotes but don't post")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 @click.option("-q", "--quiet", is_flag=True, help="Minimal output")
-@click.option("--market", default=None, help='Filter markets (e.g. "btc 15m")')
-def maker(auto, dry, verbose, quiet, market):
-    """Start the market maker — post-only limit orders on crypto up/down markets.
+@click.option("--market", default=None, help='Crypto mode: filter markets (e.g. "btc 15m")')
+@click.option("--condition-id", default=None, help="Static mode: target specific market(s), comma-separated")
+def maker(auto, dry, verbose, quiet, market, condition_id):
+    """Start the market maker — post-only spread capture on any Polymarket market.
+
+    \b
+    Two modes:
+      Crypto mode (--market): Window-hopping on crypto up/down markets.
+      Static mode (--condition-id): Any Polymarket market, no expiry.
 
     \b
     Posts bids and asks on both sides of the book to capture the spread.
     ALL orders are post-only (maker-only) — zero taker fees + rebates.
-    Uses Binance depth as a DEFENSIVE signal to pull quotes during
-    momentum spikes, preventing adverse selection.
+    Fair value from Polymarket book midpoint. Defense from book dynamics.
 
     \b
     Includes a dead-man switch (heartbeat) — if the bot crashes, the
@@ -1565,12 +1570,21 @@ def maker(auto, dry, verbose, quiet, market):
 
     \b
     Examples:
-      polyedge maker --dry --market "btc"     # Watch BTC markets
-      polyedge maker --auto --market "btc 15m" # Auto-trade BTC 15-min
-      polyedge maker --dry                     # All up/down markets
+      polyedge maker --dry --market "btc 15m"            # Crypto mode, BTC 15-min
+      polyedge maker --dry --condition-id abc123          # Static mode, any market
+      polyedge maker --auto --market "btc"                # Auto-trade all BTC windows
 
     No AI needed — pure spread capture with inventory management.
     """
+    if not market and not condition_id:
+        console.print("[red]Specify --market (crypto mode) or --condition-id (static mode)[/red]")
+        return
+
+    if market and condition_id:
+        console.print("[red]Use either --market or --condition-id, not both[/red]")
+        return
+
+    condition_ids = [c.strip() for c in condition_id.split(",")] if condition_id else None
 
     async def _maker():
         from polyedge.core.client import PolyClient
@@ -1598,6 +1612,7 @@ def maker(auto, dry, verbose, quiet, market):
             auto=auto,
             dry=dry,
             market_filter=market,
+            condition_ids=condition_ids,
             verbose=verbose,
             quiet=quiet,
         )
