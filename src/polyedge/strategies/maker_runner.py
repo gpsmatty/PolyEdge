@@ -140,6 +140,9 @@ class MakerRunner:
         self._warmup_complete = False
         self._warmup_start: float = 0.0
 
+        # Track last known best prices per token to detect material changes
+        self._last_best: dict[str, tuple[float, float]] = {}  # token_id -> (bid, ask)
+
         # State
         self._running = False
         self._last_market_refresh = 0.0
@@ -553,11 +556,24 @@ class MakerRunner:
             entry = self._token_to_market.get(token_id)
             if not entry:
                 return
-            # Trigger requote on material book change
+            # Only trigger requote if mid price moved >= 0.5 cents
+            try:
+                bid = float(event.get("best_bid", 0))
+                ask = float(event.get("best_ask", 0))
+            except (ValueError, TypeError):
+                return
+            prev = self._last_best.get(token_id)
+            if prev:
+                old_mid = (prev[0] + prev[1]) / 2
+                new_mid = (bid + ask) / 2
+                if abs(new_mid - old_mid) < 0.005:
+                    self._last_best[token_id] = (bid, ask)
+                    return  # Not material — skip requote
+            self._last_best[token_id] = (bid, ask)
             self._requote_event.set()
 
         async def _on_book(event: dict):
-            """Full book snapshot — most useful for BookIntelligence."""
+            """Full book snapshot — trigger requote (infrequent event)."""
             self._requote_event.set()
 
         self.poly_feed.on(EVENT_BEST_BID_ASK, _on_best_bid_ask)
@@ -646,7 +662,13 @@ class MakerRunner:
     # ===================================================================
 
     async def _quote_loop(self):
-        """Main quoting loop — event-driven with floor interval."""
+        """Main quoting loop — event-driven with floor interval.
+
+        Orders stay live until fair value moves materially (>= 0.5 cent).
+        The floor interval (min_requote_interval, default 3s) fires periodic
+        refreshes even when the book is quiet, to update time-decay spreads.
+        """
+        last_post_time = 0.0
         while self._running:
             try:
                 # Wait for event or floor interval
@@ -658,6 +680,12 @@ class MakerRunner:
                 except asyncio.TimeoutError:
                     pass
                 self._requote_event.clear()
+
+                # Enforce minimum time between actual order posts
+                now = time.monotonic()
+                since_last_post = now - last_post_time
+                if since_last_post < self.config.min_requote_interval:
+                    continue
 
                 # Check window hops (crypto mode)
                 self._check_window_hops()
@@ -684,6 +712,7 @@ class MakerRunner:
                 current_markets = self._get_current_markets()
                 for cid, m in current_markets.items():
                     await self._quote_market(cid, m, depth_momentum)
+                last_post_time = time.monotonic()
 
             except Exception as e:
                 logger.error(f"Quote loop error: {e}")
