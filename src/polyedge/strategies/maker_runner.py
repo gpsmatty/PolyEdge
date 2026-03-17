@@ -51,6 +51,23 @@ logger = logging.getLogger("polyedge.maker_runner")
 MARKET_REFRESH_INTERVAL = 120  # seconds
 STATUS_INTERVAL = 15  # seconds
 
+# CLOB API returns token balances in micro-units (6 decimals).
+# 3770000 raw = 3.77 actual tokens.
+TOKEN_BALANCE_DIVISOR = 1e6
+
+
+def _parse_token_balance(bal_resp: dict | float) -> float:
+    """Convert raw CLOB token balance response to actual token count."""
+    if isinstance(bal_resp, dict):
+        raw = bal_resp.get("balance", 0)
+    else:
+        raw = bal_resp
+    raw_float = float(str(raw))
+    # If the value is huge (>10000), it's in micro-units
+    if raw_float > 10000:
+        return round(raw_float / TOKEN_BALANCE_DIVISOR, 2)
+    return round(raw_float, 2)
+
 
 class MakerRunner:
     """Persistent async loop for market making on Polymarket.
@@ -1033,8 +1050,8 @@ class MakerRunner:
                     yes_bal = self.client.get_token_balance(m.clob_token_ids[0])
                     no_bal = self.client.get_token_balance(m.clob_token_ids[1])
 
-                    actual_yes = float(yes_bal.get("balance", 0)) if isinstance(yes_bal, dict) else 0.0
-                    actual_no = float(no_bal.get("balance", 0)) if isinstance(no_bal, dict) else 0.0
+                    actual_yes = _parse_token_balance(yes_bal)
+                    actual_no = _parse_token_balance(no_bal)
 
                     inv = self.strategy.get_inventory(cid)
 
@@ -1065,8 +1082,8 @@ class MakerRunner:
                 yes_bal = self.client.get_token_balance(m.clob_token_ids[0])
                 no_bal = self.client.get_token_balance(m.clob_token_ids[1])
 
-                actual_yes = float(yes_bal.get("balance", 0)) if isinstance(yes_bal, dict) else 0.0
-                actual_no = float(no_bal.get("balance", 0)) if isinstance(no_bal, dict) else 0.0
+                actual_yes = _parse_token_balance(yes_bal)
+                actual_no = _parse_token_balance(no_bal)
 
                 if actual_yes > 0.5 or actual_no > 0.5:
                     inv = self.strategy.get_inventory(cid)
