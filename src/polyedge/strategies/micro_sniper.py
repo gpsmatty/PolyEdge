@@ -625,6 +625,93 @@ class MicroSniperStrategy:
             poly_book_imbalance=poly_imbalance,
         )
 
+    def _evaluate_sell_into_strength(
+        self,
+        market: Market,
+        micro: MicroStructure,
+        seconds_remaining: float,
+        current_position: str,
+        momentum: float,
+        confidence: float,
+        is_bullish: bool,
+        entry_price: Optional[float] = None,
+    ) -> Optional[MicroOpportunity]:
+        """Sell-into-strength exit: only sell when profitable AND momentum agrees.
+
+        Holds through reversals. Only exits on:
+        - Floor exit (low price + low time remaining)
+        - Sell-into-strength (profitable + momentum in our direction)
+        Take profit and max loss are checked before this method is called.
+        Force exit is checked before evaluate() calls _evaluate_with_position().
+        """
+        holding_yes = current_position == "yes"
+        our_price = market.yes_price if holding_yes else market.no_price
+
+        # --- FLOOR EXIT (same as old logic) ---
+        if seconds_remaining < 120:
+            if seconds_remaining < 30:
+                floor = self.config.min_entry_price
+            elif seconds_remaining < 60:
+                floor = 0.20
+            else:
+                floor = 0.15
+
+            if our_price < floor:
+                console.print(
+                    f"[bold red]FLOOR EXIT: {'YES' if holding_yes else 'NO'} price "
+                    f"${our_price:.2f} < floor ${floor:.2f} "
+                    f"({seconds_remaining:.0f}s left) — emergency bail[/bold red]"
+                )
+                return MicroOpportunity(
+                    market=market, symbol=micro.symbol,
+                    action=MicroAction.EXIT,
+                    side=Side.YES if holding_yes else Side.NO,
+                    momentum=momentum, confidence=confidence,
+                    ofi_5s=micro.flow_5s.ofi, ofi_15s=micro.flow_15s.ofi,
+                    vwap_drift=micro.flow_15s.vwap_drift,
+                    trade_intensity=micro.flow_5s.trade_intensity,
+                    binance_price=micro.current_price,
+                    price_change_pct=micro.price_change_pct,
+                    market_price=our_price,
+                    seconds_remaining=seconds_remaining,
+                    exit_reason="floor_exit",
+                )
+
+        # --- SELL INTO STRENGTH ---
+        if entry_price and entry_price > 0:
+            profit_pct = (our_price - entry_price) / entry_price
+            # Momentum aligned with our position?
+            aligned = (holding_yes and is_bullish) or (not holding_yes and not is_bullish)
+            abs_mom = abs(momentum)
+
+            if (
+                profit_pct >= self.config.sell_min_profit_pct
+                and aligned
+                and abs_mom >= self.config.sell_momentum_agreement
+            ):
+                console.print(
+                    f"[bold green]SELL INTO STRENGTH: {'YES' if holding_yes else 'NO'} "
+                    f"entry=${entry_price:.2f} → now=${our_price:.2f} "
+                    f"(+{profit_pct:.0%}) momentum={momentum:+.2f} "
+                    f"— selling while direction holds[/bold green]"
+                )
+                return MicroOpportunity(
+                    market=market, symbol=micro.symbol,
+                    action=MicroAction.EXIT,
+                    side=Side.YES if holding_yes else Side.NO,
+                    momentum=momentum, confidence=confidence,
+                    ofi_5s=micro.flow_5s.ofi, ofi_15s=micro.flow_15s.ofi,
+                    vwap_drift=micro.flow_15s.vwap_drift,
+                    trade_intensity=micro.flow_5s.trade_intensity,
+                    binance_price=micro.current_price,
+                    price_change_pct=micro.price_change_pct,
+                    market_price=our_price,
+                    seconds_remaining=seconds_remaining,
+                    exit_reason="sell_into_strength",
+                )
+
+        return None  # HOLD — wait for conditions to align
+
     def _evaluate_with_position(
         self,
         market: Market,
@@ -704,6 +791,15 @@ class MicroSniperStrategy:
                     seconds_remaining=seconds_remaining,
                     exit_reason="max_loss",
                 )
+
+        # --- SELL INTO STRENGTH ---
+        # When enabled: skip all reversal/trailing exits. Only sell when profitable
+        # AND momentum still agrees with our position (selling into strength).
+        if self.config.sell_into_strength_enabled:
+            return self._evaluate_sell_into_strength(
+                market, micro, seconds_remaining, current_position,
+                momentum, confidence, is_bullish, entry_price,
+            )
 
         # --- TRAILING STOP LOSS ---
         # When enabled: tracks the high water mark (HWM) of our position's price.

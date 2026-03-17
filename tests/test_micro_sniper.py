@@ -1634,7 +1634,7 @@ class TestBookExitOverride:
 
     def test_book_no_override_when_depth_too_low(self):
         """When bid depth is too thin, book should NOT override — let the exit happen."""
-        strategy = self._make_real_strategy()
+        strategy = self._make_real_strategy(sell_into_strength_enabled=False)
         micro = self._make_bearish_micro()
         market = FakeMarket(yes_price=0.60, no_price=0.40)
 
@@ -1657,7 +1657,7 @@ class TestBookExitOverride:
 
     def test_book_no_override_when_imbalance_against(self):
         """When imbalance is against our position, book should NOT override."""
-        strategy = self._make_real_strategy()
+        strategy = self._make_real_strategy(sell_into_strength_enabled=False)
         micro = self._make_bearish_micro()
         market = FakeMarket(yes_price=0.60, no_price=0.40)
 
@@ -1705,7 +1705,7 @@ class TestBookExitOverride:
 
     def test_no_override_when_book_disabled(self):
         """When poly_book_enabled=False, exits should happen normally."""
-        strategy = self._make_real_strategy(poly_book_enabled=False)
+        strategy = self._make_real_strategy(poly_book_enabled=False, sell_into_strength_enabled=False)
         micro = self._make_bearish_micro()
         market = FakeMarket(yes_price=0.60, no_price=0.40)
 
@@ -1726,7 +1726,7 @@ class TestBookExitOverride:
 
     def test_no_override_when_no_book_data(self):
         """When book_intel is None, exits should happen normally."""
-        strategy = self._make_real_strategy()
+        strategy = self._make_real_strategy(sell_into_strength_enabled=False)
         micro = self._make_bearish_micro()
         market = FakeMarket(yes_price=0.60, no_price=0.40)
 

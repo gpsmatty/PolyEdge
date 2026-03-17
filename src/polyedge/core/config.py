@@ -314,8 +314,14 @@ class MicroSniperConfig(BaseModel):
 
     # Max loss stop: exit if position loses X% from entry, regardless of momentum.
     # Protects against trades that immediately go wrong and never recover.
-    # Trailing stop only arms after min_profit_pct gain — this fills the gap below entry.
     max_loss_pct: float = 0.35                     # Exit if token drops 35% from entry price (0 = disabled)
+
+    # Sell-into-strength: only sell when profitable AND momentum agrees with position.
+    # Holds through reversals (no panic selling). Only exits on: take_profit, max_loss,
+    # force_exit (window end), or sell_into_strength conditions met.
+    sell_into_strength_enabled: bool = True         # Master toggle (False = old reversal-exit mode)
+    sell_min_profit_pct: float = 0.05              # Min profit above entry to allow sell (5%)
+    sell_momentum_agreement: float = 0.20          # Min momentum in our direction to trigger sell
 
     # --- Binance order book depth integration ---
     # Uses @depth20@100ms stream for LEADING indicators (limit order changes).

@@ -145,6 +145,7 @@ ALL_FILTERS_OFF = dict(
     dead_market_band=0.0,
     min_entry_price=0.01,
     max_entry_price=0.99,
+    min_seconds_remaining=15.0,
     poly_book_enabled=False,
     trailing_stop_enabled=False,
     take_profit_enabled=False,
@@ -152,6 +153,7 @@ ALL_FILTERS_OFF = dict(
     entry_threshold=0.30,
     min_confidence=0.10,
     min_trades_in_window=1,
+    sell_into_strength_enabled=False,
 )
 
 

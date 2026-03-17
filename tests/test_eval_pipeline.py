@@ -171,6 +171,7 @@ ALL_FILTERS_OFF = dict(
     dead_market_band=0.0,
     min_entry_price=0.01,
     max_entry_price=0.99,
+    min_seconds_remaining=15.0,
     poly_book_enabled=False,
     trailing_stop_enabled=False,
     take_profit_enabled=False,
@@ -178,6 +179,7 @@ ALL_FILTERS_OFF = dict(
     entry_threshold=0.30,    # Low so strong signals pass by default
     min_confidence=0.10,
     min_trades_in_window=1,
+    sell_into_strength_enabled=False,
 )
 
 
@@ -387,6 +389,7 @@ class TestGradualExitFilter:
             high_intensity_block_enabled=False,
             entry_persistence_enabled=False,
             poly_book_enabled=False,
+            sell_into_strength_enabled=False,
         )
 
         # Create momentum against the position
@@ -521,6 +524,7 @@ class TestExitAlwaysEvaluates:
             take_profit_enabled=False,
             enable_flips=False,
             poly_book_enabled=False,
+            sell_into_strength_enabled=False,
         )
         # Strong bearish momentum + bearish 30s OFI (no exit protection)
         micro = make_micro_with_momentum("bearish", 0.8, ofi_30s=-0.5)
@@ -572,6 +576,7 @@ class TestExitAlwaysEvaluates:
             trailing_stop_enabled=True,
             trailing_stop_pct=0.12,
             trailing_stop_min_profit_pct=0.10,
+            sell_into_strength_enabled=False,
         )
         micro = make_micro_with_momentum("bearish", 0.3)
         # Price dropped from HWM of 0.70 to 0.55 = 21% drawdown > 12%
@@ -989,6 +994,7 @@ class TestThresholdLogging:
             counter_trend_exit_threshold=0.45,
             trailing_stop_enabled=False,
             take_profit_enabled=False,
+            sell_into_strength_enabled=False,
         )
         # Holding YES with positive 30s OFI (partial protection)
         micro = make_micro_with_momentum("bearish", 0.5, ofi_30s=0.15)
